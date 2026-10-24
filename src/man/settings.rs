@@ -13,23 +13,23 @@ use serde_json::Value;
 
 use crate::ai::huggingface::HuggingFaceModel;
 use crate::ai::{asr, chat, embedding, huggingface, tts};
-use crate::db;
-use crate::db_executor;
+use crate::repo;
+use crate::repo::secret::SecretChange;
 use crate::result::{Error, Result};
 use crate::robot::dto::RobotQuery;
+use crate::security;
 use crate::web::server::{self, to_res};
 
-/// 全局设置表 —— **跨机器人**，只有它和机器人注册表是全局的。
+/// 敏感字段在 `secrets` 里的固定名字（D36）。
 ///
-/// 名字保持 `settings`：全局的那几个键（[`SETTINGS_KEY`] / `db_init_time` /
-/// `version`）原来就住在这里。
-pub(crate) const TABLE: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("settings");
-/// 每机器人设置表的后缀，表名是 `{robot_id}settings`。
-///
-/// 原来每机器人的设置以 `robot_id` 为键混在上面的全局表里，是仓库里唯一一张
-/// GLOBAL 与 PER-ROBOT 混住的表；拆开以后机器人导出/删除都只碰自己那张。
-pub(crate) const TABLE_SUFFIX: &str = "settings";
-pub(crate) const SETTINGS_KEY: &str = "global-settings";
+/// 设置 JSON 里只存 `enc:<name>`；用户改成 `env:` / `file:` 时这里不落密文。
+const SECRET_CHAT_API_KEY: &str = "chat_api_key";
+const SECRET_EMBEDDING_API_KEY: &str = "embedding_api_key";
+const SECRET_ASR_API_KEY: &str = "asr_api_key";
+const SECRET_TTS_API_KEY: &str = "tts_api_key";
+const SECRET_SMTP_PASSWORD: &str = "smtp_password";
+const SECRET_HF_TOKEN: &str = "hf_token";
+const GLOBAL_SCOPE: &str = "global";
 
 /// `db_init_time` 写库用的时间格式。
 ///
@@ -201,7 +201,7 @@ fn progress_of(status: &ModelLoadStatus, kind: ModelKind) -> &ModelLoadProgress 
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct HfModelDownload {
     #[serde(rename = "connectTimeoutMillis")]
     pub(crate) connect_timeout_millis: u32,
@@ -211,7 +211,7 @@ pub(crate) struct HfModelDownload {
     pub(crate) access_token: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct GlobalSettings {
     pub(crate) ip: String,
     pub(crate) port: u16,
@@ -466,48 +466,194 @@ impl Default for Settings {
     }
 }
 
-pub(crate) async fn init_table(store: &db::RedbStore) -> Result<()> {
-    db::init_table(store, TABLE).await
+/// 引用串的三种形式（D36）。其余内容一律当作「用户刚输入的明文」处理。
+fn is_secret_ref(value: &str) -> bool {
+    value.starts_with("enc:") || value.starts_with("env:") || value.starts_with("file:")
 }
 
-pub(crate) async fn exists(store: &db::RedbStore) -> Result<bool> {
-    let cnt = db::count(store, TABLE).await?;
-    Ok(cnt > 0)
+/// 把一个敏感字段拆成「设置里要存的引用串 + 对 secrets 表的动作」。
+fn split_secret(name: &str, value: &str, changes: &mut Vec<SecretChange>) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        changes.push(SecretChange::Delete {
+            name: String::from(name),
+        });
+        return Ok(String::new());
+    }
+    if let Some(key_name) = value.strip_prefix("enc:") {
+        if key_name.is_empty() {
+            return Err(Error::WithMessage(format!(
+                "Secret reference for {name} has no name"
+            )));
+        }
+        // 原样保留引用串：设置页「读 → 改 → 原样写回」不能覆盖已有密文。
+        return Ok(String::from(value));
+    }
+    if is_secret_ref(value) {
+        // env: / file: 不需要 secrets 行；顺手清掉同名字段以前的密文。
+        changes.push(SecretChange::Delete {
+            name: String::from(name),
+        });
+        return Ok(String::from(value));
+    }
+
+    let ciphertext = security::encrypt(value)?;
+    changes.push(SecretChange::Upsert {
+        name: String::from(name),
+        kind: String::from("enc"),
+        value: ciphertext,
+    });
+    Ok(format!("enc:{name}"))
 }
 
-pub(crate) async fn init_global(store: &db::RedbStore) -> Result<GlobalSettings> {
+pub(crate) fn split_settings(data: &Settings) -> Result<(Settings, Vec<SecretChange>)> {
+    let mut stored = data.clone();
+    let mut changes = Vec::new();
+
+    stored.chat_provider.api_key = split_secret(
+        SECRET_CHAT_API_KEY,
+        &data.chat_provider.api_key,
+        &mut changes,
+    )?;
+    stored.sentence_embedding_provider.api_key = split_secret(
+        SECRET_EMBEDDING_API_KEY,
+        &data.sentence_embedding_provider.api_key,
+        &mut changes,
+    )?;
+    stored.asr_provider.api_key =
+        split_secret(SECRET_ASR_API_KEY, &data.asr_provider.api_key, &mut changes)?;
+    stored.tts_provider.api_key =
+        split_secret(SECRET_TTS_API_KEY, &data.tts_provider.api_key, &mut changes)?;
+    stored.smtp_password = split_secret(SECRET_SMTP_PASSWORD, &data.smtp_password, &mut changes)?;
+
+    Ok((stored, changes))
+}
+
+pub(crate) fn split_global(data: &GlobalSettings) -> Result<(GlobalSettings, Vec<SecretChange>)> {
+    let mut stored = data.clone();
+    let mut changes = Vec::new();
+    stored.hf_model_download.access_token = split_secret(
+        SECRET_HF_TOKEN,
+        &data.hf_model_download.access_token,
+        &mut changes,
+    )?;
+    Ok((stored, changes))
+}
+
+fn read_secret_file(path: &str) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(s) => s.trim_end_matches(['\r', '\n']).to_string(),
+        Err(e) => {
+            log::warn!("Reading secret file {path} failed: {e}");
+            String::new()
+        }
+    }
+}
+
+/// 引用串 → 真正可用的明文。只给运行期用；HTTP 回显仍返回引用串本身。
+async fn resolve_secret(scope: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    if let Some(name) = value.strip_prefix("env:") {
+        return Ok(std::env::var(name).unwrap_or_default());
+    }
+    if let Some(path) = value.strip_prefix("file:") {
+        return Ok(read_secret_file(path));
+    }
+    if let Some(name) = value.strip_prefix("enc:") {
+        let Some(row) = repo::secret::get(repo::pool(), scope, name).await? else {
+            log::warn!("Secret {scope}/{name} is referenced but missing");
+            return Ok(String::new());
+        };
+        return match row.kind.as_str() {
+            "enc" => security::decrypt(&row.value),
+            "env" => Ok(std::env::var(row.value).unwrap_or_default()),
+            "file" => Ok(read_secret_file(&row.value)),
+            other => Err(Error::WithMessage(format!(
+                "Unknown secret kind in database: {other}"
+            ))),
+        };
+    }
+    // 老记录/手改配置里的明文：原样使用。
+    Ok(String::from(value))
+}
+
+async fn hydrate_settings(robot_id: &str, stored: Settings) -> Result<Settings> {
+    let mut s = stored;
+    let v = resolve_secret(robot_id, &s.chat_provider.api_key).await?;
+    s.chat_provider.api_key = v;
+    let v = resolve_secret(robot_id, &s.sentence_embedding_provider.api_key).await?;
+    s.sentence_embedding_provider.api_key = v;
+    let v = resolve_secret(robot_id, &s.asr_provider.api_key).await?;
+    s.asr_provider.api_key = v;
+    let v = resolve_secret(robot_id, &s.tts_provider.api_key).await?;
+    s.tts_provider.api_key = v;
+    let v = resolve_secret(robot_id, &s.smtp_password).await?;
+    s.smtp_password = v;
+    Ok(unify_legacy_api_urls(s))
+}
+
+async fn hydrate_global(stored: GlobalSettings) -> Result<GlobalSettings> {
+    let mut s = stored;
+    let v = resolve_secret(GLOBAL_SCOPE, &s.hf_model_download.access_token).await?;
+    s.hf_model_download.access_token = v;
+    Ok(s)
+}
+
+/// 首次启动写默认全局设置 + `app_meta` 的初始化时间。已有记录时直接返回。
+pub(crate) async fn init_global() -> Result<GlobalSettings> {
+    if let Some(s) = repo::settings::get_global(repo::pool()).await? {
+        return Ok(s);
+    }
+
     let settings = GlobalSettings::default();
-    db::write(store, TABLE, SETTINGS_KEY, &settings).await?;
+    let (stored, changes) = split_global(&settings)?;
+    repo::settings::save_global(repo::pool(), &stored, &changes).await?;
+
     let format = time::format_description::parse_borrowed::<3>(TIME_FORMAT)
         .expect("Invalid format description");
-    let t = time::OffsetDateTime::now_utc();
-    let t_str = t
+    let t_str = time::OffsetDateTime::now_utc()
         .format(&format)
         .map_err(|e| Error::TimeFormat(Box::new(e)))?;
-    db::write(store, TABLE, "db_init_time", &t_str).await?;
-    db::write(store, TABLE, "version", &String::from(server::VERSION)).await?;
+    repo::app_meta::put_if_absent(repo::pool(), "db_init_time", &t_str).await?;
+    repo::app_meta::put(repo::pool(), "app_version", server::VERSION).await?;
     Ok(settings)
 }
 
-/// 新机器人的默认设置，写在**它自己**那张表里。
+/// 新机器人的默认设置。**幂等**：已有 robot_settings 时不会覆盖（也不会动 secrets），
+/// 避免以后误调用把用户的密钥清掉。
 pub(crate) async fn init(robot_id: &str) -> Result<Settings> {
     let settings = Settings::default();
-    db_executor!(db::write, robot_id, TABLE_SUFFIX, robot_id, &settings)?;
+    let (stored, _) = split_settings(&settings)?;
+    repo::settings::init_robot(repo::pool(), robot_id, &stored).await?;
     Ok(settings)
 }
 
-pub(crate) async fn get_global_settings(store: &db::RedbStore) -> Result<Option<GlobalSettings>> {
-    db::query(store, TABLE, SETTINGS_KEY).await
+/// 设置页读的那份：引用串原样返回（D36，不能用 `***`）。
+pub(crate) async fn get_stored_settings(robot_id: &str) -> Result<Option<Settings>> {
+    Ok(repo::settings::get_robot(repo::pool(), robot_id)
+        .await?
+        .map(unify_legacy_api_urls))
+}
+
+pub(crate) async fn get_global_settings() -> Result<Option<GlobalSettings>> {
+    repo::settings::get_global(repo::pool()).await
+}
+
+pub(crate) async fn get_global_settings_hydrated() -> Result<Option<GlobalSettings>> {
+    let Some(stored) = repo::settings::get_global(repo::pool()).await? else {
+        return Ok(None);
+    };
+    Ok(Some(hydrate_global(stored).await?))
 }
 
 pub(crate) async fn rest_get_global_settings() -> impl IntoResponse {
-    let r = match db::store(db::StoreKey::Global).await {
-        Ok(store) => get_global_settings(store).await,
-        Err(e) => Err(e),
-    };
-    to_res(r)
+    to_res(get_global_settings().await)
 }
 
+/// 运行期读的那份：密钥已经解密，URL 已归一化。缓存里也存这个形态。
 pub(crate) async fn get_settings(robot_id: &str) -> Result<Option<Settings>> {
     // 缓存锁必须在 await 之前放开：std 的 MutexGuard 不是 Send。
     {
@@ -516,8 +662,14 @@ pub(crate) async fn get_settings(robot_id: &str) -> Result<Option<Settings>> {
             return Ok(Some(s.clone()));
         }
     }
-    let r: Option<Settings> = db_executor!(db::query, robot_id, TABLE_SUFFIX, robot_id)?;
-    Ok(r.map(unify_legacy_api_urls))
+    let Some(stored) = repo::settings::get_robot(repo::pool(), robot_id).await? else {
+        return Ok(None);
+    };
+    let hydrated = hydrate_settings(robot_id, stored).await?;
+    SETTINGS_CACHE
+        .lock()?
+        .insert(String::from(robot_id), hydrated.clone());
+    Ok(Some(hydrated))
 }
 
 /// 老记录里指向 Ollama **原生**端点的地址。
@@ -611,19 +763,24 @@ impl Settings {
 /// 最多是下次少一条警告，而向量已经写成功了，所以调用方通常只记一笔日志，不把
 /// 整个请求判失败。
 pub(crate) async fn stamp_embedding_index(robot_id: &str) -> Result<()> {
-    let Some(mut s) = get_settings(robot_id).await? else {
+    // 只改 `indexed_embedding`（非敏感），所以从**存库形态**读、写回；不能拿
+    // hydrated 形态去写，否则会把 `env:`/`file:` 引用替换成解析后的明文。
+    let Some(mut stored) = get_stored_settings(robot_id).await? else {
         return Ok(());
     };
-    s.sentence_embedding_provider.indexed_embedding = Some(s.current_embedding_identity());
-    db_executor!(db::write, robot_id, TABLE_SUFFIX, robot_id, &s)?;
-    let mut l = SETTINGS_CACHE.lock()?;
-    l.insert(String::from(robot_id), s);
-    drop(l);
+    stored.sentence_embedding_provider.indexed_embedding =
+        Some(stored.current_embedding_identity());
+    let (stored, changes) = split_settings(&stored)?;
+    repo::settings::save_robot(repo::pool(), robot_id, &stored, &changes).await?;
+    let hydrated = hydrate_settings(robot_id, stored).await?;
+    SETTINGS_CACHE
+        .lock()?
+        .insert(String::from(robot_id), hydrated);
     Ok(())
 }
 
 pub(crate) async fn get(Query(q): Query<RobotQuery>) -> impl IntoResponse {
-    to_res::<Option<Settings>>(get_settings(&q.robot_id).await)
+    to_res::<Option<Settings>>(get_stored_settings(&q.robot_id).await)
 }
 
 pub(crate) async fn save(
@@ -633,26 +790,20 @@ pub(crate) async fn save(
     to_res(save_settings(&q.robot_id, data).await)
 }
 
-pub(crate) async fn save_global_settings(
-    store: &db::RedbStore,
-    data: &GlobalSettings,
-) -> Result<()> {
+pub(crate) async fn save_global_settings(data: &GlobalSettings) -> Result<()> {
     let addr = format!("{}:{}", data.ip, data.port);
     let _: SocketAddr = addr.parse().map_err(|_| {
-        log::error!("Saving invalid listen IP: {}", &addr);
+        log::error!("Saving invalid listen IP: {addr}");
         Error::WithMessage(String::from("lang.settings.invalidIp"))
     })?;
-    db::write(store, TABLE, SETTINGS_KEY, data).await
+    let (stored, changes) = split_global(data)?;
+    repo::settings::save_global(repo::pool(), &stored, &changes).await
 }
 
 pub(crate) async fn rest_save_global_settings(
     Json(data): Json<GlobalSettings>,
 ) -> impl IntoResponse {
-    let r = match db::store(db::StoreKey::Global).await {
-        Ok(store) => save_global_settings(store, &data).await,
-        Err(e) => Err(e),
-    };
-    to_res(r)
+    to_res(save_global_settings(&data).await)
 }
 
 pub(crate) async fn save_settings(robot_id: &str, data: Settings) -> Result<()> {
@@ -667,10 +818,15 @@ pub(crate) async fn save_settings(robot_id: &str, data: Settings) -> Result<()> 
     let previous = get_settings(robot_id).await.ok().flatten();
     let (reload_chat, reload_embedding) = models_to_reload(previous.as_ref(), &data);
 
-    db_executor!(db::write, robot_id, TABLE_SUFFIX, robot_id, &data)?;
-    let mut l = SETTINGS_CACHE.lock()?;
-    l.insert(String::from(robot_id), data);
-    drop(l);
+    // 拆出敏感字段（加密后写 secrets），设置 JSON 里只留 `enc:` 引用串。
+    let (stored, changes) = split_settings(&data)?;
+    repo::settings::save_robot(repo::pool(), robot_id, &stored, &changes).await?;
+
+    // 缓存存 hydrated 形态，运行期直接拿密钥；设置页读的是 stored 形态。
+    let hydrated = hydrate_settings(robot_id, stored).await?;
+    SETTINGS_CACHE
+        .lock()?
+        .insert(String::from(robot_id), hydrated);
 
     // 装模型放在写完库之后：写失败就不该去装。装的过程在后台跑，接口立刻返回，
     // 进度和失败原因由 [`model_load_progress`] 给设置页（见 [`spawn_model_load`]）。
@@ -737,8 +893,17 @@ pub(crate) async fn load_model_now(Query(q): Query<LoadModelQuery>) -> impl Into
     to_res(Ok(()))
 }
 
-pub(crate) async fn smtp_test(Json(settings): Json<Settings>) -> impl IntoResponse {
-    to_res(check_smtp_settings(&settings))
+pub(crate) async fn smtp_test(
+    Query(q): Query<RobotQuery>,
+    Json(settings): Json<Settings>,
+) -> impl IntoResponse {
+    let r: Result<bool> = async {
+        // 设置页拿到的是引用串（`enc:` / `env:` / `file:`），测试连接前要先还原。
+        let settings = hydrate_settings(&q.robot_id, settings).await?;
+        check_smtp_settings(&settings)
+    }
+    .await;
+    to_res(r)
 }
 
 pub(crate) fn check_smtp_settings(settings: &Settings) -> Result<bool> {
@@ -760,23 +925,15 @@ pub(crate) fn check_smtp_settings(settings: &Settings) -> Result<bool> {
 }
 
 pub(crate) async fn download_model_files(Json(m): Json<HuggingFaceModel>) -> impl IntoResponse {
-    let store = match db::store(db::StoreKey::Global).await {
-        Ok(store) => store,
+    let global_settings = match get_global_settings_hydrated().await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return to_res(Err(Error::WithMessage(String::from(
+                "Global settings not found.",
+            ))));
+        }
         Err(e) => return to_res(Err(e)),
     };
-    let global_settings = get_global_settings(store).await;
-    if global_settings.is_err() {
-        return to_res(Err(Error::WithMessage(String::from(
-            "Load global settings failed.",
-        ))));
-    }
-    let global_settings = global_settings.unwrap();
-    if global_settings.is_none() {
-        return to_res(Err(Error::WithMessage(String::from(
-            "Global settings not found.",
-        ))));
-    }
-    let global_settings = global_settings.unwrap();
     tokio::spawn(async move {
         match huggingface::download_hf_models(
             &m.get_info(),
@@ -979,7 +1136,15 @@ pub(crate) async fn list_openai_models(
             "API URL parameter is empty",
         ))));
     }
-    let api_key = q.get("apiKey").map(String::as_str).unwrap_or_default();
+    let raw_api_key = q.get("apiKey").map(String::as_str).unwrap_or_default();
+    // 设置页传来的是引用串；按机器人作用域还原。没有 robotId 时按旧行为当明文。
+    let api_key = match q.get("robotId").filter(|s| !s.is_empty()) {
+        Some(robot_id) => match resolve_secret(robot_id, raw_api_key).await {
+            Ok(k) => k,
+            Err(e) => return to_res(Err(e)),
+        },
+        None => String::from(raw_api_key),
+    };
     let proxy_url = q.get("proxyUrl").map(String::as_str).unwrap_or_default();
     let connect_timeout_millis = q
         .get("connectTimeoutMillis")
@@ -992,7 +1157,7 @@ pub(crate) async fn list_openai_models(
     to_res(
         retrieve_openai_models(
             url,
-            api_key,
+            &api_key,
             connect_timeout_millis,
             read_timeout_millis,
             proxy_url,
@@ -1027,11 +1192,8 @@ async fn retrieve_openai_models(
     proxy_url: &str,
 ) -> Result<Vec<String>> {
     // 走共享 client 而不是裸 reqwest::get，这样用户的代理和超时设置才生效。
-    let client = crate::external::http::get_client(
-        connect_timeout_millis,
-        read_timeout_millis,
-        proxy_url,
-    )?;
+    let client =
+        crate::external::http::get_client(connect_timeout_millis, read_timeout_millis, proxy_url)?;
     let mut req = client.get(models_url(url));
     if !api_key.is_empty() {
         req = req.header("Authorization", format!("Bearer {api_key}"));
@@ -1218,7 +1380,10 @@ mod tests {
 
         // 本地模型换成在线模型：没有东西可装（旧缓存留给懒加载/LRU 处理）。
         let all_online = settings_with(None, None);
-        assert_eq!(models_to_reload(Some(&both_local), &all_online), (None, None));
+        assert_eq!(
+            models_to_reload(Some(&both_local), &all_online),
+            (None, None)
+        );
 
         // 在线模型之间、以及在线换回本地：后者要装。
         assert_eq!(
@@ -1338,14 +1503,22 @@ mod tests {
     fn embedding_identity_names_both_the_model_and_the_dimensions() {
         let mut s = Settings::default();
         // 默认是本地 AllMiniLML6V2，没填维度。
-        assert_eq!(s.current_embedding_identity(), "v1|huggingface|AllMiniLML6V2|0");
+        assert_eq!(
+            s.current_embedding_identity(),
+            "v1|huggingface|AllMiniLML6V2|0"
+        );
         s.sentence_embedding_provider.dimensions = Some(1024);
-        assert_eq!(s.current_embedding_identity(), "v1|huggingface|AllMiniLML6V2|1024");
+        assert_eq!(
+            s.current_embedding_identity(),
+            "v1|huggingface|AllMiniLML6V2|1024"
+        );
 
         // 在线模型用真正发给端点的那个名字（`OpenAICompatible(名字)`），
         // 外层那个 `model` 字段不参与 —— 前端存的是前者。
         s.sentence_embedding_provider.provider =
-            embedding::SentenceEmbeddingProvider::OpenAICompatible(String::from("text-embedding-v4"));
+            embedding::SentenceEmbeddingProvider::OpenAICompatible(String::from(
+                "text-embedding-v4",
+            ));
         s.sentence_embedding_provider.model = String::from("stale-unused-field");
         let identity = s.current_embedding_identity();
         assert_eq!(identity, "v1|openai-compatible|text-embedding-v4|1024");
@@ -1364,5 +1537,85 @@ mod tests {
                 "text-embedding-v3",
             ));
         assert_ne!(third.current_embedding_identity(), identity);
+    }
+
+    /// D36：明文进 secrets、设置 JSON 只留引用串；`env:` / `file:` 不落密文；
+    /// 原样写回引用串时不能重新加密。
+    #[test]
+    fn secrets_are_split_into_reference_strings() {
+        crate::security::init_with_key([9u8; 32]);
+
+        let mut s = Settings::default();
+        s.chat_provider.api_key = String::from("sk-plain");
+        s.asr_provider.api_key = String::from("env:ASR_KEY");
+        s.tts_provider.api_key = String::from("file:/tmp/tts.key");
+        let (stored, changes) = split_settings(&s).unwrap();
+        assert_eq!(stored.chat_provider.api_key, "enc:chat_api_key");
+        assert_eq!(stored.asr_provider.api_key, "env:ASR_KEY");
+        assert_eq!(stored.tts_provider.api_key, "file:/tmp/tts.key");
+        assert!(changes.iter().any(|c| matches!(
+            c,
+            SecretChange::Upsert { name, kind, .. } if name == "chat_api_key" && kind == "enc"
+        )));
+        assert!(changes.iter().any(|c| matches!(
+            c,
+            SecretChange::Delete { name } if name == "asr_api_key"
+        )));
+
+        // 读到的设置原样写回：chat 的密文不能被重新加密，env/file 保持引用。
+        let (stored2, changes2) = split_settings(&stored).unwrap();
+        assert_eq!(stored2.chat_provider.api_key, "enc:chat_api_key");
+        assert_eq!(stored2.asr_provider.api_key, "env:ASR_KEY");
+        assert!(
+            changes2
+                .iter()
+                .all(|c| matches!(c, SecretChange::Delete { .. })),
+            "already-referenced secrets must not be re-encrypted"
+        );
+
+        // 清空字段 = 删掉对应密文。
+        let mut cleared = stored.clone();
+        cleared.chat_provider.api_key = String::new();
+        let (_, changes3) = split_settings(&cleared).unwrap();
+        assert!(changes3.iter().any(|c| matches!(
+            c,
+            SecretChange::Delete { name } if name == "chat_api_key"
+        )));
+
+        // 全局的 HF token 同样处理。
+        let mut g = GlobalSettings::default();
+        g.hf_model_download.access_token = String::from("hf-plain");
+        let (g_stored, g_changes) = split_global(&g).unwrap();
+        assert_eq!(g_stored.hf_model_download.access_token, "enc:hf_token");
+        assert!(g_changes.iter().any(|c| matches!(
+            c,
+            SecretChange::Upsert { name, .. } if name == "hf_token"
+        )));
+    }
+
+    /// 引用串的解析：env / file / 明文透传都不该碰数据库。
+    #[tokio::test]
+    async fn env_and_file_references_are_resolved_without_the_database() {
+        // 环境变量名带测试前缀，避免和现场环境撞车。
+        unsafe { std::env::set_var("KIKO_TEST_SECRET_ENV", "from-env") };
+        assert_eq!(
+            resolve_secret("r1", "env:KIKO_TEST_SECRET_ENV")
+                .await
+                .unwrap(),
+            "from-env"
+        );
+        assert_eq!(
+            resolve_secret("r1", "plain-text").await.unwrap(),
+            "plain-text"
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "kiko-secret-{}.txt",
+            scru128::new_string().to_lowercase()
+        ));
+        std::fs::write(&path, "from-file\n").unwrap();
+        let reference = format!("file:{}", path.display());
+        assert_eq!(resolve_secret("r1", &reference).await.unwrap(), "from-file");
+        let _ = std::fs::remove_file(&path);
     }
 }

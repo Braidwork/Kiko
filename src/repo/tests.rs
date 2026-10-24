@@ -4,12 +4,13 @@
 //! 没配 `KIKO_TEST_DATABASE_URL` 时整组跳过 —— 没有 PG 的环境不该因此红一片。
 
 use super::{
-    context, external_http, intent, mainflow, robot, runtime_node, subflow, test_support::TestDb,
-    variable,
+    context, external_http, intent, mainflow, robot, runtime_node, secret,
+    settings as settings_repo, subflow, test_support::TestDb, variable,
 };
 use crate::external::http::dto::{
     HttpReqInfo, HttpReqParam, Method, PostContentType, Protocol, ValueSource,
 };
+use crate::man::settings::{GlobalSettings, Settings, split_global, split_settings};
 use crate::robot::dto::{RobotData, RobotType};
 use crate::variable::dto::{
     Variable, VariableObtainValueExpressionType, VariableType, VariableValueSource,
@@ -1189,6 +1190,217 @@ async fn runtime_nodes_roundtrip_and_demo_ids() {
         .await
         .unwrap();
     assert_eq!(left, 0, "删机器人必须级联清掉运行时节点（含 demo）");
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn robot_settings_and_secrets_roundtrip() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rSet", "settings"))
+        .await
+        .unwrap();
+
+    let mut s = Settings::default();
+    s.chat_provider.api_key = String::from("sk-plain");
+    s.smtp_password = String::from("smtp-pw");
+    let (stored, changes) = split_settings(&s).unwrap();
+    // 设置 JSON 里只有引用串，密钥在 secrets 表里是密文。
+    assert_eq!(stored.chat_provider.api_key, "enc:chat_api_key");
+    assert_eq!(stored.smtp_password, "enc:smtp_password");
+    settings_repo::save_robot(&db.pool, "rSet", &stored, &changes)
+        .await
+        .unwrap();
+
+    let got = settings_repo::get_robot(&db.pool, "rSet")
+        .await
+        .unwrap()
+        .expect("设置应该存在");
+    assert_eq!(got.chat_provider.api_key, "enc:chat_api_key");
+    let chat_secret = secret::get(&db.pool, "rSet", "chat_api_key")
+        .await
+        .unwrap()
+        .expect("chat secret 应该存在");
+    assert!(
+        !chat_secret.value.contains("sk-plain"),
+        "secrets.value 不能是明文"
+    );
+    assert_eq!(
+        crate::security::decrypt(&chat_secret.value).unwrap(),
+        "sk-plain"
+    );
+
+    // D36 的关键往返：把读到的引用串原样写回，密文不能变。
+    let (stored2, changes2) = split_settings(&got).unwrap();
+    assert!(
+        changes2
+            .iter()
+            .all(|c| matches!(c, crate::repo::secret::SecretChange::Delete { .. })),
+        "原样写回引用串不应重新加密/覆盖已有密文"
+    );
+    settings_repo::save_robot(&db.pool, "rSet", &stored2, &changes2)
+        .await
+        .unwrap();
+    let after = secret::get(&db.pool, "rSet", "chat_api_key")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.value, chat_secret.value, "密文必须保持不变");
+
+    // 改成 env: 引用：设置里保留引用串，旧的密文被清掉。
+    let mut s3 = got;
+    s3.chat_provider.api_key = String::from("env:MY_API_KEY");
+    let (stored3, changes3) = split_settings(&s3).unwrap();
+    assert_eq!(stored3.chat_provider.api_key, "env:MY_API_KEY");
+    assert!(
+        changes3
+            .iter()
+            .any(|c| matches!(c, crate::repo::secret::SecretChange::Delete { name } if name == "chat_api_key")),
+        "env: 引用必须清掉同名密文"
+    );
+
+    // 删机器人级联 robot_settings；secrets.scope 没有外键，要单独清。
+    assert!(robot::delete(&db.pool, "rSet").await.unwrap());
+    assert!(
+        settings_repo::get_robot(&db.pool, "rSet")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM robot_settings WHERE robot_id = $1")
+        .bind("rSet")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+    assert_eq!(
+        secret::delete_scope(&db.pool, "rSet").await.unwrap(),
+        2,
+        "chat_api_key 与 smtp_password 两行"
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn global_settings_and_hf_token_roundtrip() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let mut g = GlobalSettings::default();
+    g.hf_model_download.access_token = String::from("hf-plain-token");
+    let (stored, changes) = split_global(&g).unwrap();
+    assert_eq!(stored.hf_model_download.access_token, "enc:hf_token");
+    settings_repo::save_global(&db.pool, &stored, &changes)
+        .await
+        .unwrap();
+
+    let got = settings_repo::get_global(&db.pool)
+        .await
+        .unwrap()
+        .expect("全局设置应该存在");
+    assert_eq!(got.ip, g.ip);
+    assert_eq!(got.port, g.port);
+    assert_eq!(got.hf_model_download.access_token, "enc:hf_token");
+
+    let secret = secret::get(&db.pool, "global", "hf_token")
+        .await
+        .unwrap()
+        .expect("hf_token 应该存在");
+    assert_eq!(
+        crate::security::decrypt(&secret.value).unwrap(),
+        "hf-plain-token"
+    );
+
+    // upsert 不产生第二行。
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM global_settings")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    db.cleanup().await;
+}
+
+/// 业务粘合层端到端：全局池指向测试 schema，跑一遍真实启动会走到的设置路径。
+#[tokio::test]
+async fn settings_service_roundtrip_through_global_pool() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    // 只有本用例用全局池；其它仓储测试都显式传 &db.pool。
+    if !super::install_test_pool(db.pool.clone()) {
+        db.cleanup().await;
+        return;
+    }
+
+    // 1. 启动：默认全局设置 + app_meta。
+    let global = crate::man::settings::init_global().await.unwrap();
+    assert_eq!(global.port, 12715);
+    assert_eq!(
+        crate::man::settings::get_global_settings()
+            .await
+            .unwrap()
+            .unwrap()
+            .ip,
+        global.ip
+    );
+
+    // 2. 新机器人：默认设置落库。
+    robot::upsert(&db.pool, &robot("rSvc", "service"))
+        .await
+        .unwrap();
+    crate::man::settings::init("rSvc").await.unwrap();
+    assert!(
+        crate::man::settings::get_settings("rSvc")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // 3. 设置页保存：明文密钥被拆到 secrets，设置 JSON 只有 `enc:` 引用。
+    let mut s = Settings::default();
+    s.chat_provider.api_key = String::from("sk-service");
+    s.smtp_password = String::from("smtp-service");
+    crate::man::settings::save_settings("rSvc", s)
+        .await
+        .unwrap();
+    let stored = crate::man::settings::get_stored_settings("rSvc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.chat_provider.api_key, "enc:chat_api_key");
+    assert_eq!(stored.smtp_password, "enc:smtp_password");
+
+    // 4. 运行期读回：引用被解密，缓存里也是明文形态。
+    let hydrated = crate::man::settings::get_settings("rSvc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hydrated.chat_provider.api_key, "sk-service");
+    assert_eq!(hydrated.smtp_password, "smtp-service");
+
+    // 5. 原样写回（设置页读取 → 不改 → 保存）：密文不变。
+    let before = secret::get(&db.pool, "rSvc", "chat_api_key")
+        .await
+        .unwrap()
+        .unwrap()
+        .value;
+    crate::man::settings::save_settings("rSvc", stored)
+        .await
+        .unwrap();
+    let after = secret::get(&db.pool, "rSvc", "chat_api_key")
+        .await
+        .unwrap()
+        .unwrap()
+        .value;
+    assert_eq!(before, after);
 
     db.cleanup().await;
 }

@@ -5,7 +5,6 @@ pub(crate) type Result<D> = core::result::Result<D, Error>;
 
 #[derive(Debug)]
 pub(crate) enum Error {
-    Db(Box<redb::Error>),
     /// PostgreSQL 错误（B-08）。唯一约束 / 外键冲突单独识别成一句话，
     /// 业务侧和前端看到的就不再是 `error returned from database: …` 这种原文。
     Pg(Box<sqlx::Error>),
@@ -33,7 +32,6 @@ impl Error {
     /// 提示和日志/接口里的原因就开始各说各话。
     pub(crate) fn message(&self) -> String {
         match &self {
-            Self::Db(e) => format!("{e:?}"),
             Self::Pg(e) => match e.as_database_error() {
                 Some(db) if db.is_unique_violation() => {
                     format!("Duplicate value: {}", db.message())
@@ -87,12 +85,6 @@ impl From<regex::Error> for Error {
     }
 }
 
-impl From<redb::Error> for Error {
-    fn from(err: redb::Error) -> Self {
-        Error::Db(Box::new(err))
-    }
-}
-
 impl From<sqlx::Error> for Error {
     fn from(err: sqlx::Error) -> Self {
         Error::Pg(Box::new(err))
@@ -102,36 +94,6 @@ impl From<sqlx::Error> for Error {
 impl From<sqlx::migrate::MigrateError> for Error {
     fn from(err: sqlx::migrate::MigrateError) -> Self {
         Error::Migrate(Box::new(err))
-    }
-}
-
-impl From<redb::TransactionError> for Error {
-    fn from(err: redb::TransactionError) -> Self {
-        Error::Db(Box::new(err.into()))
-    }
-}
-
-impl From<redb::DatabaseError> for Error {
-    fn from(err: redb::DatabaseError) -> Self {
-        Error::Db(Box::new(err.into()))
-    }
-}
-
-impl From<redb::StorageError> for Error {
-    fn from(err: redb::StorageError) -> Self {
-        Error::Db(Box::new(err.into()))
-    }
-}
-
-impl From<redb::TableError> for Error {
-    fn from(err: redb::TableError) -> Self {
-        Error::Db(Box::new(err.into()))
-    }
-}
-
-impl From<redb::CommitError> for Error {
-    fn from(err: redb::CommitError) -> Self {
-        Error::Db(Box::new(err.into()))
     }
 }
 

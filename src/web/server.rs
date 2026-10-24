@@ -22,6 +22,7 @@ use crate::flow::subflow::crud as subflow;
 use crate::intent::crud as intent;
 use crate::kb::crud as kb;
 use crate::man::settings;
+use crate::repo;
 use crate::result::Error;
 use crate::robot::crud as robot;
 use crate::variable::crud as variable;
@@ -70,6 +71,10 @@ pub async fn start_app() {
         }
     };
     log::info!("Using config file: {}", config.source.display());
+    if let Err(e) = crate::security::init(config.master_key.as_deref()) {
+        log::error!("Failed to initialize master key: {e}");
+        std::process::exit(1);
+    }
     if let Err(e) = crate::repo::init(&config.database_url, config.auto_migrate).await {
         log::error!(
             "Failed to initialize PostgreSQL: {e}\n\
@@ -99,15 +104,39 @@ pub async fn start_app() {
         .expect("Failed initialize knowledge base QnA vector database.");
 
     let settings = {
-        let mut s = crate::db::init().await.expect("Initialize database failed");
+        let is_en = *IS_EN;
+        mainflow::init_default_names(is_en).expect("Initialize default flow names failed");
+        let mut s = settings::init_global()
+            .await
+            .expect("Initialize global settings failed");
+        // 首次启动（没有任何机器人）才建默认机器人；不要每次启动都建。
+        let robots = repo::robot::list(repo::pool())
+            .await
+            .expect("List robots failed");
+        if robots.is_empty() {
+            robot::init(is_en)
+                .await
+                .expect("Initialize default robot failed");
+        }
+        // 升级兼容：机器人行可能早于设置迁移就存在（A/redb 时代的旧库），
+        // 没有 robot_settings 的补一份默认值，避免运行期读不到设置。
+        for r in robots.iter() {
+            let exists = repo::settings::get_robot(repo::pool(), &r.robot_id)
+                .await
+                .expect("Read robot settings failed")
+                .is_some();
+            if !exists {
+                settings::init(&r.robot_id)
+                    .await
+                    .expect("Initialize robot settings failed");
+            }
+        }
         for argument in std::env::args() {
             if argument.eq("-rs") {
                 s = settings::GlobalSettings::default();
-                match crate::db::global_store().await {
-                    Ok(store) => settings::save_global_settings(store, &s).await,
-                    Err(e) => Err(e),
-                }
-                .expect("Reset settings failed");
+                settings::save_global_settings(&s)
+                    .await
+                    .expect("Reset settings failed");
                 break;
             }
         }

@@ -17,6 +17,8 @@ use serde::Deserialize;
 pub(crate) const CONFIG_PATH_ENV: &str = "KIKO_CONFIG";
 /// DSN 的环境变量覆盖，优先于配置文件里的 `[database] url`。
 pub(crate) const DATABASE_URL_ENV: &str = "KIKO_DATABASE_URL";
+/// 主密钥的环境变量覆盖（D20），优先于 `[security] master_key`。
+pub(crate) const MASTER_KEY_ENV: &str = "KIKO_MASTER_KEY";
 /// 默认配置文件。仓库根的 `config.toml` 是 rustc 构建配置，两者不许重名（D34）。
 pub(crate) const DEFAULT_CONFIG_PATH: &str = "data/kiko.toml";
 
@@ -35,12 +37,20 @@ url = ""
 
 # 启动时自动执行 migration；由 DBA 统一跑 DDL 的部署改成 false（D45）。
 auto_migrate = true
+
+[security]
+# 主密钥（base64 的 32 字节），用于加密 settings 里的敏感字段（D20/D36）。
+# 优先级：KIKO_MASTER_KEY 环境变量 > 这里的值 > 自动生成的 data/master.key。
+# 留空即可：首次启动会生成 data/master.key（Unix 下 0600）。
+master_key = ""
 "#;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) database_url: String,
     pub(crate) auto_migrate: bool,
+    /// 配置文件里的 `[security] master_key`；空/缺失时由 `security` 自动生成。
+    pub(crate) master_key: Option<String>,
     /// 实际生效的配置文件路径，日志里要打出来，现场排查第一步就是确认读的哪个文件。
     pub(crate) source: PathBuf,
 }
@@ -49,12 +59,19 @@ pub(crate) struct Config {
 struct FileConfig {
     #[serde(default)]
     database: DatabaseSection,
+    #[serde(default)]
+    security: SecuritySection,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct DatabaseSection {
     url: Option<String>,
     auto_migrate: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SecuritySection {
+    master_key: Option<String>,
 }
 
 /// 读取配置。**任何缺失都返回 `Err`**，由调用方打印并 `exit(非 0)`（D33）。
@@ -96,6 +113,16 @@ pub(crate) fn load() -> Result<Config, String> {
     Ok(Config {
         database_url,
         auto_migrate: file.database.auto_migrate.unwrap_or(true),
+        master_key: std::env::var(MASTER_KEY_ENV)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                file.security
+                    .master_key
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            }),
         source: path,
     })
 }
@@ -122,6 +149,8 @@ mod tests {
         let file: FileConfig = toml::from_str(TEMPLATE).expect("模板必须是合法 TOML");
         assert_eq!(file.database.url.as_deref(), Some(""));
         assert_eq!(file.database.auto_migrate, Some(true));
+        // 主密钥留空 → security 自动生成 data/master.key。
+        assert_eq!(file.security.master_key.as_deref(), Some(""));
     }
 
     #[test]

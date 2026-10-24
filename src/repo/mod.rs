@@ -4,15 +4,19 @@
 //! 每个仓储方法显式接收 `&PgPool` 是有意的 —— 集成测试因此可以给每个用例一个
 //! 独立 schema 的池（`tmp_<uuid>`），而不必去改全局单例（§7 测试约定）。
 //!
-//! 迁移期间 S2–S3 还有模块挂在 redb 上，`crate::db`（redb 门面）会与这里并存到
-//! S4；但**新表、新字段一律只落在 PG**（硬约束 3）。
+//! 迁移状态：redb 已彻底移除（S2/S3 完成），这里覆盖全部关系型业务数据；
+//! turso 只剩知识库/意图的向量与载荷（S4 再搬）。**新表、新字段一律只落在 PG**
+//! （硬约束 3）。
 
+pub(crate) mod app_meta;
 pub(crate) mod context;
 pub(crate) mod external_http;
 pub(crate) mod intent;
 pub(crate) mod mainflow;
 pub(crate) mod robot;
 pub(crate) mod runtime_node;
+pub(crate) mod secret;
+pub(crate) mod settings;
 pub(crate) mod subflow;
 pub(crate) mod variable;
 
@@ -37,6 +41,13 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/pg");
 pub(crate) fn pool() -> &'static PgPool {
     POOL.get()
         .expect("repo::init() 必须先于任何仓储调用（start_app 的第一步）")
+}
+
+/// 集成测试用：把全局池指向某个 `tmp_<uuid>` schema，供需要 `repo::pool()` 的
+/// 业务粘合层（settings 缓存/加密）做端到端测试。只能成功一次。
+#[cfg(test)]
+pub(crate) fn install_test_pool(pool: PgPool) -> bool {
+    POOL.set(pool).is_ok()
 }
 
 /// 连池 + 建 schema + 跑 migration。任何一步失败都直接返回错误，由启动路径 fail-fast（D33）。
@@ -136,6 +147,8 @@ mod test_support {
     impl TestDb {
         pub(crate) async fn new() -> Option<Self> {
             let url = test_dsn()?;
+            // secrets 的加解密需要主密钥；测试用固定密钥，避免碰 data/master.key。
+            crate::security::init_with_key([42u8; 32]);
             let schema = format!("tmp_{}", scru128::new_string().to_lowercase());
             let admin = PgPoolOptions::new()
                 .max_connections(1)

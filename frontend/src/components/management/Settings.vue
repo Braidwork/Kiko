@@ -687,7 +687,7 @@ const smtpTest = async () => {
     const r = await httpReq(
         "POST",
         "management/settings/smtp/test",
-        null,
+        { robotId: robotId },
         null,
         settings,
     );
@@ -1173,6 +1173,7 @@ const fetchChatModelList = async () => {
             "GET",
             "management/settings/model/openai/list",
             {
+                robotId: robotId,
                 url: settings.chatProvider.apiUrl,
                 apiKey: settings.chatProvider.apiKey,
                 proxyUrl: settings.chatProvider.proxyUrl,
@@ -1500,6 +1501,7 @@ const fetchSentenceEmbeddingModelList = async () => {
             "GET",
             "management/settings/model/openai/list",
             {
+                robotId: robotId,
                 url: settings.sentenceEmbeddingProvider.apiUrl,
                 apiKey: settings.sentenceEmbeddingProvider.apiKey,
                 proxyUrl: settings.sentenceEmbeddingProvider.proxyUrl,
