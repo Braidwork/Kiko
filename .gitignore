@@ -28,3 +28,6 @@ TODO.txt
 .idea
 src/web/asset.rs
 src/web/asset.txt
+
+# 内部设计文档：保留在工作区，不进仓库（AGENTS.md 仍指向这个路径）
+doc/kiko-plan.md

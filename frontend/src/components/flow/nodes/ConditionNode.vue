@@ -114,7 +114,7 @@ onMounted(async () => {
         d.splice(0, d.length);
         r.data.forEach(function (item, index, arr) {
             // console.log(item.name)
-            this.push({ label: item.intent_name, value: item.intent_name });
+            this.push({ label: item.intentName, value: item.intentName });
         }, d);
     }
     r = await httpReq('GET', 'variable', { robotId: robotId }, null, null);

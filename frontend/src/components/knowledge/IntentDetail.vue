@@ -37,10 +37,10 @@ onMounted(async () => {
     let t = await httpReq('GET', 'intent/detail', formData, null, null);
     console.log(t.data);
     if (t.status == 200 && t.data) {
-        intentName.value = t.data.intent_name;
+        intentName.value = t.data.intentName;
         intentData.keywords = t.data.keywords;
         intentData.regexes = t.data.regexes;
-        intentData.phrases = t.data.phrases.map((cur, idx, arr) => cur.phrase);
+        intentData.phrases = t.data.phrases;
     }
     t = await httpReq("GET", 'management/settings/model/check/embedding', { robotId: robotId }, null, null);
     // console.log(t);
@@ -65,16 +65,17 @@ async function newKeyword() {
         formData.data = keywordValue.value;
         const t = await httpReq('POST', 'intent/keyword', { id: formData.id, data: route.query.idx }, null, formData);
         console.log(t.data);
-        if (t.status == 200)
-            intentData.keywords.push(keywordValue.value)
+        // 后端返回新关键词的 id；之后删除按 id，不再用数组下标（D10）。
+        if (t.status == 200 && t.data)
+            intentData.keywords.push({ id: t.data, keyword: keywordValue.value })
     }
     keywordInputVisible.value = false
     keywordValue.value = ''
 }
 
-async function removeKeyword(w) {
+async function removeKeyword(kw) {
     ElMessageBox.confirm(
-        w + ' will be deleted permanently. Continue?',
+        kw.keyword + ' will be deleted permanently. Continue?',
         'Warning',
         {
             confirmButtonText: 'OK',
@@ -83,13 +84,13 @@ async function removeKeyword(w) {
         }
     )
         .then(async () => {
-            const idx = intentData.keywords.indexOf(w);
+            const idx = intentData.keywords.findIndex(cur => cur.id == kw.id);
             formData.id = route.query.id;
-            formData.data = idx.toString();
+            formData.data = kw.id;
             const t = await httpReq('DELETE', 'intent/keyword', null, null, formData);
             console.log(t.data);
             if (t.status == 200) {
-                intentData.keywords.splice(idx, 1);
+                if (idx >= 0) intentData.keywords.splice(idx, 1);
                 ElMessage({
                     type: 'success',
                     message: 'Delete completed',
@@ -121,16 +122,16 @@ async function newRegex() {
         formData.data = regexValue.value;
         const t = await httpReq('POST', 'intent/regex', { id: formData.id, data: route.query.idx }, null, formData);
         console.log(t.data);
-        if (t.status == 200)
-            intentData.regexes.push(regexValue.value)
+        if (t.status == 200 && t.data)
+            intentData.regexes.push({ id: t.data, regex: regexValue.value })
     }
     regexInputVisible.value = false
     regexValue.value = ''
 }
 
-async function removeRegex(w) {
+async function removeRegex(re) {
     ElMessageBox.confirm(
-        w + ' will be deleted permanently. Continue?',
+        re.regex + ' will be deleted permanently. Continue?',
         'Warning',
         {
             confirmButtonText: 'OK',
@@ -139,13 +140,13 @@ async function removeRegex(w) {
         }
     )
         .then(async () => {
-            const idx = intentData.regexes.indexOf(w);
+            const idx = intentData.regexes.findIndex(cur => cur.id == re.id);
             formData.id = route.query.id;
-            formData.data = idx.toString();
+            formData.data = re.id;
             const t = await httpReq('DELETE', 'intent/regex', null, null, formData);
             console.log(t.data);
             if (t.status == 200) {
-                intentData.regexes.splice(idx, 1);
+                if (idx >= 0) intentData.regexes.splice(idx, 1);
                 ElMessage({
                     type: 'success',
                     message: 'Delete completed',
@@ -181,8 +182,8 @@ async function newPhrase() {
         formData.data = phraseValue.value;
         const t = await httpReq('POST', 'intent/phrase', { robotId: robotId, id: formData.id, data: route.query.idx }, null, formData);
         // console.log(t.data);
-        if (t.status == 200)
-            intentData.phrases.push(phraseValue.value)
+        if (t.status == 200 && t.data)
+            intentData.phrases.push({ id: t.data, phrase: phraseValue.value })
         else {
             addPhraseFailedAlertTitle.value = 'Added similar sentence failed: ' + t.err.message;
             // ElMessage.error(t.err.message);
@@ -193,9 +194,9 @@ async function newPhrase() {
     phraseValue.value = ''
 }
 
-async function removePhrase(w) {
+async function removePhrase(p) {
     ElMessageBox.confirm(
-        w + ' will be deleted permanently. Continue?',
+        p.phrase + ' will be deleted permanently. Continue?',
         'Warning',
         {
             confirmButtonText: 'OK',
@@ -204,13 +205,13 @@ async function removePhrase(w) {
         }
     )
         .then(async () => {
-            const idx = intentData.phrases.indexOf(w);
+            const idx = intentData.phrases.findIndex(cur => cur.id == p.id);
             formData.id = route.query.id;
-            formData.data = idx.toString();
+            formData.data = p.id;
             const t = await httpReq('DELETE', 'intent/phrase', null, null, formData);
             console.log(t.data);
             if (t.status == 200) {
-                intentData.phrases.splice(idx, 1);
+                if (idx >= 0) intentData.phrases.splice(idx, 1);
                 ElMessage({
                     type: 'success',
                     message: 'Delete completed',
@@ -492,9 +493,9 @@ const goBack = () => {
                 <span class="tag-group-hint">Case insensitive</span>
             </div>
             <div class="tag-group-body">
-                <el-tag v-for="tag in intentData.keywords" :key="tag" closable
-                    :disable-transitions="false" @close="removeKeyword(tag)">
-                    {{ tag }}
+                <el-tag v-for="kw in intentData.keywords" :key="kw.id" closable
+                    :disable-transitions="false" @close="removeKeyword(kw)">
+                    {{ kw.keyword }}
                 </el-tag>
                 <span class="tag-group-empty" v-if="!keywordInputVisible && intentData.keywords.length === 0">
                     No keywords yet —
@@ -516,9 +517,9 @@ const goBack = () => {
                 <span class="count-badge">{{ intentData.regexes.length }}</span>
             </div>
             <div class="tag-group-body">
-                <el-tag v-for="tag in intentData.regexes" :key="tag" closable
-                    :disable-transitions="false" @close="removeRegex(tag)">
-                    {{ tag }}
+                <el-tag v-for="re in intentData.regexes" :key="re.id" closable
+                    :disable-transitions="false" @close="removeRegex(re)">
+                    {{ re.regex }}
                 </el-tag>
                 <span class="tag-group-empty" v-if="!regexInputVisible && intentData.regexes.length === 0">
                     No regexes yet —
@@ -540,9 +541,9 @@ const goBack = () => {
                 <span class="count-badge">{{ intentData.phrases.length }}</span>
             </div>
             <div class="tag-group-body">
-                <el-tag v-for="tag in intentData.phrases" :key="tag" closable
-                    :disable-transitions="false" @close="removePhrase(tag)">
-                    {{ tag }}
+                <el-tag v-for="p in intentData.phrases" :key="p.id" closable
+                    :disable-transitions="false" @close="removePhrase(p)">
+                    {{ p.phrase }}
                 </el-tag>
                 <span class="tag-group-empty" v-if="!phraseInputVisible && intentData.phrases.length === 0 && !phraseInputDisabled">
                     No similar phrases yet —

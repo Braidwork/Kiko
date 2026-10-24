@@ -8,6 +8,7 @@
 //! S4；但**新表、新字段一律只落在 PG**（硬约束 3）。
 
 pub(crate) mod external_http;
+pub(crate) mod intent;
 pub(crate) mod robot;
 pub(crate) mod variable;
 

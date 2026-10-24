@@ -39,7 +39,7 @@ async function newIntent() {
         await list();
 }
 function editIntent(idx, row) {
-    router.push({ path: '/robot/' + robotId + '/intent/detail', query: { id: intentData.value[idx].intent_id, idx: idx, name: row.name } });
+    router.push({ path: '/robot/' + robotId + '/intent/detail', query: { id: intentData.value[idx].intentId, idx: idx, name: row.intentName } });
 }
 async function deleteIntent(idx, row) {
     ElMessageBox.confirm(
@@ -51,7 +51,7 @@ async function deleteIntent(idx, row) {
             type: 'warning',
         }
     ).then(async () => {
-        const formData = { robotId: robotId, id: intentData.value[idx].intent_id, data: idx.toString() };
+        const formData = { robotId: robotId, id: intentData.value[idx].intentId, data: idx.toString() };
         const t = await httpReq('DELETE', 'intent', null, null, formData);
         console.log(t.data);
         if (t.status == 200) {
@@ -133,7 +133,7 @@ function detectIntent() {
     </div>
     <div class="page-card">
         <el-table :data="intentData" stripe style="width: 100%">
-            <el-table-column prop="intent_name" :label="tm('intent.table')[0]" width="220" />
+            <el-table-column prop="intentName" :label="tm('intent.table')[0]" width="220" />
             <el-table-column :label="tm('intent.table')[1]" width="160" align="center">
                 <template #default="scope">
                     <span class="count-badge">{{ scope.row.keywords.length }}</span>

@@ -6,15 +6,10 @@ use axum::extract::Query;
 use axum::response::IntoResponse;
 
 use super::detector;
-use super::dto::{IntentDetail, IntentFormData, IntentPhraseData};
-use crate::db;
-use crate::db_executor;
+use super::dto::{IntentDetail, IntentFormData};
+use crate::repo;
 use crate::result::{Error, Result};
 use crate::web::server::to_res;
-
-// pub(crate) const TABLE: redb::TableDefinition<&str, &[u8]> =
-//     redb::TableDefinition::new(INTENT_LIST_KEY);
-pub(crate) const TABLE_SUFFIX: &str = "intents";
 
 pub(crate) async fn init(robot_id: &str, is_en: bool) -> Result<()> {
     // Positive
@@ -38,32 +33,15 @@ pub(crate) async fn init(robot_id: &str, is_en: bool) -> Result<()> {
             "明白", "行", "愿意", "方便", "正确",
         ]
     };
-    let regexes: Vec<&str> = vec![];
-    let mut intent_detail = IntentDetail::new(if is_en { "Positive" } else { "肯定" });
-    let mut v = keywords.into_iter().map(String::from).collect();
-    intent_detail.keywords.append(&mut v);
-    let mut v = regexes.into_iter().map(String::from).collect();
-    intent_detail.regexes.append(&mut v);
-    // let intent_detail = IntentDetail {
-    //     intent_idx: 0,
-    //     intent_id: intent.id.clone(),
-    //     intent_name: intent.name.clone(),
-    //     keywords: keywords.into_iter().map(|s| String::from(s)).collect(),
-    //     regexes: regexes.into_iter().map(|s| String::from(s)).collect(),
-    //     phrases: vec![],
-    // };
-
-    // let table_name = format!("{}intents", robot_id);
-    // let table: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_name);
-    // let mut table = write_txn.open_table(TABLE)?;
-    // db::write(table, intent.id.as_str(), &intent_detail)?;
-    db_executor!(
-        db::write,
+    let keywords: Vec<String> = keywords.into_iter().map(String::from).collect();
+    // 意图与关键词都在 PG（S3.3）；新机器人的两条种子意图按顺序拿 position 0 / 1。
+    repo::intent::create(
+        repo::pool(),
         robot_id,
-        TABLE_SUFFIX,
-        intent_detail.intent_id.as_str(),
-        &intent_detail
-    )?;
+        if is_en { "Positive" } else { "肯定" },
+        &keywords,
+    )
+    .await?;
 
     // Negative
     let keywords = if is_en {
@@ -113,41 +91,21 @@ pub(crate) async fn init(robot_id: &str, is_en: bool) -> Result<()> {
             "不正确",
         ]
     };
-    let regexes: Vec<&str> = vec![];
-    let mut intent_detail = IntentDetail::new(if is_en { "Negative" } else { "否定" });
-    let mut v = keywords.into_iter().map(String::from).collect();
-    intent_detail.keywords.append(&mut v);
-    let mut v = regexes.into_iter().map(String::from).collect();
-    intent_detail.regexes.append(&mut v);
-    // let intent_detail = IntentDetail {
-    //     intent_idx: 1,
-    //     intent_id: intent.id.clone(),
-    //     intent_name: intent.name.clone(),
-    //     keywords: keywords.into_iter().map(|s| String::from(s)).collect(),
-    //     regexes: regexes.into_iter().map(|s| String::from(s)).collect(),
-    //     phrases: vec![],
-    // };
-
-    // db::write(table, intent.id.as_str(), &intent_detail)?;
-    db_executor!(
-        db::write,
+    let keywords: Vec<String> = keywords.into_iter().map(String::from).collect();
+    repo::intent::create(
+        repo::pool(),
         robot_id,
-        TABLE_SUFFIX,
-        intent_detail.intent_id.as_str(),
-        &intent_detail
-    )?;
+        if is_en { "Negative" } else { "否定" },
+        &keywords,
+    )
+    .await?;
 
-    // db::write(table, INTENT_LIST_KEY, &intents)
     Ok(())
 }
 
 pub(crate) async fn list(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
-    // let r: Result<Option<Vec<Intent>>> = db::query(TABLE, INTENT_LIST_KEY);
     if let Some(robot_id) = q.get("robotId") {
-        let r: Result<Vec<IntentDetail>> = async {
-            db_executor!(db::get_all, robot_id, TABLE_SUFFIX,)
-        }
-        .await;
+        let r: Result<Vec<IntentDetail>> = repo::intent::list(repo::pool(), robot_id).await;
         to_res(r)
     } else {
         to_res(Err(Error::WithMessage(String::from(
@@ -161,29 +119,17 @@ pub(crate) async fn add(Json(params): Json<IntentFormData>) -> impl IntoResponse
     to_res(r)
 }
 
-async fn add_intent(robot_id: &str, intent_name: &str) -> Result<()> {
-    // let d: Option<Vec<Intent>> = db::query(TABLE, INTENT_LIST_KEY)?;
-    let intent_detail = IntentDetail::new(intent_name);
-    // db::write(TABLE, intent.id.as_str(), &intent_detail)?;
-    // Ok(())
-    db_executor!(
-        db::write,
-        robot_id,
-        TABLE_SUFFIX,
-        intent_detail.intent_id.as_str(),
-        &intent_detail
-    )
+async fn add_intent(robot_id: &str, intent_name: &str) -> Result<String> {
+    repo::intent::create(repo::pool(), robot_id, intent_name, &[]).await
 }
 
 pub(crate) async fn remove(Json(params): Json<IntentFormData>) -> impl IntoResponse {
     let r: Result<()> = async {
+        // 短语向量在 turso，先清（幂等），再删 PG 行；PG 级联掉关键词/正则/短语。
+        // 两步之间失败只会留下可由重建补齐的孤儿向量，不会留下「意图还在但向量没了」。
         super::phrase::remove_by_intent_id(&params.robot_id, params.id.as_str()).await?;
-        db_executor!(
-            db::remove,
-            &params.robot_id,
-            TABLE_SUFFIX,
-            params.id.as_str()
-        )
+        repo::intent::delete(repo::pool(), &params.robot_id, params.id.as_str()).await?;
+        Ok(())
     }
     .await;
     to_res(r)
@@ -193,49 +139,36 @@ pub(in crate::intent) async fn get_detail_by_id(
     robot_id: &str,
     intent_id: &str,
 ) -> Result<Option<IntentDetail>> {
-    db_executor!(db::query, robot_id, TABLE_SUFFIX, intent_id)
+    repo::intent::get(repo::pool(), robot_id, intent_id).await
 }
 
 pub(crate) async fn detail(Query(params): Query<IntentFormData>) -> impl IntoResponse {
-    // let mut od: Option<IntentDetail> = None;
-    // let r = db::process_data(dbg!(params.id.as_str()), |d: &mut IntentDetail| {
-    //     od = Some(d);
-    //     Ok(())
-    // }).map(|_| od);
-    // to_res(r)
-    // let r: Result<Option<IntentDetail>> = db::query(TABLE, params.id.as_str());
     let r = get_detail_by_id(&params.robot_id, params.id.as_str()).await;
     to_res(r)
 }
 
+/// 追加关键词。返回新关键词的 id，前端据此删除（D10：不再用数组下标）。
 pub(crate) async fn add_keyword(Json(params): Json<IntentFormData>) -> impl IntoResponse {
-    let key = params.id.as_str();
-    let r: Result<()> = async {
-        let op: Option<IntentDetail> =
-            db_executor!(db::query, &params.robot_id, TABLE_SUFFIX, key)?;
-        if let Some(mut d) = op {
-            d.keywords.push(String::from(params.data.as_str()));
-            db_executor!(db::write, &params.robot_id, TABLE_SUFFIX, key, &d)?;
-        }
-        Ok(())
-    }
+    let r = repo::intent::add_keyword(
+        repo::pool(),
+        &params.robot_id,
+        params.id.as_str(),
+        params.data.as_str(),
+    )
     .await;
     to_res(r)
 }
 
+/// `data` 是关键词的 id（不再是下标）。
 pub(crate) async fn remove_keyword(Json(params): Json<IntentFormData>) -> impl IntoResponse {
     let r: Result<()> = async {
-        let idx = params.data.parse::<usize>().map_err(|e| {
-            log::error!("{e:?}");
-            Error::WithMessage(String::from("Invalid parameter"))
-        })?;
-        let key = params.id.as_str();
-        let op: Option<IntentDetail> =
-            db_executor!(db::query, &params.robot_id, TABLE_SUFFIX, key)?;
-        if let Some(mut d) = op {
-            d.keywords.remove(idx);
-            db_executor!(db::write, &params.robot_id, TABLE_SUFFIX, key, &d)?;
-        }
+        repo::intent::remove_keyword(
+            repo::pool(),
+            &params.robot_id,
+            params.id.as_str(),
+            params.data.as_str(),
+        )
+        .await?;
         Ok(())
     }
     .await;
@@ -243,192 +176,145 @@ pub(crate) async fn remove_keyword(Json(params): Json<IntentFormData>) -> impl I
 }
 
 pub(crate) async fn add_regex(Json(params): Json<IntentFormData>) -> impl IntoResponse {
-    let key = params.id.as_str();
-    let r: Result<()> = async {
-        let op: Option<IntentDetail> =
-            db_executor!(db::query, &params.robot_id, TABLE_SUFFIX, key)?;
-        if let Some(mut d) = op {
-            let _ = regex::Regex::new(params.data.as_str())?;
-            d.regexes.push(String::from(params.data.as_str()));
-            db_executor!(db::write, &params.robot_id, TABLE_SUFFIX, key, &d)?;
-        }
-        Ok(())
+    let r: Result<Option<String>> = async {
+        // 语法错误在写库之前就返回（与 A 一致）。
+        let _ = regex::Regex::new(params.data.as_str())?;
+        repo::intent::add_regex(
+            repo::pool(),
+            &params.robot_id,
+            params.id.as_str(),
+            params.data.as_str(),
+        )
+        .await
     }
     .await;
     to_res(r)
 }
 
+/// `data` 是正则的 id（不再是下标）。
 pub(crate) async fn remove_regex(Json(params): Json<IntentFormData>) -> impl IntoResponse {
     let r: Result<()> = async {
-        let idx = params.data.parse::<usize>().map_err(|e| {
-            log::error!("{e:?}");
-            Error::WithMessage(String::from("Invalid parameter"))
-        })?;
-        let key = params.id.as_str();
-        let op: Option<IntentDetail> =
-            db_executor!(db::query, &params.robot_id, TABLE_SUFFIX, key)?;
-        if let Some(mut d) = op {
-            d.regexes.remove(idx);
-            db_executor!(db::write, &params.robot_id, TABLE_SUFFIX, key, &d)?;
-        }
+        repo::intent::remove_regex(
+            repo::pool(),
+            &params.robot_id,
+            params.id.as_str(),
+            params.data.as_str(),
+        )
+        .await?;
         Ok(())
     }
     .await;
     to_res(r)
 }
 
+/// 加一条短语：先算向量写 turso，再落 PG 载荷。返回新短语的 id。
 #[axum::debug_handler]
-pub(crate) async fn add_phrase(
-    // Query(query): Query<IntentFormData>,
-    Json(params): Json<IntentFormData>,
-) -> impl IntoResponse {
-    let r: Result<()> = async {
+pub(crate) async fn add_phrase(Json(params): Json<IntentFormData>) -> impl IntoResponse {
+    let r: Result<Option<String>> = async {
         let intent_id = params.id.as_str();
-        let phrase = &params.data;
-        let d: Option<IntentDetail> =
-            db_executor!(db::query, &params.robot_id, TABLE_SUFFIX, intent_id)?;
-        let mut d = match d {
-            Some(d) => d,
-            None => {
-                return Err(Error::WithMessage(String::from(
-                    "Can NOT find intention detail",
-                )));
-            }
+        let phrase = params.data.as_str();
+        let Some(meta) = repo::intent::get_meta(repo::pool(), &params.robot_id, intent_id).await?
+        else {
+            return Err(Error::WithMessage(String::from(
+                "Can NOT find intention detail",
+            )));
         };
-        let vec_row_id =
-            super::phrase::add(&params.robot_id, None, intent_id, &d.intent_name, phrase)
-                .await
-                .map_err(|e| {
-                    log::error!("{:#?}", &e);
-                    Error::WithMessage(String::from("Invalid idx parameter."))
-                })?;
-        d.phrases.push(IntentPhraseData {
-            id: vec_row_id,
-            phrase: String::from(params.data.as_str()),
-        });
-        // log::info!("intent detail {} {}", intent_id, serde_json::to_string(&d).unwrap());
-        db_executor!(db::write, &params.robot_id, TABLE_SUFFIX, intent_id, &d)
+        let vec_row_id = super::phrase::add(&params.robot_id, intent_id, &meta.name, phrase)
+            .await
+            .map_err(|e| {
+                log::error!("{:#?}", e);
+                Error::WithMessage(String::from("Invalid idx parameter."))
+            })?;
+
+        match repo::intent::add_phrase(
+            repo::pool(),
+            &params.robot_id,
+            intent_id,
+            phrase,
+            vec_row_id,
+        )
+        .await
+        {
+            Ok(Some(id)) => Ok(Some(id)),
+            Ok(None) => {
+                // 意图在算向量期间被删掉了：回滚刚写的向量行，避免留下孤儿。
+                if let Err(e) = super::phrase::remove(&params.robot_id, vec_row_id).await {
+                    log::warn!("Removing orphan phrase vector failed: {e:?}");
+                }
+                Err(Error::WithMessage(String::from(
+                    "Can NOT find intention detail",
+                )))
+            }
+            Err(e) => {
+                if let Err(e2) = super::phrase::remove(&params.robot_id, vec_row_id).await {
+                    log::warn!("Removing orphan phrase vector failed: {e2:?}");
+                }
+                Err(e)
+            }
+        }
     }
     .await;
     to_res(r)
 }
 
-/*
-pub(crate) async fn add_phrase(
-    Query(query): Query<IntentFormData>,
-    Json(params): Json<IntentFormData>,
-) -> impl IntoResponse {
-    let key = params.id.as_str();
-    let r: Result<Option<IntentDetail>> =
-        db_executor!(db::query, &params.robot_id, TABLE_SUFFIX, key);
-    if r.is_err() {
-        return to_res(r.map(|_| ()));
-    }
-    let r = r.unwrap();
-    if r.is_none() {
-        return to_res(Err(Error::ErrorWithMessage(String::from(
-            "Can NOT find intention detail",
-        ))));
-    }
-    let mut d = r.unwrap();
-    let r =
-        detector::save_intent_embedding(&params.robot_id, key, &d.intent_name, &params.data).await;
-    if r.is_err() {
-        return to_res(r.map(|_| ()));
-    }
-    // let r:Result<i64> = Ok(0i64);
-    d.phrases.push(IntentPhraseData {
-        id: r.unwrap(),
-        phrase: String::from(params.data.as_str()),
-    });
-    let r = query
-        .data
-        .parse::<usize>()
-        .map_err(|e| {
-            log::error!("{:#?}", &e);
-            Error::ErrorWithMessage(String::from("Invalid idx parameter."))
-        })
-        .and_then(|idx| {
-            change_num(&params.robot_id, key, &mut d, |i: &mut Vec<Intent>| {
-                i[idx].phrase_num = i[idx].phrase_num + 1
-            })
-        });
-    to_res(r)
-}
-*/
-
+/// 按 id 删除短语：先删向量行，再删 PG 行。
+///
+/// 顺序是有意的：turso 删失败就整体失败、PG 行还在，重试即可；PG 删失败最多留下
+/// 一条指向已不存在向量的载荷，下一次「重建」会把它连向量一起补回来。
 pub(crate) async fn remove_phrase(Json(params): Json<IntentFormData>) -> impl IntoResponse {
-    let r = params.data.parse::<usize>();
-    let phrase_idx = match r {
-        Ok(n) => n,
-        Err(e) => {
-            log::error!("{e:?}");
-            return to_res(Err(Error::WithMessage(String::from("Invalid parameter"))));
-        }
-    };
-    let key = params.id.as_str();
     let r: Result<()> = async {
-        let op: Option<IntentDetail> =
-            db_executor!(db::query, &params.robot_id, TABLE_SUFFIX, key)?;
-        if let Some(mut d) = op {
-            let phrase = d.phrases.remove(phrase_idx);
-            super::phrase::remove(&params.robot_id, phrase.id).await?;
-            db_executor!(db::write, &params.robot_id, TABLE_SUFFIX, key, &d)?;
+        let Some(p) = repo::intent::get_phrase(
+            repo::pool(),
+            &params.robot_id,
+            params.id.as_str(),
+            params.data.as_str(),
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        if let Some(vec_row_id) = p.vec_row_id {
+            super::phrase::remove(&params.robot_id, vec_row_id).await?;
         }
+        repo::intent::delete_phrase(
+            repo::pool(),
+            &params.robot_id,
+            params.id.as_str(),
+            params.data.as_str(),
+        )
+        .await?;
         Ok(())
     }
     .await;
     to_res(r)
-    // let r = params
-    //     .data
-    //     .parse::<usize>()
-    //     .map_err(|e| {
-    //         log::error!("{:?}", e);
-    //         Error::ErrorWithMessage(String::from("Invalid parameter"))
-    //     })
-    //     .and_then(|idx| {
-    //         let key = params.id.as_str();
-    //         let result: Result<Option<IntentDetail>> =
-    //             db_executor!(db::query, &params.robot_id, TABLE_SUFFIX, key);
-    //         result.and_then(|mut op| {
-    //             if op.is_some() {
-    //                 let mut d = op.as_mut().unwrap();
-    //                 let phrase = d.phrases.remove(idx);
-    //                 crate::db::embedding::remove(&params.robot_id, key, phrase.id).await.and_then(|_| {
-    //                     let idx = d.intent_idx;
-    //                     change_num(&params.robot_id, key, &mut d, |i: &mut Vec<Intent>| {
-    //                         i[idx].phrase_num = i[idx].phrase_num - 1
-    //                     })
-    //                 })
-    //             } else {
-    //                 Ok(())
-    //             }
-    //         })
-    //     });
-    // to_res(r)
 }
 
 pub(crate) async fn detect(Json(params): Json<IntentFormData>) -> impl IntoResponse {
     to_res(detector::detect(&params.robot_id, &params.data).await)
 }
 
+/// 给一个意图的**全部**短语重算向量（模型/维度变了之后用）。
+///
+/// 按 `vec_row_id` 原地更新，不删表：这些短语的载荷现在在 PG，删 turso 表后
+/// 旧实现用 `UPDATE … WHERE id = ?` 会一行都更新不到（见 §18）。
 pub(crate) async fn regenerate_embeddings(
     Query(params): Query<IntentFormData>,
 ) -> impl IntoResponse {
-    let key = params.id.as_str();
+    let intent_id = params.id.as_str();
     let r: Result<()> = async {
-        let op: Option<IntentDetail> =
-            db_executor!(db::query, &params.robot_id, TABLE_SUFFIX, key)?;
-        let d = match op {
-            Some(d) => d,
-            None => {
-                return Err(Error::WithMessage(String::from(
-                    "Can NOT find intention detail",
-                )));
-            }
+        let Some(meta) = repo::intent::get_meta(repo::pool(), &params.robot_id, intent_id).await?
+        else {
+            return Err(Error::WithMessage(String::from(
+                "Can NOT find intention detail",
+            )));
         };
-        // let array: Vec<&str> = d.phrases.iter().map(|v| v.phrase.as_ref()).collect();
-        super::phrase::batch_add(&params.robot_id, &params.data, &d.intent_name, &d.phrases).await
+        let phrases: Vec<(i64, String)> =
+            repo::intent::list_phrase_vectors(repo::pool(), &params.robot_id, intent_id)
+                .await?
+                .into_iter()
+                .filter_map(|p| p.vec_row_id.map(|id| (id, p.phrase)))
+                .collect();
+        super::phrase::update_vectors(&params.robot_id, intent_id, &meta.name, &phrases).await
     }
     .await;
     to_res(r)

@@ -3,7 +3,7 @@
 //! 每个用例自建 `tmp_<uuid>` schema、跑 migration、结束时 drop，不污染共享库。
 //! 没配 `KIKO_TEST_DATABASE_URL` 时整组跳过 —— 没有 PG 的环境不该因此红一片。
 
-use super::{external_http, robot, test_support::TestDb, variable};
+use super::{external_http, intent, robot, test_support::TestDb, variable};
 use crate::external::http::dto::{
     HttpReqInfo, HttpReqParam, Method, PostContentType, Protocol, ValueSource,
 };
@@ -372,6 +372,369 @@ async fn external_http_surfaces_missing_robot_as_business_error() {
 
     // 机器人不存在 → 外键冲突。错误文案要是人话（B-08），不是 sqlx 的原文。
     let err = external_http::upsert(&db.pool, "no-such-robot", &http_api("api1", "x"))
+        .await
+        .expect_err("外键冲突必须返回错误");
+    let msg = err.message();
+    assert!(
+        msg.contains("Referenced row is missing"),
+        "unexpected error message: {msg}"
+    );
+
+    db.cleanup().await;
+}
+
+/// 读一个意图的子项 `(id, 文本, position)`，按 position 排好。
+async fn intent_children(
+    db: &TestDb,
+    table: &str,
+    text_column: &str,
+    intent_id: &str,
+) -> Vec<(String, String, i32)> {
+    let sql = format!(
+        "SELECT id, {text_column}, position FROM {table} WHERE intent_id = $1 ORDER BY position"
+    );
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(intent_id)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn intent_crud_roundtrip_and_position_order() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rI", "intents"))
+        .await
+        .unwrap();
+
+    let alpha = intent::create(
+        &db.pool,
+        "rI",
+        "alpha",
+        &[String::from("k1"), String::from("k2")],
+    )
+    .await
+    .unwrap();
+    let beta = intent::create(&db.pool, "rI", "beta", &[]).await.unwrap();
+
+    let k3 = intent::add_keyword(&db.pool, "rI", &alpha, "k3")
+        .await
+        .unwrap()
+        .expect("意图存在时必须返回新关键词 id");
+    let r1 = intent::add_regex(&db.pool, "rI", &alpha, "^hi$")
+        .await
+        .unwrap()
+        .expect("意图存在时必须返回新正则 id");
+    let p1 = intent::add_phrase(&db.pool, "rI", &alpha, "hello", 101)
+        .await
+        .unwrap()
+        .expect("意图存在时必须返回新短语 id");
+
+    let got = intent::get(&db.pool, "rI", &alpha)
+        .await
+        .unwrap()
+        .expect("alpha 应该存在");
+    assert_eq!(got.intent_name, "alpha");
+    let keywords: Vec<&str> = got.keywords.iter().map(|k| k.keyword.as_str()).collect();
+    assert_eq!(keywords, ["k1", "k2", "k3"], "关键词按 position 追加");
+    assert_eq!(got.keywords[2].id, k3, "返回的 id 要能定位到这一行");
+    assert_eq!(got.regexes.len(), 1);
+    assert_eq!(got.regexes[0].id, r1);
+    assert_eq!(got.regexes[0].regex, "^hi$");
+    assert_eq!(got.phrases.len(), 1);
+    assert_eq!(got.phrases[0].id, p1);
+    assert_eq!(got.phrases[0].phrase, "hello");
+
+    let list = intent::list(&db.pool, "rI").await.unwrap();
+    let names: Vec<&str> = list.iter().map(|d| d.intent_name.as_str()).collect();
+    assert_eq!(names, ["alpha", "beta"], "意图按 position 排序");
+
+    // 按 id 删除中间的关键词，剩下的顺序不变。
+    let k2_id = got.keywords[1].id.clone();
+    assert!(
+        intent::remove_keyword(&db.pool, "rI", &alpha, &k2_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !intent::remove_keyword(&db.pool, "rI", &alpha, &k2_id)
+            .await
+            .unwrap()
+    );
+    let got = intent::get(&db.pool, "rI", &alpha).await.unwrap().unwrap();
+    let keywords: Vec<&str> = got.keywords.iter().map(|k| k.keyword.as_str()).collect();
+    assert_eq!(keywords, ["k1", "k3"]);
+
+    // 短语的向量行号是内部列，但删除短语需要它。
+    let phrase = intent::get_phrase(&db.pool, "rI", &alpha, &p1)
+        .await
+        .unwrap()
+        .expect("p1 应该存在");
+    assert_eq!(phrase.vec_row_id, Some(101));
+    assert_eq!(phrase.phrase, "hello");
+    assert!(
+        intent::delete_phrase(&db.pool, "rI", &alpha, &p1)
+            .await
+            .unwrap()
+    );
+    assert!(
+        intent::get_phrase(&db.pool, "rI", &alpha, &p1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // 删意图：子表全部级联。
+    assert!(intent::delete(&db.pool, "rI", &beta).await.unwrap());
+    assert!(intent::get(&db.pool, "rI", &beta).await.unwrap().is_none());
+    assert!(!intent::delete(&db.pool, "rI", &beta).await.unwrap());
+    assert!(intent::delete(&db.pool, "rI", &alpha).await.unwrap());
+    for table in ["intent_keywords", "intent_regexes", "intent_phrases"] {
+        let left: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(left, 0, "删意图必须级联清掉 {table}");
+    }
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn intent_positions_leave_holes_and_append() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rP", "positions"))
+        .await
+        .unwrap();
+    let id = intent::create(&db.pool, "rP", "p", &[]).await.unwrap();
+
+    for k in ["a", "b", "c"] {
+        intent::add_keyword(&db.pool, "rP", &id, k)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let rows = intent_children(&db, "intent_keywords", "keyword", &id).await;
+    let b_id = rows[1].0.clone();
+    assert!(
+        intent::remove_keyword(&db.pool, "rP", &id, &b_id)
+            .await
+            .unwrap()
+    );
+    intent::add_keyword(&db.pool, "rP", &id, "d")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // 删除留空洞，新增取 MAX+1 —— 不重排已有行（§5.1）。
+    let rows = intent_children(&db, "intent_keywords", "keyword", &id).await;
+    let got: Vec<(&str, i32)> = rows.iter().map(|(_, k, p)| (k.as_str(), *p)).collect();
+    assert_eq!(got, [("a", 0), ("c", 2), ("d", 3)]);
+
+    let got = intent::get(&db.pool, "rP", &id).await.unwrap().unwrap();
+    let keywords: Vec<&str> = got.keywords.iter().map(|k| k.keyword.as_str()).collect();
+    assert_eq!(keywords, ["a", "c", "d"], "读出来的顺序必须是 position 序");
+
+    // 意图自身的 position 同理：删 middle 不影响后面。
+    let first = id;
+    let second = intent::create(&db.pool, "rP", "second", &[]).await.unwrap();
+    let third = intent::create(&db.pool, "rP", "third", &[]).await.unwrap();
+    assert!(intent::delete(&db.pool, "rP", &second).await.unwrap());
+    let fourth = intent::create(&db.pool, "rP", "fourth", &[]).await.unwrap();
+    let list = intent::list(&db.pool, "rP").await.unwrap();
+    let ids: Vec<&str> = list.iter().map(|d| d.intent_id.as_str()).collect();
+    assert_eq!(ids, [first.as_str(), third.as_str(), fourth.as_str()]);
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_intent_writes_get_distinct_positions() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rC", "concurrent"))
+        .await
+        .unwrap();
+    let id = intent::create(&db.pool, "rC", "c", &[]).await.unwrap();
+
+    // 8 个并发追加：没有父行锁时，多个事务会读到同一个 MAX(position)，
+    // 写出重复的 position（顺序变得不确定）。
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let pool = db.pool.clone();
+        let intent_id = id.clone();
+        tasks.push(tokio::spawn(async move {
+            let keyword = format!("k{i}");
+            intent::add_keyword(&pool, "rC", &intent_id, &keyword)
+                .await
+                .unwrap()
+                .expect("意图存在");
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    let mut positions: Vec<i32> = sqlx::query_scalar(
+        "SELECT position FROM intent_keywords WHERE intent_id = $1 ORDER BY position",
+    )
+    .bind(&id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    positions.sort_unstable();
+    assert_eq!(
+        positions,
+        (0..8).collect::<Vec<i32>>(),
+        "并发追加必须拿到互不相同的 position"
+    );
+
+    // 并发建意图同理：position 不能重复。
+    let mut tasks = Vec::new();
+    for i in 0..4 {
+        let pool = db.pool.clone();
+        tasks.push(tokio::spawn(async move {
+            intent::create(&pool, "rC", &format!("i{i}"), &[])
+                .await
+                .unwrap()
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let mut positions: Vec<i32> =
+        sqlx::query_scalar("SELECT position FROM intents WHERE robot_id = $1")
+            .bind("rC")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    positions.sort_unstable();
+    assert_eq!(positions, vec![0, 1, 2, 3, 4], "并发建意图不能撞 position");
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn intent_isolates_robots() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rA", "a")).await.unwrap();
+    robot::upsert(&db.pool, &robot("rB", "b")).await.unwrap();
+    let id = intent::create(&db.pool, "rA", "only-a", &[]).await.unwrap();
+    let keyword = intent::add_keyword(&db.pool, "rA", &id, "k")
+        .await
+        .unwrap()
+        .unwrap();
+    let phrase = intent::add_phrase(&db.pool, "rA", &id, "p", 7)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // 另一个机器人既读不到，也不能通过别人的 id 改数据。
+    assert!(intent::get(&db.pool, "rB", &id).await.unwrap().is_none());
+    assert!(intent::list(&db.pool, "rB").await.unwrap().is_empty());
+    assert!(
+        intent::add_keyword(&db.pool, "rB", &id, "stolen")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        intent::add_regex(&db.pool, "rB", &id, "x")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        intent::add_phrase(&db.pool, "rB", &id, "stolen", 8)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !intent::remove_keyword(&db.pool, "rB", &id, &keyword)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !intent::delete_phrase(&db.pool, "rB", &id, &phrase)
+            .await
+            .unwrap()
+    );
+    assert!(!intent::delete(&db.pool, "rB", &id).await.unwrap());
+    assert!(
+        intent::get_meta(&db.pool, "rB", &id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // rA 的数据原封不动。
+    let got = intent::get(&db.pool, "rA", &id).await.unwrap().unwrap();
+    assert_eq!(got.keywords.len(), 1);
+    assert_eq!(got.phrases.len(), 1);
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn deleting_robot_cascades_intents() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rD", "cascade"))
+        .await
+        .unwrap();
+    let id = intent::create(&db.pool, "rD", "d", &[String::from("k")])
+        .await
+        .unwrap();
+    intent::add_regex(&db.pool, "rD", &id, "^d$")
+        .await
+        .unwrap()
+        .unwrap();
+    intent::add_phrase(&db.pool, "rD", &id, "d", 9)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(robot::delete(&db.pool, "rD").await.unwrap());
+    for table in [
+        "intents",
+        "intent_keywords",
+        "intent_regexes",
+        "intent_phrases",
+    ] {
+        let left: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(left, 0, "删机器人必须级联清掉 {table}");
+    }
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn intent_create_surfaces_missing_robot_as_business_error() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let err = intent::create(&db.pool, "no-such-robot", "x", &[])
         .await
         .expect_err("外键冲突必须返回错误");
     let msg = err.message();

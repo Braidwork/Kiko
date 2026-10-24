@@ -7,7 +7,7 @@
 //!
 //! | 表 | 载荷 | 重建入口 |
 //! | --- | --- | --- |
-//! | 意图短语 `phrase.dat` | 红库 `{robot_id}intents` 里的 `phrases[].phrase` | [`crate::intent::phrase::reindex`] |
+//! | 意图短语 `phrase.dat` | PG `intent_phrases.phrase` | [`crate::intent::phrase::reindex`] |
 //! | 问答 `qa.dat` | `{robot_id}.qa_data` 里的主问题 + 相似问题 | [`crate::kb::qa::reindex`] |
 //! | 文档 `doc.dat` | `{robot_id}.doc_content` | [`crate::kb::doc::reindex`] |
 //!
@@ -31,12 +31,10 @@ use axum::extract::Query;
 use axum::response::IntoResponse;
 use serde::Serialize;
 
-use crate::db;
-use crate::db_executor;
-use crate::intent::crud as intent_crud;
 use crate::intent::dto::IntentDetail;
 use crate::kb::{doc, qa};
 use crate::man::settings;
+use crate::repo;
 use crate::result::{Error, Result};
 use crate::robot::dto::RobotQuery;
 use crate::web::server::to_res;
@@ -153,11 +151,12 @@ async fn run(robot_id: &str) -> Result<()> {
     //    先**清空整张短语向量表**再重建：重建只负责"给现存的数据写新向量"，不会
     //    删掉已经不存在的短语留下的孤儿行。孤儿行的维度和新配置不一致，会让
     //    `vector_distance_cos` 在扫到它时报错——那正是我们要修的问题，所以必须连
-    //    它们一起清掉。短语表只有向量列（载荷在红库里），可以整表重建。
+    //    它们一起清掉。短语表只有向量列（载荷在 PG `intent_phrases`），可以整表重建。
     //
     //    总数要先把所有意图的短语加起来，否则界面上的进度条没有分母。
-    let intents: Vec<IntentDetail> =
-        db_executor!(db::get_all, robot_id, intent_crud::TABLE_SUFFIX,)?;
+    //    载荷在 PG（S3.3），重建时逐条插入新的 turso 向量行并把新行号写回
+    //    `intent_phrases.vec_row_id`。
+    let intents: Vec<IntentDetail> = repo::intent::list(repo::pool(), robot_id).await?;
     let total_phrases: usize = intents.iter().map(|d| d.phrases.len()).sum();
     let before_intents = count_rows("phrase.dat", robot_id).await;
     update_status(robot_id, |s| {
@@ -165,7 +164,7 @@ async fn run(robot_id: &str) -> Result<()> {
         s.intents.begin(total_phrases, before_intents);
     });
     crate::intent::phrase::remove_tables(robot_id).await?;
-    crate::intent::phrase::reindex(robot_id, &intents).await?;
+    crate::intent::phrase::reindex(repo::pool(), robot_id, &intents).await?;
     update_status(robot_id, |s| s.intents.done = total_phrases);
     let after_intents = count_rows("phrase.dat", robot_id).await;
     update_status(robot_id, |s| s.intents.after = after_intents);

@@ -385,9 +385,9 @@ const hideForm = () => {
                     >
                         <el-option
                             v-for="item in intents"
-                            :key="item.id"
-                            :label="item.intent_name"
-                            :value="item.intent_id"
+                            :key="item.intentId"
+                            :label="item.intentName"
+                            :value="item.intentId"
                         />
                     </el-select>
                     <el-input

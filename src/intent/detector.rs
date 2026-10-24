@@ -4,14 +4,14 @@ use unicase::UniCase;
 use super::dto::IntentDetail;
 use super::phrase;
 use crate::ai::embedding::embedding;
-use crate::db;
-use crate::db_executor;
+use crate::repo;
 use crate::result::Result;
 
 pub(crate) async fn detect(robot_id: &str, s: &str) -> Result<Option<String>> {
     // let now = std::time::Instant::now();
-    let r: Result<Vec<IntentDetail>> =
-        db_executor!(db::get_all, robot_id, super::crud::TABLE_SUFFIX,);
+    // 意图载荷在 PG（S3.3）：一次取全（含 keywords/regexes/phrases），
+    // 与 A 的 `get_all` 语义一致。
+    let r: Result<Vec<IntentDetail>> = repo::intent::list(repo::pool(), robot_id).await;
     let intents = match r {
         Ok(v) => {
             // log::info!("v.len {}", v.len());
@@ -21,7 +21,7 @@ pub(crate) async fn detect(robot_id: &str, s: &str) -> Result<Option<String>> {
             v
         }
         Err(e) => {
-            log::warn!("Detecting intent failed: {:?}", &e);
+            log::warn!("Detecting intent failed: {:?}", e);
             return Ok(None);
         }
     };
@@ -32,14 +32,14 @@ pub(crate) async fn detect(robot_id: &str, s: &str) -> Result<Option<String>> {
         // log::info!("detail.keywords.len {}", detail.keywords.len());
         let unicase_s = UniCase::new(s);
         for k in detail.keywords.iter() {
-            // log::info!("intent compare {} {}", k, s);
-            if UniCase::new(k) == unicase_s {
-                // println!("{} {} {}", s, k, &i.name);
+            // log::info!("intent compare {} {}", k.keyword, s);
+            if UniCase::new(&k.keyword) == unicase_s {
+                // println!("{} {} {}", s, k.keyword, &i.name);
                 return Ok(Some(detail.intent_name.clone()));
             }
         }
         for r in detail.regexes.iter() {
-            let re = Regex::new(r)?;
+            let re = Regex::new(&r.regex)?;
             if re.is_match(s) {
                 return Ok(Some(detail.intent_name.clone()));
             }
@@ -58,7 +58,7 @@ pub(crate) async fn detect(robot_id: &str, s: &str) -> Result<Option<String>> {
             embedding
         }
         Err(e) => {
-            log::warn!("Detecting intent failed: {:?}", &e);
+            log::warn!("Detecting intent failed: {:?}", e);
             return Ok(None);
         }
     };
@@ -71,14 +71,12 @@ pub(crate) async fn detect(robot_id: &str, s: &str) -> Result<Option<String>> {
     let similarity_threshold = embedding.1 as f64;
     let mut result = phrase::search(robot_id, &search_vector).await?;
     // log::info!("Searching vector took {:?}", now.elapsed());
-    if !result.is_empty() {
-        if let Some(record) = result.get_mut(0) {
-            // log::info!("Record distance: {}", record.1);
-            if (1f64 - record.1) >= similarity_threshold {
-                let s = std::mem::take(&mut record.0);
-                return Ok(Some(s));
-            }
-        }
+    if let Some(record) = result.first_mut()
+        && (1f64 - record.1) >= similarity_threshold
+    {
+        // log::info!("Record distance: {}", record.1);
+        let s = std::mem::take(&mut record.0);
+        return Ok(Some(s));
     }
     Ok(None)
 }
