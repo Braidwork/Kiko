@@ -7,6 +7,7 @@
 //! 迁移期间 S2–S3 还有模块挂在 redb 上，`crate::db`（redb 门面）会与这里并存到
 //! S4；但**新表、新字段一律只落在 PG**（硬约束 3）。
 
+pub(crate) mod context;
 pub(crate) mod external_http;
 pub(crate) mod intent;
 pub(crate) mod robot;

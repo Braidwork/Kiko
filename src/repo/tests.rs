@@ -3,7 +3,7 @@
 //! 每个用例自建 `tmp_<uuid>` schema、跑 migration、结束时 drop，不污染共享库。
 //! 没配 `KIKO_TEST_DATABASE_URL` 时整组跳过 —— 没有 PG 的环境不该因此红一片。
 
-use super::{external_http, intent, robot, test_support::TestDb, variable};
+use super::{context, external_http, intent, robot, test_support::TestDb, variable};
 use crate::external::http::dto::{
     HttpReqInfo, HttpReqParam, Method, PostContentType, Protocol, ValueSource,
 };
@@ -742,6 +742,153 @@ async fn intent_create_surfaces_missing_robot_as_business_error() {
         msg.contains("Referenced row is missing"),
         "unexpected error message: {msg}"
     );
+
+    db.cleanup().await;
+}
+
+fn context_payload(robot_id: &str, session_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "robot_id": robot_id,
+        "session_id": session_id,
+        "main_flow_id": "mf1",
+        "nodes": ["node-a", "node-b"],
+        "vars": {"name": {"Str": "kiko"}},
+        "last_active_time": 123,
+        "chat_history": [{"role": "user", "content": "hi"}]
+    })
+}
+
+#[tokio::test]
+async fn context_roundtrip_and_last_write_wins() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rS", "sessions"))
+        .await
+        .unwrap();
+    robot::upsert(&db.pool, &robot("rT", "other"))
+        .await
+        .unwrap();
+
+    let data = context_payload("rS", "s1");
+    context::upsert(&db.pool, "rS", "s1", &data, Some(&[1, 2, 3]), 3600)
+        .await
+        .unwrap();
+
+    let row = context::get(&db.pool, "rS", "s1")
+        .await
+        .unwrap()
+        .expect("会话应该存在");
+    assert_eq!(row.data, data, "JSONB 载荷要原样往返");
+    assert_eq!(row.node_state, Some(vec![1, 2, 3]), "节点状态单独走 BYTEA");
+
+    // 同一个 session_id 在不同机器人下是两行，互不影响。
+    context::upsert(&db.pool, "rT", "s1", &data, None, 3600)
+        .await
+        .unwrap();
+    assert!(context::get(&db.pool, "rT", "s1").await.unwrap().is_some());
+    assert!(
+        context::get(&db.pool, "rS", "nope")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // 同一主键再存 = 整条覆盖（最后写入胜出），不是插入第二行。
+    let updated = serde_json::json!({"robot_id": "rS", "session_id": "s1", "vars": {}});
+    context::upsert(&db.pool, "rS", "s1", &updated, None, 3600)
+        .await
+        .unwrap();
+    let row = context::get(&db.pool, "rS", "s1").await.unwrap().unwrap();
+    assert_eq!(row.data, updated);
+    assert_eq!(row.node_state, None, "覆盖时 node_state 也要跟着变");
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM contexts WHERE robot_id = $1 AND session_id = $2")
+            .bind("rS")
+            .bind("s1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "upsert 不能留下重复行");
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn context_expiry_deletes_only_expired_sessions() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rE", "expiry"))
+        .await
+        .unwrap();
+
+    // ttl=0 → expires_at = now()；ttl=3600 → 一小时后。
+    context::upsert(
+        &db.pool,
+        "rE",
+        "old",
+        &context_payload("rE", "old"),
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+    context::upsert(
+        &db.pool,
+        "rE",
+        "fresh",
+        &context_payload("rE", "fresh"),
+        None,
+        3600,
+    )
+    .await
+    .unwrap();
+
+    // 给 `now()` 一点前进的余地（清理是另一条事务）。
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let deleted = context::delete_expired(&db.pool).await.unwrap();
+    assert_eq!(deleted, 1, "只删已过期的那一条");
+    assert!(context::get(&db.pool, "rE", "old").await.unwrap().is_none());
+    assert!(
+        context::get(&db.pool, "rE", "fresh")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn deleting_robot_cascades_contexts() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rX", "cascade"))
+        .await
+        .unwrap();
+    context::upsert(
+        &db.pool,
+        "rX",
+        "s1",
+        &context_payload("rX", "s1"),
+        Some(&[9]),
+        3600,
+    )
+    .await
+    .unwrap();
+
+    assert!(robot::delete(&db.pool, "rX").await.unwrap());
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM contexts WHERE robot_id = $1")
+        .bind("rX")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "删机器人必须级联清掉会话");
 
     db.cleanup().await;
 }

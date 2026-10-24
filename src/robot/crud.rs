@@ -6,7 +6,6 @@ use axum::{Json, response::IntoResponse};
 use super::dto::{RobotData, RobotQuery, RobotType};
 use crate::db_executor;
 use crate::flow::mainflow::crud as mainflow;
-use crate::flow::rt::context;
 use crate::intent::crud as intent;
 use crate::man::settings;
 use crate::repo;
@@ -69,8 +68,7 @@ async fn new(d: &RobotData, is_en: bool) -> Result<()> {
     // 主流程
     mainflow::init(&d.robot_id).await?;
     // 外部 HTTP 接口：表在 PG，按 robot_id 外键挂在机器人下，不需要建表。
-    // 流程上下文：每机器人一张表（原来的全局 session 索引已去掉）
-    context::init(&d.robot_id).await?;
+    // 流程上下文：表在 PG，不需要建表（也不再是每机器人一张）。
     Ok(())
 }
 
@@ -96,9 +94,9 @@ pub(crate) async fn delete(Query(q): Query<RobotQuery>) -> impl IntoResponse {
 /// 可重试，允许中间态残留。
 ///
 /// 顺序是有意的：先把 turso / redb 里按 `robot_id` 命名的表清掉，最后才删 PG 里的
-/// `robots` 行（`variables` / `intents` / `external_http_apis` / `robot_settings`
-/// 由 FK 级联）。反过来的话，中途失败会留下「机器人还在、子数据已删」的半截状态；
-/// 按这个顺序失败，残留的是孤儿表，重跑一次 purge 就能补齐。
+/// `robots` 行（`variables` / `intents` / `contexts` / `external_http_apis` /
+/// `robot_settings` 由 FK 级联）。反过来的话，中途失败会留下「机器人还在、子数据
+/// 已删」的半截状态；按这个顺序失败，残留的是孤儿表，重跑一次 purge 就能补齐。
 async fn purge(robot_id: &str) -> Result<()> {
     // turso 三件套：这些表在各自文件里都只属于这一个机器人，整表删掉。
     // 三个 helper 都带 `IF EXISTS` —— 表是懒创建的，没建过就得跳过而不是报错，
@@ -112,11 +110,6 @@ async fn purge(robot_id: &str) -> Result<()> {
         db::delete_table,
         robot_id,
         crate::flow::subflow::crud::TABLE_SUFFIX,
-    )?;
-    db_executor!(
-        db::delete_table,
-        robot_id,
-        crate::flow::rt::context::TABLE_SUFFIX,
     )?;
     let r: Vec<crate::flow::mainflow::dto::MainFlowDetail> = db_executor!(
         db::get_all,

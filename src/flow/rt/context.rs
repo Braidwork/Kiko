@@ -8,24 +8,18 @@ use tokio::time::{Duration, interval};
 use super::node::RuntimeNodeEnum;
 use crate::ai::chat::Prompt;
 use crate::db;
-use crate::db_executor;
 use crate::man::settings;
+use crate::repo;
 use crate::result::Result;
 use crate::variable::dto::VariableValue;
 
-/// 每机器人的会话表，表名是 `{robot_id}contexts`。
+/// 会话表 `contexts`（§5.3）。PG 单表，主键 `(robot_id, session_id)`，不再按机器人
+/// 分表。
 ///
-/// 原来是一张全局 `contexts` 表，外加一个以 `CONTEXT_KEY`（`"contexts"`）为键的
-/// 全局索引行存全部 session id。索引已删除：
-///
-/// - 它是**冗余状态** —— 从机器人注册表 + 各机器人的表就能推导出来；
-/// - 它的代价是真实的 —— 每轮对话都要多写一次，`Context::get` 里还有一处
-///   "读索引 → push → 写回"的**未加锁**读-改-写。删掉索引，那个竞态直接消失。
-///
-/// 代价落在 [`clean_expired_session`]：从"遍历一个 Vec"变成"遍历机器人注册表"。
-/// 那是每分钟一次的后台任务，每个机器人的表都很小，可以接受。
-pub(crate) const TABLE_SUFFIX: &str = "contexts";
-
+/// 历史：A 里是一张全局 `contexts` 表 + 一个以 `"contexts"` 为键的全局 session
+/// 索引；索引后来删掉了（它是冗余状态，而且每轮对话都要多写一次）。S3.4 之前
+/// 会话落在 redb 的 `{robot_id}contexts` 表里，清理过期会话要遍历机器人注册表；
+/// 现在 `expires_at` 在写入时算好，清理是一条 PG `DELETE`。
 pub(crate) enum UserInputIntent {
     Unknown,
     Detected(String),
@@ -36,6 +30,8 @@ pub(crate) struct Context {
     robot_id: String,
     pub(in crate::flow::rt) main_flow_id: String,
     session_id: String,
+    /// rkyv 节点状态。单独存 `contexts.node_state`（D29），不进 `data` JSON。
+    #[serde(skip)]
     pub(in crate::flow::rt) node: Option<Vec<u8>>,
     pub(in crate::flow::rt) nodes: LinkedList<String>,
     pub(crate) vars: HashMap<String, VariableValue>,
@@ -47,6 +43,8 @@ pub(crate) struct Context {
     pub(crate) none_persistent_data: HashMap<String, String>,
     #[serde(skip)]
     pub(crate) user_media: Option<crate::ai::dto::UserMediaData>,
+    /// 最后一次活跃时间（unix 秒）。仅作为会话内容的一部分保留；过期判定现在用
+    /// `contexts.expires_at`（见 [`Context::save`]），不再靠这个字段。
     last_active_time: u64,
     pub(crate) chat_history: Vec<Prompt>,
 }
@@ -123,19 +121,19 @@ impl Context {
             && req.user_input_result == crate::flow::rt::dto::UserInputResult::Successful
             && !req.user_input.is_empty()
         {
-            let user_input_intent =
-                crate::intent::detector::detect(&req.robot_id, &req.user_input).await?;
-            if user_input_intent.is_none() {
-                log::info!("No intent detected for user input: {}", req.user_input);
-                self.user_input_intent = Some(UserInputIntent::Unknown);
-            } else {
-                log::info!(
-                    "Detected intent for user input '{}': {}",
-                    req.user_input,
-                    user_input_intent.as_ref().unwrap()
-                );
-                self.user_input_intent =
-                    Some(UserInputIntent::Detected(user_input_intent.unwrap()));
+            match crate::intent::detector::detect(&req.robot_id, &req.user_input).await? {
+                Some(intent) => {
+                    log::info!(
+                        "Detected intent for user input '{}': {}",
+                        req.user_input,
+                        intent
+                    );
+                    self.user_input_intent = Some(UserInputIntent::Detected(intent));
+                }
+                None => {
+                    log::info!("No intent detected for user input: {}", req.user_input);
+                    self.user_input_intent = Some(UserInputIntent::Unknown);
+                }
             }
         }
         Ok(self.user_input_intent.as_ref().unwrap())
@@ -145,9 +143,11 @@ impl Context {
 impl Context {
     pub(crate) async fn get(robot_id: &str, session_id: &str) -> Result<Self> {
         let last_active_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let existing: Option<Context> =
-            db_executor!(db::query, robot_id, TABLE_SUFFIX, session_id)?;
-        if let Some(mut ctx) = existing {
+        let existing = repo::context::get(repo::pool(), robot_id, session_id).await?;
+        if let Some(row) = existing {
+            // `data` 里没有 node（见字段上的 `serde(skip)`），节点状态从 BYTEA 列恢复。
+            let mut ctx: Context = serde_json::from_value(row.data)?;
+            ctx.node = row.node_state;
             ctx.last_active_time = last_active_time;
             return Ok(ctx);
         }
@@ -168,13 +168,18 @@ impl Context {
     }
 
     pub(crate) async fn save(&self) -> Result<()> {
-        db_executor!(
-            db::write,
+        // 整条覆盖、最后写入胜出（§6.2）；过期时间按机器人设置算一次。
+        let ttl = session_ttl_secs(&self.robot_id).await;
+        let data = serde_json::to_value(self)?;
+        repo::context::upsert(
+            repo::pool(),
             &self.robot_id,
-            TABLE_SUFFIX,
-            self.session_id.as_str(),
-            self
+            &self.session_id,
+            &data,
+            self.node.as_deref(),
+            ttl,
         )
+        .await
     }
 
     // pub(crate) async fn clear(&mut self) -> Result<()> {
@@ -200,7 +205,7 @@ impl Context {
             match crate::flow::rt::node::deser_node(v.as_ref()) {
                 Ok(n) => return Some(n),
                 Err(e) => {
-                    log::error!("pop_node failed err: {:?}", &e);
+                    log::error!("pop_node failed err: {:?}", e);
                 }
             }
         }
@@ -222,11 +227,6 @@ impl Context {
     }
 }
 
-/// 新机器人的会话表。
-pub(crate) async fn init(robot_id: &str) -> Result<()> {
-    db_executor!(db::init_table, robot_id, TABLE_SUFFIX,)
-}
-
 pub async fn clean_expired_session(mut recv: tokio::sync::oneshot::Receiver<()>) {
     let mut interval = interval(Duration::from_secs(60));
     loop {
@@ -246,51 +246,31 @@ pub async fn clean_expired_session(mut recv: tokio::sync::oneshot::Receiver<()>)
     }
 }
 
-/// 扫一遍所有机器人的会话表。
+/// 一次清理：一条 `DELETE`，不再遍历机器人、不再逐个读设置。
 async fn clean_once() -> Result<()> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    // 机器人清单在 PG（S2 起），会话表还在 redb —— 共存期的正常状态。
-    let robots = crate::repo::robot::list(crate::repo::pool()).await?;
-    for r in robots.iter() {
-        let store = db::store(db::StoreKey::Robot(&r.robot_id)).await?;
-        clean_robot_sessions(store, &r.robot_id, now).await?;
+    let n = repo::context::delete_expired(repo::pool()).await?;
+    if n > 0 {
+        log::info!("Discarded {n} expired session(s)");
     }
     Ok(())
 }
 
-/// 清理一个机器人里已过期的会话。
+/// 会话的过期秒数：最多 1 天，取机器人设置里的 `maxSessionIdleSec`（§5.3）。
 ///
-/// 设置表现在是每机器人一张，所以每个机器人取一次就够了 —— 原来得在 session
-/// 循环里逐条查设置。
-async fn clean_robot_sessions(
-    store: &db::RedbStore,
-    robot_id: &str,
-    now: u64,
-) -> Result<()> {
-    let sessions: Vec<Context> = db_executor!(db::get_all, robot_id, TABLE_SUFFIX,)?;
-    if sessions.is_empty() {
-        return Ok(());
-    }
-    let max_idle = match settings::get_settings(robot_id).await? {
-        Some(s) => 86400u64.min(s.max_session_idle_sec as u64) /* 1 day */,
-        None => {
-            // 机器人设置没了，说明它已经被删掉（或从没建全）—— 会话一并清掉。
+/// 设置缺失（机器人已被删或从没建全）时返回 0 —— 与旧清理逻辑一致，下一次清理
+/// 就删掉。读设置失败不能连累对话：记日志后退回 1 天。
+async fn session_ttl_secs(robot_id: &str) -> i64 {
+    match settings::get_settings(robot_id).await {
+        Ok(Some(s)) => 86400u64.min(s.max_session_idle_sec as u64) /* 1 day */ as i64,
+        Ok(None) => {
             log::info!("Settings of robot {robot_id} is missing, discarding its sessions");
             0
         }
-    };
-    for c in sessions.iter() {
-        if now.saturating_sub(c.last_active_time) > max_idle {
-            if let Err(e) =
-                db_executor!(db::remove, robot_id, TABLE_SUFFIX, c.session_id.as_str())
-            {
-                log::warn!("Discarding expired session {} failed {e:?}", c.session_id);
-            } else {
-                log::info!("Discarded expired session: {}", c.session_id);
-            }
+        Err(e) => {
+            log::warn!("Reading settings of {robot_id} for session expiry failed: {e:?}");
+            86400
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -380,5 +360,18 @@ mod tests {
         // recording an answer cannot drift apart.
         c.fill_answer_history(slot, "<i>filled</i>");
         assert_eq!(c.chat_history[slot.idx].content, "filled");
+    }
+
+    /// D29：节点状态走 `contexts.node_state` 的 BYTEA，不进 JSONB 载荷。
+    #[test]
+    fn node_state_is_kept_out_of_the_json_payload() {
+        let mut c = ctx();
+        c.node = Some(vec![0xde, 0xad]);
+        let v = serde_json::to_value(&c).unwrap();
+        assert!(v.get("node").is_none(), "rkyv 字节不能塞进 data JSON");
+        assert_eq!(v["main_flow_id"], "mf");
+        // 反序列化后 node 为空，由仓储从 BYTEA 列补回。
+        let back: Context = serde_json::from_value(v).unwrap();
+        assert!(back.node.is_none());
     }
 }
