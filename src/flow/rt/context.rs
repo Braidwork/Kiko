@@ -7,7 +7,6 @@ use tokio::time::{Duration, interval};
 
 use super::node::RuntimeNodeEnum;
 use crate::ai::chat::Prompt;
-use crate::db;
 use crate::man::settings;
 use crate::repo;
 use crate::result::Result;
@@ -211,16 +210,30 @@ impl Context {
         }
         if let Some(node_id) = self.nodes.pop_front() {
             // log::info!("main_flow_id {} node_id {}", &self.main_flow_id, &node_id);
-            let store = match db::store(db::StoreKey::Robot(&self.robot_id)).await {
-                Ok(store) => store,
-                Err(e) => {
-                    log::error!("Resolving store of robot {} failed: {e:?}", self.robot_id);
-                    return None;
-                }
-            };
-            if let Ok(r) = super::crud::get_runtime_node(store, &self.main_flow_id, &node_id).await
+            // 运行时节点在 PG（S3.5）：按 (robot, main_flow_id, node_id) 取原始 rkyv 字节。
+            match repo::runtime_node::get(
+                repo::pool(),
+                &self.robot_id,
+                &self.main_flow_id,
+                &node_id,
+            )
+            .await
             {
-                return r;
+                Ok(Some(bytes)) => match crate::flow::rt::node::deser_node(&bytes) {
+                    Ok(n) => return Some(n),
+                    Err(e) => {
+                        log::error!("pop_node failed err: {:?}", e);
+                    }
+                },
+                Ok(None) => {
+                    log::warn!(
+                        "Runtime node {node_id} of main flow {} not found",
+                        self.main_flow_id
+                    );
+                }
+                Err(e) => {
+                    log::error!("Reading runtime node {node_id} failed: {e:?}");
+                }
             }
         }
         None

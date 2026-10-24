@@ -1270,12 +1270,11 @@ impl RuntimeNode for KnowledgeBaseAnswerNode {
 }
 
 pub(crate) fn deser_node(bytes: &[u8]) -> Result<RuntimeNodeEnum> {
-    // let now = std::time::Instant::now();
+    // PG 返回的是未对齐切片，rkyv 要求对齐 —— 这次拷贝不是冗余（§5.3）。
     let mut v = AlignedVec::<256>::with_capacity(bytes.len());
     v.extend_from_slice(bytes);
-    let r = rkyv::from_bytes::<RuntimeNodeEnum, rkyv::rancor::Error>(&v).unwrap();
-    // let archived = rkyv::access::<ArchivedRuntimeNnodeEnum, rkyv::rancor::Error>(bytes).unwrap();
-    // let deserialized = rkyv::deserialize::<RuntimeNnodeEnum, rkyv::rancor::Error>(archived).unwrap();
-    // log::info!("deser_node time {:?}", now.elapsed());
-    Ok(r)
+    // release 是 `panic = 'abort'`，一条坏字节用 `unwrap` 会直接杀进程（§16.1）。
+    rkyv::from_bytes::<RuntimeNodeEnum, rkyv::rancor::Error>(&v).map_err(|e| {
+        crate::result::Error::WithMessage(format!("Deserializing runtime node failed: {e}"))
+    })
 }

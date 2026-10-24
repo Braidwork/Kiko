@@ -7,36 +7,30 @@ use super::node::{
     KnowledgeBaseAnswerNode, LlmChatNode, LlmGenTextNode, RuntimeNodeEnum, SendEmailNode,
     TerminateNode, TextNode,
 };
-use crate::db;
-use crate::db_executor;
 use crate::flow::demo;
-use crate::flow::subflow::crud::TABLE_SUFFIX;
 use crate::flow::subflow::dto::{BranchType, CanvasCells, NextActionType, Node, SubFlowDetail};
+use crate::repo;
 use crate::result::{Error, Result};
 
 pub(crate) async fn convert_flow(is_en: bool, robot_id: &str, mainflow_id: &str) -> Result<()> {
     let flows: Vec<SubFlowDetail> = if let Some(t) = demo::get_demo(is_en, mainflow_id) {
         serde_json::from_str(t)?
     } else {
-        let r: Option<Vec<SubFlowDetail>> =
-            db_executor!(db::query, robot_id, TABLE_SUFFIX, mainflow_id)?;
-        if r.is_none() {
+        let r = repo::subflow::list(repo::pool(), robot_id, mainflow_id).await?;
+        if r.is_empty() {
             return Err(Error::WithMessage(String::from("Flow data not found")));
         }
-        r.unwrap()
+        r
     };
-    // let mut idx = 0;
+
+    // 所有节点先收集、最后一次事务写入：release 要么整批生效，要么保留上一版。
+    // demo 主流程没有 `mainflows` 行也没关系 —— 运行时节点按 (robot, main_flow_id)
+    // 归属，`main_flow_id` 只是命名空间（见 §5.3）。
+    let mut runtime_nodes: Vec<(String, Vec<u8>)> = Vec::with_capacity(32);
     for (idx, f) in flows.iter().enumerate() {
-        // if !f.valid {
-        //     return Err(Error::ErrorWithMessage(format!(
-        //         "子流程：{} 校验不通过",
-        //         f.name
-        //     )));
-        // }
-        convert_subflow(robot_id, mainflow_id, idx, f).await?;
-        // idx += 1;
+        convert_subflow(mainflow_id, idx, f, &mut runtime_nodes)?;
     }
-    Ok(())
+    repo::runtime_node::upsert_many(repo::pool(), robot_id, mainflow_id, &runtime_nodes).await
 }
 
 fn validate_nodes(f: &SubFlowDetail, nodes: &Vec<&mut Node>) -> Result<()> {
@@ -91,13 +85,12 @@ fn check_first_node(
     }
 }
 
-async fn convert_subflow(
-    robot_id: &str,
+fn convert_subflow(
     mainflow_id: &str,
     flow_idx: usize,
     f: &SubFlowDetail,
+    runtime_nodes: &mut Vec<(String, Vec<u8>)>,
 ) -> Result<()> {
-    // println!("{}", &f.nodes);
     let mut cells: CanvasCells = serde_json::from_str(&f.canvas)?;
     let mut branches_link: HashMap<String, String> = HashMap::with_capacity(32);
     let mut node_cnt = 0usize;
@@ -120,7 +113,6 @@ async fn convert_subflow(
             node_cnt += 1;
         }
     }
-    // let mut inner_cells:&mut Vec<crate::flow::canvas::dto::CanvasCell> = cells.cells.as_mut();
     let mut nodes: Vec<&mut Node> = Vec::with_capacity(node_cnt);
     for n in cells.cells.iter_mut() {
         if let Some(node) = n.data.as_mut() {
@@ -147,57 +139,59 @@ async fn convert_subflow(
         }
     }
 
-    // let mut nodes: Vec<Node> = serde_json::from_str(&f.nodes)?;
     validate_nodes(f, &nodes)?;
     check_first_node(mainflow_id, flow_idx, f, &mut nodes)?;
     for node in nodes {
-        convert_node(robot_id, mainflow_id, node).await?;
+        convert_node(node, runtime_nodes)?;
     }
     Ok(())
 }
 
-// `robot_id` 只是为了定位运行时节点表所属的 store（表按机器人分），
-// 表名本身仍然只由 `main_flow_id` 拼出。
-async fn convert_node(robot_id: &str, main_flow_id: &str, node: &mut Node) -> Result<()> {
-    let mut nodes: Vec<(String, rkyv::util::AlignedVec)> = Vec::with_capacity(32);
+/// 把一个画布节点序列化成运行时节点。写失败返回错误，不再 `unwrap`（§16.1）。
+fn push_node(
+    nodes: &mut Vec<(String, Vec<u8>)>,
+    node_id: String,
+    node: RuntimeNodeEnum,
+) -> Result<()> {
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&node)
+        .map_err(|e| Error::WithMessage(format!("Serialize runtime node failed: {e}")))?;
+    nodes.push((node_id, bytes.as_slice().to_vec()));
+    Ok(())
+}
+
+fn convert_node(node: &mut Node, nodes: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
     match node {
-        Node::DialogNode(n) => {
-            match n.dialog_text_source {
-                crate::flow::subflow::dto::DialogTextSource::FixedText => {
-                    let node = TextNode {
-                        text: std::mem::take(&mut n.dialog_text),
-                        text_type: n.dialog_text_type.clone(),
-                        ret: NextActionType::WaitUserResponse == n.next_step,
-                        next_node_id: n.branches[0].target_node_id.clone(),
-                    };
-                    // println!("Dialog {} {}", &n.node_id, &node.next_node_id);
-                    let r = RuntimeNodeEnum::TextNode(node);
-                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-                    // let mut bytes = rkyv::to_bytes::<_, 256>(&node).unwrap();
-                    // bytes.push(RuntimeNodeTypeId::TextNode as u8);
-                    nodes.push((n.node_id.clone(), bytes));
-                }
-                crate::flow::subflow::dto::DialogTextSource::LlmGenText => {
-                    let node = LlmGenTextNode {
-                        prompt: std::mem::take(&mut n.dialog_llm_gen_prompt),
-                        fallback_text: std::mem::take(&mut n.dialog_fallback_text),
-                        context_len: n.context_length,
-                        connect_timeout: n.connect_timeout,
-                        read_timeout: n.read_timeout,
-                        response_streaming: n.response_streaming,
-                        enable_thinking: n.enable_thinking,
-                        ret: NextActionType::WaitUserResponse == n.next_step,
-                        next_node_id: n.branches[0].target_node_id.clone(),
-                    };
-                    let r = RuntimeNodeEnum::LlmGenTextNode(node);
-                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-                    nodes.push((n.node_id.clone(), bytes));
-                }
+        Node::DialogNode(n) => match n.dialog_text_source {
+            crate::flow::subflow::dto::DialogTextSource::FixedText => {
+                let node = TextNode {
+                    text: std::mem::take(&mut n.dialog_text),
+                    text_type: n.dialog_text_type.clone(),
+                    ret: NextActionType::WaitUserResponse == n.next_step,
+                    next_node_id: n.branches[0].target_node_id.clone(),
+                };
+                push_node(nodes, n.node_id.clone(), RuntimeNodeEnum::TextNode(node))?;
             }
-        }
+            crate::flow::subflow::dto::DialogTextSource::LlmGenText => {
+                let node = LlmGenTextNode {
+                    prompt: std::mem::take(&mut n.dialog_llm_gen_prompt),
+                    fallback_text: std::mem::take(&mut n.dialog_fallback_text),
+                    context_len: n.context_length,
+                    connect_timeout: n.connect_timeout,
+                    read_timeout: n.read_timeout,
+                    response_streaming: n.response_streaming,
+                    enable_thinking: n.enable_thinking,
+                    ret: NextActionType::WaitUserResponse == n.next_step,
+                    next_node_id: n.branches[0].target_node_id.clone(),
+                };
+                push_node(
+                    nodes,
+                    n.node_id.clone(),
+                    RuntimeNodeEnum::LlmGenTextNode(node),
+                )?;
+            }
+        },
         Node::LlmChatNode(n) => {
             let node = LlmChatNode {
-                // prompt: n.prompt.clone(),
                 context_len: n.context_length,
                 cur_run_times: 0,
                 exit_condition: n.exit_condition.clone(),
@@ -208,28 +202,22 @@ async fn convert_node(robot_id: &str, main_flow_id: &str, node: &mut Node) -> Re
                 enable_thinking: n.enable_thinking,
                 next_node_id: n.branches[0].target_node_id.clone(),
             };
-            let r = RuntimeNodeEnum::LlmChatNode(node);
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-            nodes.push((n.node_id.clone(), bytes));
+            push_node(nodes, n.node_id.clone(), RuntimeNodeEnum::LlmChatNode(node))?;
         }
         Node::ConditionNode(n) => {
-            // println!("Condition {}", &n.node_id);
             let mut cnt = 1u8;
             for b in n.branches.iter() {
                 let node_id = if cnt == 1 {
                     n.node_id.clone()
                 } else {
-                    format!("{}-{}", &n.node_id, cnt)
+                    format!("{}-{}", n.node_id, cnt)
                 };
                 cnt += 1;
                 if BranchType::GotoAnotherNode == b.branch_type {
                     let node = GotoAnotherNode {
                         next_node_id: b.target_node_id.clone(),
                     };
-                    let r = RuntimeNodeEnum::GotoAnotherNode(node);
-                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-                    // bytes.push(RuntimeNodeTypeId::GotoAnotherNode as u8);
-                    nodes.push((node_id, bytes));
+                    push_node(nodes, node_id, RuntimeNodeEnum::GotoAnotherNode(node))?;
                 } else {
                     let mut conditions: Vec<Vec<ConditionData>> = Vec::with_capacity(10);
                     for and_condition in b.condition_group.iter() {
@@ -248,14 +236,11 @@ async fn convert_node(robot_id: &str, main_flow_id: &str, node: &mut Node) -> Re
                         conditions.push(and_conditions);
                     }
                     let node = ConditionNode {
-                        next_node_id: format!("{}-{}", &n.node_id, cnt),
+                        next_node_id: format!("{}-{}", n.node_id, cnt),
                         goto_node_id: b.target_node_id.clone(),
                         conditions,
                     };
-                    let r = RuntimeNodeEnum::ConditionNode(node);
-                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-                    // bytes.push(RuntimeNodeTypeId::ConditionNode as u8);
-                    nodes.push((node_id, bytes));
+                    push_node(nodes, node_id, RuntimeNodeEnum::ConditionNode(node))?;
                 }
             }
         }
@@ -277,17 +262,13 @@ async fn convert_node(robot_id: &str, main_flow_id: &str, node: &mut Node) -> Re
                     }
                 };
             }
-            // println!("{} {}", &successful_node_id, &failed_node_id);
             let node = CollectNode {
                 var_name: n.collect_save_var_name.clone(),
                 collect_type: n.collect_type.clone(),
                 successful_node_id,
                 failed_node_id,
             };
-            let r = RuntimeNodeEnum::CollectNode(node);
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-            // bytes.push(RuntimeNodeTypeId::CollectNode as u8);
-            nodes.push((n.node_id.clone(), bytes));
+            push_node(nodes, n.node_id.clone(), RuntimeNodeEnum::CollectNode(node))?;
         }
         Node::ExternalHttpNode(n) => {
             let (successful_node_id, next_node_id) = if n.branches.len() == 2 {
@@ -306,10 +287,11 @@ async fn convert_node(robot_id: &str, main_flow_id: &str, node: &mut Node) -> Re
                 read_timeout_milliseconds: n.read_timeout_milliseconds,
                 async_req: n.async_req,
             };
-            let r = RuntimeNodeEnum::ExternalHttpCallNode(node);
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-            // bytes.push(RuntimeNodeTypeId::CollectNode as u8);
-            nodes.push((n.node_id.clone(), bytes));
+            push_node(
+                nodes,
+                n.node_id.clone(),
+                RuntimeNodeEnum::ExternalHttpCallNode(node),
+            )?;
         }
         Node::SendEmailNode(n) => {
             let successful_node_id = std::mem::take(&mut n.branches[0].target_node_id);
@@ -332,56 +314,54 @@ async fn convert_node(robot_id: &str, main_flow_id: &str, node: &mut Node) -> Re
                 successful_node_id,
                 goto_node_id,
             };
-            let r = RuntimeNodeEnum::SendEmailNode(node);
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-            // bytes.push(RuntimeNodeTypeId::CollectNode as u8);
-            nodes.push((n.node_id.clone(), bytes));
+            push_node(
+                nodes,
+                n.node_id.clone(),
+                RuntimeNodeEnum::SendEmailNode(node),
+            )?;
         }
-        Node::GotoNode(n) => {
-            // println!("GotoNode {}", &n.node_id);
-            match n.goto_type {
-                NextActionType::GotoMainFlow => {
-                    let node = GotoMainFlowNode {
-                        main_flow_id: n.goto_mainflow_id.clone(),
-                        next_node_id: n.goto_subflow_id.clone(),
-                    };
-                    let r = RuntimeNodeEnum::GotoMainFlowNode(node);
-                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-                    nodes.push((n.node_id.clone(), bytes));
-                }
-                NextActionType::GotoSubFlow => {
-                    let node = GotoAnotherNode {
-                        next_node_id: n.goto_subflow_id.clone(),
-                    };
-                    let r = RuntimeNodeEnum::GotoAnotherNode(node);
-                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-                    // bytes.push(RuntimeNodeTypeId::GotoAnotherNode as u8);
-                    nodes.push((n.node_id.clone(), bytes));
-                }
-                NextActionType::GotoExternalLink => {}
-                _ => {}
+        Node::GotoNode(n) => match n.goto_type {
+            NextActionType::GotoMainFlow => {
+                let node = GotoMainFlowNode {
+                    main_flow_id: n.goto_mainflow_id.clone(),
+                    next_node_id: n.goto_subflow_id.clone(),
+                };
+                push_node(
+                    nodes,
+                    n.node_id.clone(),
+                    RuntimeNodeEnum::GotoMainFlowNode(node),
+                )?;
             }
-        }
+            NextActionType::GotoSubFlow => {
+                let node = GotoAnotherNode {
+                    next_node_id: n.goto_subflow_id.clone(),
+                };
+                push_node(
+                    nodes,
+                    n.node_id.clone(),
+                    RuntimeNodeEnum::GotoAnotherNode(node),
+                )?;
+            }
+            NextActionType::GotoExternalLink => {}
+            _ => {}
+        },
         Node::EndNode(n) => {
-            // log::info!("EndNode {}", &n.node_id);
-            let node = TerminateNode {};
-            let r = RuntimeNodeEnum::TerminateNode(node);
-            let ter_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
+            let ter_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&RuntimeNodeEnum::TerminateNode(
+                TerminateNode {},
+            ))
+            .map_err(|e| Error::WithMessage(format!("Serialize runtime node failed: {e}")))?;
             if n.ending_text.is_empty() {
-                nodes.push((n.node_id.clone(), ter_bytes));
+                nodes.push((n.node_id.clone(), ter_bytes.as_slice().to_vec()));
             } else {
-                // log::info!("Append textNode for endNode {}", &n.ending_text);
-                let end_node_id = format!("{}-2", &n.node_id);
+                let end_node_id = format!("{}-2", n.node_id);
                 let node = TextNode {
                     text: n.ending_text.clone(),
                     text_type: super::dto::AnswerContentType::TextPlain,
                     ret: false,
                     next_node_id: end_node_id.clone(),
                 };
-                let r = RuntimeNodeEnum::TextNode(node);
-                let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-                nodes.push((n.node_id.clone(), bytes));
-                nodes.push((end_node_id, ter_bytes));
+                push_node(nodes, n.node_id.clone(), RuntimeNodeEnum::TextNode(node))?;
+                nodes.push((end_node_id, ter_bytes.as_slice().to_vec()));
             }
         }
         Node::KnowledgeBaseAnswerNode(n) => {
@@ -391,20 +371,14 @@ async fn convert_node(robot_id: &str, main_flow_id: &str, node: &mut Node) -> Re
                 no_recall_then: n.no_answer_then.clone(),
                 next_node_id: n.branches[0].target_node_id.clone(),
             };
-            let r = RuntimeNodeEnum::KnowledgeBaseAnswerNode(node);
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&r).unwrap();
-            // bytes.push(RuntimeNodeTypeId::CollectNode as u8);
-            nodes.push((n.node_id.clone(), bytes));
+            push_node(
+                nodes,
+                n.node_id.clone(),
+                RuntimeNodeEnum::KnowledgeBaseAnswerNode(node),
+            )?;
         }
     };
-    // let mut nodes: Vec<(&str, &[u8])> = Vec::with_capacity(box_nodes.len());
-    // for n in box_nodes.iter() {
-    // let json = serde_json::to_string(&n.1)?;
-    // println!("saved {}", &n.0);
-    // }
-
-    let store = db::store(db::StoreKey::Robot(robot_id)).await?;
-    super::crud::save_runtime_nodes(store, main_flow_id, nodes).await
+    Ok(())
 }
 
 /*

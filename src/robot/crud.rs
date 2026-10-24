@@ -1,5 +1,3 @@
-use std::vec::Vec;
-
 use axum::extract::Query;
 use axum::{Json, response::IntoResponse};
 
@@ -95,8 +93,9 @@ pub(crate) async fn delete(Query(q): Query<RobotQuery>) -> impl IntoResponse {
 ///
 /// 顺序是有意的：先把 turso / redb 里按 `robot_id` 命名的表清掉，最后才删 PG 里的
 /// `robots` 行（`variables` / `intents` / `contexts` / `external_http_apis` /
-/// `robot_settings` 由 FK 级联）。反过来的话，中途失败会留下「机器人还在、子数据
-/// 已删」的半截状态；按这个顺序失败，残留的是孤儿表，重跑一次 purge 就能补齐。
+/// `mainflows` / `subflows` / `runtime_nodes` / `robot_settings` 由 FK 级联）。
+/// 反过来的话，中途失败会留下「机器人还在、子数据已删」的半截状态；按这个顺序
+/// 失败，残留的是孤儿表，重跑一次 purge 就能补齐。
 async fn purge(robot_id: &str) -> Result<()> {
     // turso 三件套：这些表在各自文件里都只属于这一个机器人，整表删掉。
     // 三个 helper 都带 `IF EXISTS` —— 表是懒创建的，没建过就得跳过而不是报错，
@@ -106,27 +105,8 @@ async fn purge(robot_id: &str) -> Result<()> {
     crate::kb::doc::remove_tables(robot_id).await?;
     // 每机器人的设置表（原来只是全局 settings 表里以 robot_id 为键的一行）
     db_executor!(db::delete_table, robot_id, settings::TABLE_SUFFIX,)?;
-    db_executor!(
-        db::delete_table,
-        robot_id,
-        crate::flow::subflow::crud::TABLE_SUFFIX,
-    )?;
-    let r: Vec<crate::flow::mainflow::dto::MainFlowDetail> = db_executor!(
-        db::get_all,
-        robot_id,
-        crate::flow::mainflow::crud::TABLE_SUFFIX,
-    )?;
-    // 运行时节点表是按 main_flow_id 命名、归属该机器人的，删主流程之前先清掉。
-    let store = db::store(db::StoreKey::Robot(robot_id)).await?;
-    for v in r.iter() {
-        crate::flow::rt::crud::remove_runtime_nodes(store, &v.id).await?;
-    }
-    db_executor!(
-        db::delete_table,
-        robot_id,
-        crate::flow::mainflow::crud::TABLE_SUFFIX,
-    )?;
-    // 最后才是 PG：机器人行没了，按 robot_id 外键挂在它下面的数据由级联清掉。
+    // 流程、运行时节点、会话、意图等都在 PG：删 robots 行时由外键级联清掉，
+    // 不再有 per-robot 的 redb 表要单独删。
     repo::robot::delete(repo::pool(), robot_id).await?;
     Ok(())
 }

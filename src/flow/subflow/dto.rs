@@ -27,18 +27,6 @@ pub(crate) struct SubFlowDetail {
     // pub(crate) valid: bool,
 }
 
-impl SubFlowDetail {
-    pub(crate) fn new(name: &str) -> Self {
-        SubFlowDetail {
-            id: scru128::new_string(),
-            name: String::from(name),
-            canvas: String::new(),
-            // nodes: String::new(),
-            // valid: false,
-        }
-    }
-}
-
 #[derive(Deserialize)]
 pub(crate) struct CanvasCells {
     pub(crate) cells: Vec<CanvasCell>,

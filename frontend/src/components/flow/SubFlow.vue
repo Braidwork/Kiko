@@ -409,7 +409,9 @@ let graph = null;
 let editedSubFlow = false;
 const mainFlowId = route.params.id;
 const mainFlowName = atob(route.params.name);
-const isDemo = mainFlowId.indexOf("demo") > -1;
+// demo 是平台共用的内置模板，只读、只能直接发布；id 固定（与后端 demo 模块一致）。
+const DEMO_IDS = ['demo-repay', 'demo-collect', 'demo-notify'];
+const isDemo = DEMO_IDS.includes(mainFlowId);
 
 onMounted(async () => {
     // console.log("subflow onMounted");
@@ -476,6 +478,7 @@ onMounted(async () => {
         panning: true,
     });
     graph.on("node:click", ({ e, x, y, node, view }) => {
+        if (isDemo) return;
         node.setTools([
             {
                 name: "button-remove",
@@ -489,10 +492,12 @@ onMounted(async () => {
         }
     });
     graph.on("node:dblclick", ({ e, x, y, node, view }) => {
+        if (isDemo) return;
         node.setData({ currentTime: Date.now() });
         editedSubFlow = true;
     });
     graph.on("edge:click", ({ e, x, y, edge, view }) => {
+        if (isDemo) return;
         edge.setTools(["button-remove"]);
     });
 
@@ -549,6 +554,7 @@ function cacheSubFlows(t) {
 const dialogFormVisible = ref(false);
 const flowName = ref("");
 async function newSubFlow() {
+    if (isDemo) return;
     await saveSubFlow();
     const t = await httpReq(
         "POST",
@@ -568,6 +574,7 @@ async function newSubFlow() {
 }
 
 function removeSubFlow(index) {
+    if (isDemo) return;
     if (subFlows.value.length < 2) {
         ElMessage.error(t("flow.needOne"));
     } else {
@@ -583,7 +590,7 @@ function removeSubFlow(index) {
                     {
                         robotId: robotId,
                         mainFlowId: mainFlowId,
-                        data: selectedSubFlowIdx,
+                        data: subFlows.value[index].id,
                     },
                     null,
                     null,
@@ -671,7 +678,7 @@ async function saveSubFlow() {
     const r = await httpReq(
         "POST",
         "subflow",
-        { robotId: robotId, mainFlowId: mainFlowId, data: selectedSubFlowIdx },
+        { robotId: robotId, mainFlowId: mainFlowId, data: source.id },
         null,
         data,
     );
@@ -1369,7 +1376,7 @@ const popupRundryWindow = async () => {
                     <div class="aside-title">{{
                         $t("flow.subFlowList")
                         }}</div>
-                    <div class="newSubFlowBtn" @click="dialogFormVisible = true">
+                    <div v-if="!isDemo" class="newSubFlowBtn" @click="dialogFormVisible = true">
                         <el-icon size="16px">
                             <EpPlus />
                         </el-icon>
@@ -1378,7 +1385,7 @@ const popupRundryWindow = async () => {
                     <div v-for="(item, index) in subFlows" :id="subFlowId(index)" :key="item.label"
                         @click="showSubFlow(index)" class="subFlowBtn">
                         <span>{{ item.name }}</span>
-                        <span @click="removeSubFlow(index)">
+                        <span v-if="!isDemo" @click="removeSubFlow(index)">
                             <el-icon>
                                 <EpDelete />
                             </el-icon>
@@ -1386,7 +1393,7 @@ const popupRundryWindow = async () => {
                     </div>
                 </el-aside>
                 <el-main v-loading="loading">
-                    <div class="nodesBox">
+                    <div v-if="!isDemo" class="nodesBox">
                         <div class="palette-title">{{
                             $t("flow.nodePalette")
                             }}</div>

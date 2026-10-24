@@ -3,7 +3,10 @@
 //! 每个用例自建 `tmp_<uuid>` schema、跑 migration、结束时 drop，不污染共享库。
 //! 没配 `KIKO_TEST_DATABASE_URL` 时整组跳过 —— 没有 PG 的环境不该因此红一片。
 
-use super::{context, external_http, intent, robot, test_support::TestDb, variable};
+use super::{
+    context, external_http, intent, mainflow, robot, runtime_node, subflow, test_support::TestDb,
+    variable,
+};
 use crate::external::http::dto::{
     HttpReqInfo, HttpReqParam, Method, PostContentType, Protocol, ValueSource,
 };
@@ -889,6 +892,303 @@ async fn deleting_robot_cascades_contexts() {
         .await
         .unwrap();
     assert_eq!(left, 0, "删机器人必须级联清掉会话");
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn mainflow_create_lists_and_cascades() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rF", "flows"))
+        .await
+        .unwrap();
+
+    let first = mainflow::create(&db.pool, "rF", "first", "default sub")
+        .await
+        .unwrap();
+    assert_eq!(first.name, "first");
+    assert!(first.enabled);
+    // D48：id 是纯 scru128，不再有 count 前缀。
+    assert_eq!(
+        first.id.len(),
+        scru128::new_string().len(),
+        "主流程 id 不应再带 count 前缀"
+    );
+
+    // 默认子流程与主流程在同一个事务里创建。
+    let subs = subflow::list(&db.pool, "rF", &first.id).await.unwrap();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].name, "default sub");
+    assert_eq!(subs[0].canvas, "", "空画布读回空串");
+    assert_ne!(subs[0].id, first.id, "子流程用自己的 id");
+
+    let second = mainflow::create(&db.pool, "rF", "second", "default sub")
+        .await
+        .unwrap();
+    let list = mainflow::list(&db.pool, "rF").await.unwrap();
+    let names: Vec<&str> = list.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["first", "second"], "主流程按 position 排序");
+
+    // 保存（PUT）是更新，不新增行。
+    let mut renamed = first.clone();
+    renamed.name = String::from("renamed");
+    renamed.enabled = false;
+    assert!(mainflow::upsert(&db.pool, "rF", &renamed).await.unwrap());
+    let list = mainflow::list(&db.pool, "rF").await.unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].name, "renamed");
+    assert!(!list[0].enabled);
+
+    // 删主流程：子流程级联，运行时节点由仓储显式清掉。
+    runtime_node::upsert_many(
+        &db.pool,
+        "rF",
+        &first.id,
+        &[(String::from("n1"), vec![1, 2, 3])],
+    )
+    .await
+    .unwrap();
+    assert!(mainflow::delete(&db.pool, "rF", &first.id).await.unwrap());
+    assert!(
+        subflow::list(&db.pool, "rF", &first.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        runtime_node::get(&db.pool, "rF", &first.id, "n1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let list = mainflow::list(&db.pool, "rF").await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, second.id);
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn subflow_crud_by_id_and_position() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rG", "subflows"))
+        .await
+        .unwrap();
+    let mf = mainflow::create(&db.pool, "rG", "mf", "one").await.unwrap();
+    let mut flows = subflow::list(&db.pool, "rG", &mf.id).await.unwrap();
+    assert_eq!(flows.len(), 1);
+
+    let added = subflow::create(&db.pool, "rG", &mf.id, "two")
+        .await
+        .unwrap();
+    assert_eq!(added.len(), 2);
+    let two_id = added[1].id.clone();
+
+    // 位置 0/1，按 position 读。
+    let positions: Vec<i32> = sqlx::query_scalar(
+        "SELECT position FROM subflows WHERE main_flow_id = $1 ORDER BY position",
+    )
+    .bind(&mf.id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(positions, [0, 1]);
+
+    // 保存画布按 id（不再按下标）。
+    let canvas = r#"{"cells":[{"id":"a","shape":"edge"}]}"#;
+    assert!(
+        subflow::save_canvas(&db.pool, "rG", &mf.id, &two_id, canvas)
+            .await
+            .unwrap()
+    );
+    flows = subflow::list(&db.pool, "rG", &mf.id).await.unwrap();
+    assert_eq!(flows[1].canvas, canvas);
+
+    // 空画布写库是合法 JSON（{}），读回仍是空串。
+    assert!(
+        subflow::save_canvas(&db.pool, "rG", &mf.id, &two_id, "")
+            .await
+            .unwrap()
+    );
+    flows = subflow::list(&db.pool, "rG", &mf.id).await.unwrap();
+    assert_eq!(flows[1].canvas, "");
+    let raw: serde_json::Value = sqlx::query_scalar("SELECT canvas FROM subflows WHERE id = $1")
+        .bind(&two_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(raw, serde_json::json!({}), "空画布必须存成合法 JSON 对象");
+
+    // 另一个机器人不能通过别人的 mainflow id 改数据。
+    assert!(
+        !subflow::save_canvas(&db.pool, "rOther", &mf.id, &two_id, "{}")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !subflow::delete(&db.pool, "rOther", &mf.id, &two_id)
+            .await
+            .unwrap()
+    );
+
+    // 按 id 删除；重复删除是幂等的。
+    assert!(
+        subflow::delete(&db.pool, "rG", &mf.id, &two_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !subflow::delete(&db.pool, "rG", &mf.id, &two_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        subflow::list(&db.pool, "rG", &mf.id).await.unwrap().len(),
+        1
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_subflow_creates_get_distinct_positions() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rH", "concurrent"))
+        .await
+        .unwrap();
+    let mf = mainflow::create(&db.pool, "rH", "mf", "one").await.unwrap();
+
+    // 8 路并发追加：没有父主流程行锁时会算出重复 position。
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let pool = db.pool.clone();
+        let main_flow_id = mf.id.clone();
+        tasks.push(tokio::spawn(async move {
+            subflow::create(&pool, "rH", &main_flow_id, &format!("s{i}"))
+                .await
+                .unwrap();
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let mut positions: Vec<i32> = sqlx::query_scalar(
+        "SELECT position FROM subflows WHERE main_flow_id = $1 ORDER BY position",
+    )
+    .bind(&mf.id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    positions.sort_unstable();
+    assert_eq!(
+        positions,
+        (0..9).collect::<Vec<i32>>(),
+        "默认子流程 + 8 条并发追加，position 必须互不相同"
+    );
+
+    // 并发建主流程同理。
+    let mut tasks = Vec::new();
+    for i in 0..4 {
+        let pool = db.pool.clone();
+        tasks.push(tokio::spawn(async move {
+            mainflow::create(&pool, "rH", &format!("m{i}"), "sub")
+                .await
+                .unwrap();
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let mut positions: Vec<i32> =
+        sqlx::query_scalar("SELECT position FROM mainflows WHERE robot_id = $1")
+            .bind("rH")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    positions.sort_unstable();
+    assert_eq!(positions, vec![0, 1, 2, 3, 4]);
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn runtime_nodes_roundtrip_and_demo_ids() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rN", "nodes"))
+        .await
+        .unwrap();
+    let mf = mainflow::create(&db.pool, "rN", "mf", "one").await.unwrap();
+
+    runtime_node::upsert_many(
+        &db.pool,
+        "rN",
+        &mf.id,
+        &[
+            (String::from("n1"), vec![1, 2, 3]),
+            (String::from("n2"), vec![4]),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_node::get(&db.pool, "rN", &mf.id, "n1")
+            .await
+            .unwrap(),
+        Some(vec![1, 2, 3])
+    );
+    // 同一 node_id 再写 = 覆盖。
+    runtime_node::upsert_many(&db.pool, "rN", &mf.id, &[(String::from("n1"), vec![9, 9])])
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime_node::get(&db.pool, "rN", &mf.id, "n1")
+            .await
+            .unwrap(),
+        Some(vec![9, 9])
+    );
+    assert_eq!(
+        runtime_node::get(&db.pool, "rN", &mf.id, "n2")
+            .await
+            .unwrap(),
+        Some(vec![4])
+    );
+
+    // demo 流程没有 mainflows 行，但运行时节点要能写/读（靠 robot_id 归属）。
+    runtime_node::upsert_many(
+        &db.pool,
+        "rN",
+        "demo-collect",
+        &[(String::from("start"), vec![7])],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime_node::get(&db.pool, "rN", "demo-collect", "start")
+            .await
+            .unwrap(),
+        Some(vec![7])
+    );
+
+    // 删机器人：真实主流程与 demo 的节点都由 robot_id 外键级联清掉。
+    assert!(robot::delete(&db.pool, "rN").await.unwrap());
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_nodes WHERE robot_id = $1")
+        .bind("rN")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "删机器人必须级联清掉运行时节点（含 demo）");
 
     db.cleanup().await;
 }
