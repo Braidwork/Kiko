@@ -5,27 +5,13 @@ use axum::extract::{Path, Query};
 use axum::response::IntoResponse;
 
 use super::dto::HttpReqInfo;
-use crate::db;
-use crate::db_executor;
+use crate::repo;
 use crate::result::{Error, Result};
 use crate::web::server::to_res;
 
-// pub(crate) const TABLE: redb::TableDefinition<&str, &[u8]> =
-//     redb::TableDefinition::new("externalHttpApis");
-pub(crate) const TABLE_SUFFIX: &str = "externalHttpApis";
-
-pub(crate) async fn init(robot_id: &str) -> Result<()> {
-    // db::init_table(TABLE)
-    db_executor!(db::init_table, robot_id, TABLE_SUFFIX,)
-}
-
 pub(crate) async fn list(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
-    // let r: Result<Vec<HttpReqInfo>> = db::get_all(TABLE);
     if let Some(robot_id) = q.get("robotId") {
-        let r: Result<Vec<HttpReqInfo>> = async {
-            db_executor!(db::get_all, &robot_id, TABLE_SUFFIX,)
-        }
-        .await;
+        let r: Result<Vec<HttpReqInfo>> = repo::external_http::list(repo::pool(), robot_id).await;
         to_res(r)
     } else {
         to_res(Err(Error::WithMessage(String::from(
@@ -35,8 +21,7 @@ pub(crate) async fn list(Query(q): Query<HashMap<String, String>>) -> impl IntoR
 }
 
 pub(crate) async fn get_detail(robot_id: &str, id: &str) -> Result<Option<HttpReqInfo>> {
-    // db::query(TABLE, id)
-    db_executor!(db::query, robot_id, TABLE_SUFFIX, id)
+    repo::external_http::get(repo::pool(), robot_id, id).await
 }
 
 pub(crate) async fn detail(
@@ -61,10 +46,7 @@ pub(crate) async fn save(
         if params.id.is_empty() || params.id.eq("new") {
             params.id = scru128::new_string();
         }
-        let r: Result<()> = async {
-            db_executor!(db::write, robot_id, TABLE_SUFFIX, &params.id, &params)
-        }
-        .await;
+        let r = repo::external_http::upsert(repo::pool(), robot_id, &params).await;
         to_res(r)
     } else {
         to_res(Err(Error::WithMessage(String::from(
@@ -78,10 +60,7 @@ pub(crate) async fn remove(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(robot_id) = q.get("robotId") {
-        let r: Result<()> = async {
-            db_executor!(db::remove, &robot_id, TABLE_SUFFIX, id.as_str())
-        }
-        .await;
+        let r = repo::external_http::delete(repo::pool(), robot_id, id.as_str()).await;
         to_res(r)
     } else {
         to_res(Err(Error::WithMessage(String::from(

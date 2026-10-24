@@ -3,7 +3,10 @@
 //! 每个用例自建 `tmp_<uuid>` schema、跑 migration、结束时 drop，不污染共享库。
 //! 没配 `KIKO_TEST_DATABASE_URL` 时整组跳过 —— 没有 PG 的环境不该因此红一片。
 
-use super::{robot, test_support::TestDb, variable};
+use super::{external_http, robot, test_support::TestDb, variable};
+use crate::external::http::dto::{
+    HttpReqInfo, HttpReqParam, Method, PostContentType, Protocol, ValueSource,
+};
 use crate::robot::dto::{RobotData, RobotType};
 use crate::variable::dto::{
     Variable, VariableObtainValueExpressionType, VariableType, VariableValueSource,
@@ -211,6 +214,171 @@ async fn deleting_robot_cascades_variables() {
         .await
         .unwrap();
     assert_eq!(left, 0, "删机器人必须级联清掉它的变量");
+
+    db.cleanup().await;
+}
+
+fn param(name: &str, value: &str, vs: ValueSource) -> HttpReqParam {
+    HttpReqParam {
+        name: String::from(name),
+        value: String::from(value),
+        value_source: vs,
+    }
+}
+
+fn http_api(id: &str, name: &str) -> HttpReqInfo {
+    HttpReqInfo {
+        id: String::from(id),
+        name: String::from(name),
+        description: String::from("desc"),
+        protocol: Protocol::HTTPS,
+        method: Method::POST,
+        address: String::from("api.example.com/v1"),
+        post_content_type: PostContentType::Raw,
+        headers: vec![
+            param("X-A", "1", ValueSource::Val),
+            param("X-B", "var", ValueSource::Var),
+        ],
+        query_params: vec![param("q", "v", ValueSource::Var)],
+        form_data: vec![
+            param("f1", "a", ValueSource::Val),
+            param("f2", "b", ValueSource::Val),
+        ],
+        request_body: String::from("{}"),
+        content_type: String::from("application/json"),
+        user_agent: String::from("kiko-test"),
+    }
+}
+
+#[tokio::test]
+async fn external_http_roundtrip_and_replace() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rH", "http")).await.unwrap();
+
+    let mut api = http_api("api1", "first");
+    external_http::upsert(&db.pool, "rH", &api).await.unwrap();
+
+    let got = external_http::get(&db.pool, "rH", "api1")
+        .await
+        .unwrap()
+        .expect("api1 应该存在");
+    assert_eq!(got.name, "first");
+    assert_eq!(got.protocol, Protocol::HTTPS);
+    assert_eq!(got.method, Method::POST);
+    assert_eq!(got.post_content_type, PostContentType::Raw);
+    assert_eq!(got.content_type, "application/json");
+    assert_eq!(got.user_agent, "kiko-test");
+    assert_eq!(
+        got.headers, api.headers,
+        "header 顺序与 valueSource 都要保序"
+    );
+    assert_eq!(got.query_params, api.query_params);
+    assert_eq!(got.form_data, api.form_data);
+
+    // 同一个 id 再存一次 = 主表更新 + 参数整组替换，不能残留旧参数。
+    api.name = String::from("renamed");
+    api.headers = vec![param("X-Only", "1", ValueSource::Val)];
+    api.query_params.clear();
+    api.form_data = vec![param("f", "z", ValueSource::Var)];
+    external_http::upsert(&db.pool, "rH", &api).await.unwrap();
+
+    let got = external_http::get(&db.pool, "rH", "api1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.name, "renamed");
+    assert_eq!(got.headers, api.headers);
+    assert!(got.query_params.is_empty());
+    assert_eq!(got.form_data, api.form_data);
+
+    let params: i64 = sqlx::query_scalar("SELECT count(*) FROM external_http_params")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(params, 2, "旧参数必须被删掉，不能重复累积");
+
+    // 列表与单条一致。
+    let list = external_http::list(&db.pool, "rH").await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, "api1");
+
+    external_http::delete(&db.pool, "rH", "api1").await.unwrap();
+    assert!(
+        external_http::get(&db.pool, "rH", "api1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let params: i64 = sqlx::query_scalar("SELECT count(*) FROM external_http_params")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(params, 0, "删 API 必须级联删参数");
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn external_http_list_orders_by_id_and_isolates_robots() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rA", "a")).await.unwrap();
+    robot::upsert(&db.pool, &robot("rB", "b")).await.unwrap();
+
+    external_http::upsert(&db.pool, "rA", &http_api("b-api", "b"))
+        .await
+        .unwrap();
+    external_http::upsert(&db.pool, "rA", &http_api("a-api", "a"))
+        .await
+        .unwrap();
+    external_http::upsert(&db.pool, "rB", &http_api("c-api", "c"))
+        .await
+        .unwrap();
+
+    let a = external_http::list(&db.pool, "rA").await.unwrap();
+    let ids: Vec<&str> = a.iter().map(|x| x.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["a-api", "b-api"],
+        "列表按 id 字节序，与 redb key 序一致"
+    );
+
+    let b = external_http::list(&db.pool, "rB").await.unwrap();
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0].id, "c-api");
+
+    // 别的机器人拿不到别人的 API（防止跨机器人泄漏）。
+    assert!(
+        external_http::get(&db.pool, "rB", "a-api")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn external_http_surfaces_missing_robot_as_business_error() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    // 机器人不存在 → 外键冲突。错误文案要是人话（B-08），不是 sqlx 的原文。
+    let err = external_http::upsert(&db.pool, "no-such-robot", &http_api("api1", "x"))
+        .await
+        .expect_err("外键冲突必须返回错误");
+    let msg = err.message();
+    assert!(
+        msg.contains("Referenced row is missing"),
+        "unexpected error message: {msg}"
+    );
 
     db.cleanup().await;
 }

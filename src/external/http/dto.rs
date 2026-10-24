@@ -2,31 +2,31 @@ use std::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) enum Protocol {
     HTTP,
     HTTPS,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) enum Method {
     GET,
     POST,
 }
 
-#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) enum PostContentType {
     UrlEncoded,
     Raw,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) enum ValueSource {
     Val,
     Var,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) struct HttpReqParam {
     pub(crate) name: String,
     pub(crate) value: String,

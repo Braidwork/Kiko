@@ -5,7 +5,6 @@ use axum::{Json, response::IntoResponse};
 
 use super::dto::{RobotData, RobotQuery, RobotType};
 use crate::db_executor;
-use crate::external::http::crud as http;
 use crate::flow::mainflow::crud as mainflow;
 use crate::flow::rt::context;
 use crate::intent::crud as intent;
@@ -69,8 +68,7 @@ async fn new(d: &RobotData, is_en: bool) -> Result<()> {
     variable::init(&d.robot_id, is_en).await?;
     // 主流程
     mainflow::init(&d.robot_id).await?;
-    // Http 接口
-    http::init(&d.robot_id).await?;
+    // 外部 HTTP 接口：表在 PG，按 robot_id 外键挂在机器人下，不需要建表。
     // 流程上下文：每机器人一张表（原来的全局 session 索引已去掉）
     context::init(&d.robot_id).await?;
     Ok(())
@@ -110,11 +108,6 @@ async fn purge(robot_id: &str) -> Result<()> {
     crate::kb::doc::remove_tables(robot_id).await?;
     // 每机器人的设置表（原来只是全局 settings 表里以 robot_id 为键的一行）
     db_executor!(db::delete_table, robot_id, settings::TABLE_SUFFIX,)?;
-    db_executor!(
-        db::delete_table,
-        robot_id,
-        crate::external::http::crud::TABLE_SUFFIX,
-    )?;
     db_executor!(
         db::delete_table,
         robot_id,
