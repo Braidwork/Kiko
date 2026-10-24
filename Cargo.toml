@@ -66,6 +66,7 @@ scraper = "0.27.0"
 # strsim = "0.10.0"
 # textdistance = "1.0.2"
 time = { version = "0.3.55", features = ["formatting"] }
+toml = "0.9"
 tower-http = { version = "0.7.1", features = ["cors", "limit"] }
 # typetag = "0.2"
 tokio = { version = "1.53.2", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "time", "tracing"] }
@@ -76,7 +77,17 @@ env_logger = "0.11.11"
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "tokio1", "tokio1-rustls", "rustls", "rustls-platform-verifier", "ring", "smtp-transport", "pool"]}
 unicase = "2.10.0"
 unicode-normalization = "0.1.25"
-# sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+# D40：sqlx 0.9，default-features 必须关掉（默认带 `any`）；TLS 特性名是 `tls-rustls`。
+# redb / turso 要等 S3 逐模块切换完之后才能删（D39）。
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "json",
+    "migrate",
+    "macros",
+    "derive",
+] }
 lopdf = "0.45.0"
 # docx-rs = "0.4.17"
 # lancedb = "0.13.0"

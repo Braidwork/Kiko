@@ -30,7 +30,7 @@ fn main() -> Result<(), std::io::Error> {
         .format_target(false)
         .format_indent(None);
     builder.init();
-Kiko
+
     let runtime = Builder::new_multi_thread()
         .worker_threads(std::thread::available_parallelism()?.get() + 5usize)
         .thread_name("Kiko")

@@ -11,7 +11,6 @@ use crate::db;
 use crate::db_executor;
 use crate::man::settings;
 use crate::result::Result;
-use crate::robot::crud as robot;
 use crate::variable::dto::VariableValue;
 
 /// 每机器人的会话表，表名是 `{robot_id}contexts`。
@@ -250,10 +249,8 @@ pub async fn clean_expired_session(mut recv: tokio::sync::oneshot::Receiver<()>)
 /// 扫一遍所有机器人的会话表。
 async fn clean_once() -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let robots: Vec<crate::robot::dto::RobotData> = async {
-        db::get_all(db::global_store().await?, robot::TABLE).await
-    }
-    .await?;
+    // 机器人清单在 PG（S2 起），会话表还在 redb —— 共存期的正常状态。
+    let robots = crate::repo::robot::list(crate::repo::pool()).await?;
     for r in robots.iter() {
         let store = db::store(db::StoreKey::Robot(&r.robot_id)).await?;
         clean_robot_sessions(store, &r.robot_id, now).await?;

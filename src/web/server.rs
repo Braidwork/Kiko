@@ -60,6 +60,26 @@ fn get_lang() -> String {
 // }
 
 pub async fn start_app() {
+    // 启动顺序（D33 fail-fast）：配置 → PostgreSQL（连池 + 迁移）→ 其余存储 → 起服务。
+    // 任何一步失败都以非 0 退出：不猜 DSN、不进降级模式、不做 setup 向导。
+    let config = match crate::config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    log::info!("Using config file: {}", config.source.display());
+    if let Err(e) = crate::repo::init(&config.database_url, config.auto_migrate).await {
+        log::error!(
+            "Failed to initialize PostgreSQL: {e}\n\
+             Check the [database] url in {} or the {} environment variable.",
+            config.source.display(),
+            crate::config::DATABASE_URL_ENV
+        );
+        std::process::exit(1);
+    }
+
     // unsafe {
     //     libsqlite3_sys::sqlite3_auto_extension(Some(std::mem::transmute(
     //         sqlite_vec::sqlite3_vec_init as *const (),

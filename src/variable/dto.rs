@@ -327,13 +327,13 @@ impl VariableValue {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) enum VariableType {
     Str,
     Num,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) enum VariableValueSource {
     Import,
     Collect,
@@ -342,7 +342,7 @@ pub(crate) enum VariableValueSource {
     ExternalHttp,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) enum VariableObtainValueExpressionType {
     None,
     JsonPointer,

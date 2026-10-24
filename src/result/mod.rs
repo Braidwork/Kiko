@@ -6,6 +6,11 @@ pub(crate) type Result<D> = core::result::Result<D, Error>;
 #[derive(Debug)]
 pub(crate) enum Error {
     Db(Box<redb::Error>),
+    /// PostgreSQL 错误（B-08）。唯一约束 / 外键冲突单独识别成一句话，
+    /// 业务侧和前端看到的就不再是 `error returned from database: …` 这种原文。
+    Pg(Box<sqlx::Error>),
+    /// schema 迁移失败（启动路径，D33 fail-fast）。
+    Migrate(Box<sqlx::migrate::MigrateError>),
     /// turso 的写锁争用（`Busy` / `BusySnapshot`）。
     ///
     /// 从 `turso::Error` 里单独拆出来，是因为它可恢复 —— 调用方可以退避后重试。
@@ -29,6 +34,19 @@ impl Error {
     pub(crate) fn message(&self) -> String {
         match &self {
             Self::Db(e) => format!("{e:?}"),
+            Self::Pg(e) => match e.as_database_error() {
+                Some(db) if db.is_unique_violation() => {
+                    format!("Duplicate value: {}", db.message())
+                }
+                Some(db) if db.is_foreign_key_violation() => {
+                    format!(
+                        "Referenced row is missing or still in use: {}",
+                        db.message()
+                    )
+                }
+                _ => format!("Database error: {e}"),
+            },
+            Self::Migrate(e) => format!("Migration error: {e}"),
             Self::DbBusy(s) => format!("Database is busy: {s}"),
             Self::Serde(e) => format!("{e:?}"),
             Self::TimeFormat(e) => format!("{e:?}"),
@@ -72,6 +90,18 @@ impl From<regex::Error> for Error {
 impl From<redb::Error> for Error {
     fn from(err: redb::Error) -> Self {
         Error::Db(Box::new(err))
+    }
+}
+
+impl From<sqlx::Error> for Error {
+    fn from(err: sqlx::Error) -> Self {
+        Error::Pg(Box::new(err))
+    }
+}
+
+impl From<sqlx::migrate::MigrateError> for Error {
+    fn from(err: sqlx::migrate::MigrateError) -> Self {
+        Error::Migrate(Box::new(err))
     }
 }
 
