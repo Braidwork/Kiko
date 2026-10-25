@@ -1,21 +1,24 @@
-//! 进程内向量索引的**注册表**：按 `(robot_id, collection)` 懒加载、写后同步、
-//! 换 generation 后作废（D35 / D47 / §6.3）。
+//! 进程内向量索引的**注册表**：按 `(robot_id, collection)` 懒加载、按内存预算淘汰、
+//! 写后同步、换 generation 后作废（D35 / D47 / §6.3）。
 //!
-//! 三条硬规矩：
+//! 四条硬规矩：
 //!
 //! 1. **PG 是事实，索引是缓存**（D4）。索引永远从 `vector_items` 重建，不落磁盘；
 //!    进程重启、加载失败、维度不一致，都只需要"丢掉缓存、下次从 PG 重读"。
 //! 2. **先写 PG，后更新索引**。写完提交成功才调 [`upsert`] / [`delete`]；更新失败
-//!    只是把这份缓存删掉（等价于"标 dirty"），下一次检索会从 PG 重新加载 —— 这样
-//!    不需要一张 dirty 表，也不存在"索引里有、库里没有"的持久不一致。
+//!    会把缓存删掉并把 `vector_collection_state.dirty` 标上（B-28），下一次检索从
+//!    PG 重新加载，加载成功后再把 dirty 清掉。
 //! 3. **查询只认 active generation**。重建期间新旧 generation 的向量行共存，
 //!    [`ensure_loaded`] 按 `vector_collection_state.active_generation` 过滤；
 //!    重建收尾翻转 active 之后调用 [`invalidate`] 让下一次查询重载。
+//! 4. **内存有预算**（B-27）。加载前先按 `(行数, 维度)` 估算占用；超过
+//!    `KIKO_VECTOR_INDEX_BUDGET_MB`（默认 512）就先降成 f16，再把最久没用的集合
+//!    淘汰掉。还放不下就记一条 warn 照常加载 —— 更大规模要等 ANN（C 阶段）。
 //!
-//! 常驻数量上限见 [`MAX_LOADED_COLLECTIONS`]：v1 先按"最多这么多集合"做 LRU，
-//! 内存预算 + f16/i8 降精度属于 B-27 的完整版（见 §18）。
+//! 后台对账（行数 vs PG）在 [`reconcile`] 里，由 `start_app` 启动。
 
 pub(crate) mod index;
+pub(crate) mod reconcile;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,20 +29,39 @@ use crate::man::settings;
 use crate::repo;
 use crate::result::{Error, Result};
 
-use index::{BruteForce, IndexBackend, ItemId, ScoredId, VectorIndex, VectorItem};
+use index::{
+    BruteForce, IndexBackend, ItemId, Precision, ScoredId, VectorIndex, VectorItem,
+    choose_precision,
+};
 
 pub(crate) use index::is_hit;
 
-/// 同时常驻的 `(robot_id, collection)` 上限。超了就淘汰最久没用过的那份。
-///
-/// 10 万条 × 1024 维 ≈ 400 MB，所以不能无限常驻；但也不能每次查询都重载 ——
-/// 一个机器人的三类集合（phrase / qa / doc）加上多机器人，8 份是保守的起点。
+/// 常驻集合数硬上限。字节预算是主约束，这个只是防御（防止几千个小集合）。
 pub(crate) const MAX_LOADED_COLLECTIONS: usize = 8;
+
+/// 默认内存预算：512 MB。10 万条 × 1024 维 f32 ≈ 400 MB，f16 ≈ 204 MB。
+const DEFAULT_BUDGET_MB: usize = 512;
+const BUDGET_ENV: &str = "KIKO_VECTOR_INDEX_BUDGET_MB";
+
+/// 索引内存预算（字节）。`KIKO_VECTOR_INDEX_BUDGET_MB` 覆盖，`0` / 非法值回落默认。
+pub(crate) fn budget_bytes() -> usize {
+    static BUDGET: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var(BUDGET_ENV)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|m| *m > 0)
+            .unwrap_or(DEFAULT_BUDGET_MB)
+            .saturating_mul(1024 * 1024)
+    });
+    *BUDGET
+}
 
 type Key = (String, String);
 
 struct Entry {
     last_used: u64,
+    /// 估算的常驻字节数（`BruteForce::bytes()`）。
+    bytes: usize,
     index: IndexBackend,
 }
 
@@ -68,52 +90,144 @@ fn is_loaded(robot_id: &str, collection: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 淘汰最久没用的那份，给新集合腾位置。
-fn evict_lru(map: &mut HashMap<Key, Entry>) {
-    if let Some(k) = map
-        .iter()
+/// 最久没用过的集合（排除正要插入的 `keep`）。
+fn lru_victim(map: &HashMap<Key, Entry>, keep: &Key) -> Option<Key> {
+    map.iter()
+        .filter(|(k, _)| *k != keep)
         .min_by_key(|(_, e)| e.last_used)
         .map(|(k, _)| k.clone())
-    {
-        map.remove(&k);
+}
+
+/// 为 `needed` 字节腾地方：先按字节预算淘汰，再按集合数上限淘汰。
+///
+/// 返回淘汰掉的集合数（测试用）。
+fn evict_until(
+    map: &mut HashMap<Key, Entry>,
+    keep: &Key,
+    needed: usize,
+    budget: usize,
+    max_count: usize,
+) -> usize {
+    let mut evicted = 0;
+    let mut used: usize = map
+        .iter()
+        .filter(|(k, _)| *k != keep)
+        .map(|(_, e)| e.bytes)
+        .sum();
+    while used.saturating_add(needed) > budget {
+        let Some(victim) = lru_victim(map, keep) else {
+            break;
+        };
+        used = used.saturating_sub(map.get(&victim).map(|e| e.bytes).unwrap_or(0));
+        map.remove(&victim);
+        evicted += 1;
     }
+    while map.keys().filter(|k| *k != keep).count() >= max_count {
+        let Some(victim) = lru_victim(map, keep) else {
+            break;
+        };
+        map.remove(&victim);
+        evicted += 1;
+    }
+    evicted
 }
 
 /// 从 PG 载入一份索引（已经载入就什么都不做）。
 ///
 /// 读的是 `active_generation` 的向量行；没有 state 行（从没写过向量）时按 0 代读，
-/// 自然得到空索引。
+/// 自然得到空索引。行是**流式**读的：`vector_items.vec` 只按行解码，不会先把整张
+/// 表拉成 `Vec<[f32]>`（否则降精度之前就已经把内存吃掉了）。
 pub(crate) async fn ensure_loaded(robot_id: &str, collection: &str) -> Result<()> {
     if is_loaded(robot_id, collection) {
         return Ok(());
     }
-    let rows = repo::vector::load_active(repo::pool(), robot_id, collection).await?;
-    let rows: Vec<(ItemId, Vec<f32>)> = rows
-        .into_iter()
-        .map(|(id, vec)| (id as ItemId, vec))
-        .collect();
-    let backend = IndexBackend::BruteForce(BruteForce::from_items(rows)?);
-    if let Ok(s) = backend.stats() {
+    let pool = repo::pool();
+    let state = repo::vector::state(pool, robot_id, collection).await?;
+    let (generation, dirty) = match &state {
+        Some(s) => (s.active_generation, s.dirty),
+        None => (0, false),
+    };
+    let budget = budget_bytes();
+    // 加载期间可能有并发写落库：读到的行数如果和构建后的条目数对不上，就再读一次。
+    // 两次都对不上（写入持续不停）也照常缓存，但标 dirty，交给后台对账兜底。
+    let mut consistent = false;
+    let mut loaded: Option<(IndexBackend, index::IndexStats)> = None;
+    for attempt in 0..2 {
+        let one = load_generation(robot_id, collection, generation).await?;
+        let now = repo::vector::count_generation(pool, robot_id, collection, generation).await?;
+        consistent = now as usize == one.1.len;
+        loaded = Some(one);
+        if consistent {
+            break;
+        }
         log::debug!(
-            "Loaded vector index {robot_id}/{collection}: {} items × {} dims",
-            s.len,
-            s.dimension
+            "Vector index {robot_id}/{collection} changed while loading (attempt {attempt}); retrying"
         );
     }
-    let mut map = lock()?;
-    if !map.contains_key(&key(robot_id, collection)) {
-        if map.len() >= MAX_LOADED_COLLECTIONS {
-            evict_lru(&mut map);
-        }
-        map.insert(
-            key(robot_id, collection),
-            Entry {
-                last_used: tick(),
-                index: backend,
-            },
+    let (backend, stats) = loaded.expect("循环至少执行一次");
+    let bytes = stats.bytes;
+    if stats.precision == Precision::F16 {
+        log::info!(
+            "Vector index {robot_id}/{collection}: {} rows × {} dims exceeds the {budget} B budget, using f16 ({bytes} B)",
+            stats.len,
+            stats.dimension
         );
+    }
+    {
+        let mut map = lock()?;
+        let k = key(robot_id, collection);
+        if !map.contains_key(&k) {
+            evict_until(&mut map, &k, bytes, budget, MAX_LOADED_COLLECTIONS);
+            map.insert(
+                k,
+                Entry {
+                    last_used: tick(),
+                    bytes,
+                    index: backend,
+                },
+            );
+        }
+    }
+    log::debug!(
+        "Loaded vector index {robot_id}/{collection}: {} items × {} dims, {bytes} bytes",
+        stats.len,
+        stats.dimension
+    );
+    if bytes > budget {
+        log::warn!(
+            "Vector index {robot_id}/{collection} needs {bytes} B, over the {budget} B budget even at f16; \
+             consider shrinking the collection or an ANN backend (C phase)"
+        );
+    }
+    if !consistent {
+        // 缓存是从一份正在变化的快照建出来的：先标脏，下一次对账/重载会纠正。
+        mark_dirty(robot_id, collection).await;
+    } else if dirty {
+        // 加载成功 = 缓存与 PG 一致；把"可能不一致"的标记清掉（B-28）。
+        repo::vector::set_dirty(pool, robot_id, collection, false).await?;
     }
     Ok(())
+}
+
+/// 一个 generation 的完整索引（不碰缓存表）。
+async fn load_generation(
+    robot_id: &str,
+    collection: &str,
+    generation: i64,
+) -> Result<(IndexBackend, index::IndexStats)> {
+    let pool = repo::pool();
+    let rows =
+        repo::vector::count_generation(pool, robot_id, collection, generation).await? as usize;
+    let dim = repo::vector::generation_dim(pool, robot_id, collection, generation).await?;
+    let precision = choose_precision(rows, dim, budget_bytes());
+    let mut brute = BruteForce::new(dim, precision);
+    repo::vector::for_each_generation_row(pool, robot_id, collection, generation, |id, blob| {
+        let vec = index::decode(blob)?;
+        brute.insert(id as ItemId, &vec)
+    })
+    .await?;
+    let stats = brute.stats()?;
+    Ok((IndexBackend::BruteForce(brute), stats))
 }
 
 /// 检索：先保证载入，再在索引里取 top-`limit`。返回的 `score` 是相似度（D41）。
@@ -139,49 +253,87 @@ pub(crate) async fn search(
 }
 
 /// 写后同步：把刚提交的向量塞进已载入的索引；没载入就什么都不做（下次从 PG 读）。
-pub(crate) fn upsert(robot_id: &str, collection: &str, rows: &[(ItemId, Vec<f32>)]) {
+///
+/// 更新失败 → 丢掉缓存 + 标 dirty（B-28）。`settle` 之后由下一次检索重载并清标记。
+pub(crate) async fn upsert(robot_id: &str, collection: &str, rows: &[(ItemId, Vec<f32>)]) {
     if rows.is_empty() {
         return;
     }
-    let Ok(mut map) = INDEXES.lock() else {
-        return;
-    };
-    let k = key(robot_id, collection);
-    let Some(entry) = map.get_mut(&k) else {
-        return;
-    };
-    entry.last_used = tick();
-    let items: Vec<VectorItem> = rows
-        .iter()
-        .map(|(id, vec)| VectorItem {
-            id: *id,
-            vec: vec.clone(),
-        })
-        .collect();
-    if let Err(e) = entry.index.upsert(&items) {
-        log::warn!("Updating vector index of {robot_id}/{collection} failed: {e}; dropping cache");
-        map.remove(&k);
+    let mut failed = false;
+    {
+        let Ok(mut map) = INDEXES.lock() else {
+            return;
+        };
+        let k = key(robot_id, collection);
+        let Some(entry) = map.get_mut(&k) else {
+            return;
+        };
+        entry.last_used = tick();
+        let items: Vec<VectorItem> = rows
+            .iter()
+            .map(|(id, vec)| VectorItem {
+                id: *id,
+                vec: vec.clone(),
+            })
+            .collect();
+        match entry.index.upsert(&items) {
+            Ok(()) => {
+                if let Ok(s) = entry.index.stats() {
+                    entry.bytes = s.bytes;
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "Updating vector index of {robot_id}/{collection} failed: {e}; dropping cache and marking dirty"
+                );
+                map.remove(&k);
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        mark_dirty(robot_id, collection).await;
     }
 }
 
-/// 删除后同步。
-pub(crate) fn delete(robot_id: &str, collection: &str, ids: &[ItemId]) {
+/// 删除后同步。删除本身不会让内存变大，但失败同样要标 dirty。
+pub(crate) async fn delete(robot_id: &str, collection: &str, ids: &[ItemId]) {
     if ids.is_empty() {
         return;
     }
-    let Ok(mut map) = INDEXES.lock() else {
-        return;
-    };
-    let k = key(robot_id, collection);
-    let Some(entry) = map.get_mut(&k) else {
-        return;
-    };
-    entry.last_used = tick();
-    if let Err(e) = entry.index.delete(ids) {
-        log::warn!(
-            "Deleting from vector index of {robot_id}/{collection} failed: {e}; dropping cache"
-        );
-        map.remove(&k);
+    let mut failed = false;
+    {
+        let Ok(mut map) = INDEXES.lock() else {
+            return;
+        };
+        let k = key(robot_id, collection);
+        let Some(entry) = map.get_mut(&k) else {
+            return;
+        };
+        entry.last_used = tick();
+        match entry.index.delete(ids) {
+            Ok(()) => {
+                if let Ok(s) = entry.index.stats() {
+                    entry.bytes = s.bytes;
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "Deleting from vector index of {robot_id}/{collection} failed: {e}; dropping cache and marking dirty"
+                );
+                map.remove(&k);
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        mark_dirty(robot_id, collection).await;
+    }
+}
+
+async fn mark_dirty(robot_id: &str, collection: &str) {
+    if let Err(e) = repo::vector::set_dirty(repo::pool(), robot_id, collection, true).await {
+        log::warn!("Marking vector index of {robot_id}/{collection} dirty failed: {e}");
     }
 }
 
@@ -204,6 +356,22 @@ pub(crate) fn clear(robot_id: &str, collection: &str) {
         log::warn!("Clearing vector index of {robot_id}/{collection} failed: {e}");
         map.remove(&key(robot_id, collection));
     }
+}
+
+/// 当前载入的集合（对账用）。
+pub(crate) fn loaded_keys() -> Vec<(String, String)> {
+    INDEXES
+        .lock()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// 某个集合载入的条目数；没载入返回 `None`。
+pub(crate) fn loaded_count(robot_id: &str, collection: &str) -> Option<usize> {
+    let map = INDEXES.lock().ok()?;
+    map.get(&key(robot_id, collection))
+        .and_then(|e| e.index.stats().ok())
+        .map(|s| s.len)
 }
 
 /// 当前配置会把向量算成什么模型（B-23 的 `embedding_models` 行）。
@@ -254,22 +422,66 @@ mod tests {
         assert_eq!(&blob[..4], &[0x00, 0x00, 0x00, 0x3f]);
     }
 
-    /// LRU 的硬性质：超过上限必须淘汰，且淘汰的是最久没用的那份。
+    fn entry(last_used: u64, bytes: usize) -> Entry {
+        Entry {
+            last_used,
+            bytes,
+            index: IndexBackend::BruteForce(BruteForce::new(0, Precision::F32)),
+        }
+    }
+
+    /// LRU 的硬性质：超预算必须淘汰，且淘汰的是最久没用的那份。
     #[test]
-    fn lru_evicts_the_least_recently_used_collection() {
+    fn evicts_the_least_recently_used_collection_to_fit_the_budget() {
         let mut map: HashMap<Key, Entry> = HashMap::new();
         for (i, c) in ["a", "b", "c"].iter().enumerate() {
-            map.insert(
-                key("r", c),
-                Entry {
-                    last_used: i as u64,
-                    index: IndexBackend::BruteForce(BruteForce::new(0)),
-                },
-            );
+            map.insert(key("r", c), entry(i as u64, 100));
         }
-        evict_lru(&mut map);
-        assert!(!map.contains_key(&key("r", "a")), "最久没用的 a 应该被淘汰");
+        // 需要 150 字节、预算 350：现有 300 → 450 > 350，淘汰一份最久没用的（a）
+        // 之后 200 + 150 = 350 正好放下。
+        let evicted = evict_until(&mut map, &key("r", "d"), 150, 350, 8);
+        assert_eq!(evicted, 1);
+        assert!(!map.contains_key(&key("r", "a")));
         assert!(map.contains_key(&key("r", "b")));
         assert!(map.contains_key(&key("r", "c")));
+    }
+
+    /// 预算永远优先淘汰最久没用的，直到放得下；放不下就全部淘汰（调用方会 warn）。
+    #[test]
+    fn eviction_continues_until_the_new_collection_fits() {
+        let mut map: HashMap<Key, Entry> = HashMap::new();
+        for (i, c) in ["a", "b", "c"].iter().enumerate() {
+            map.insert(key("r", c), entry(i as u64, 100));
+        }
+        let evicted = evict_until(&mut map, &key("r", "new"), 900, 250, 8);
+        assert_eq!(evicted, 3, "900 字节放不进 250 的预算，必须清空");
+        assert!(map.is_empty());
+    }
+
+    /// 集合数上限：字节够也必须淘汰，否则小集合会无限积累。
+    #[test]
+    fn collection_count_cap_evicts_even_when_the_budget_is_loose() {
+        let mut map: HashMap<Key, Entry> = HashMap::new();
+        for (i, c) in ["a", "b", "c"].iter().enumerate() {
+            map.insert(key("r", c), entry(i as u64, 1));
+        }
+        evict_until(&mut map, &key("r", "d"), 1, usize::MAX, 3);
+        assert!(!map.contains_key(&key("r", "a")), "最久没用的 a 应先走");
+        assert_eq!(map.len(), 2);
+    }
+
+    /// 正在插入的集合自己不能被当成淘汰对象。
+    #[test]
+    fn the_collection_being_loaded_is_never_evicted() {
+        let mut map: HashMap<Key, Entry> = HashMap::new();
+        map.insert(key("r", "x"), entry(0, 100));
+        evict_until(&mut map, &key("r", "x"), 1000, 0, 8);
+        assert!(map.contains_key(&key("r", "x")));
+    }
+
+    /// B-27：预算默认存在、可用环境变量覆盖（这里只断言非零，避免改进程环境）。
+    #[test]
+    fn budget_defaults_to_a_positive_number_of_bytes() {
+        assert!(budget_bytes() >= 8 * 1024 * 1024);
     }
 }

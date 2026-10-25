@@ -87,6 +87,9 @@ pub async fn start_app() {
 
     // 知识库与向量的存储全部在 PG（S4）；进程内索引按 `(robot, collection)` 懒加载，
     // 启动时不需要初始化任何嵌入式数据库。
+    // 后台对账（B-28）：已载入的索引按行数与 PG 比对，漂移就作废缓存并标 dirty；
+    // `KIKO_VECTOR_RECONCILE_SECS=0` 关闭（默认 60 秒）。必须在 repo::init 之后。
+    crate::vector::reconcile::spawn();
 
     let settings = {
         let is_en = *IS_EN;

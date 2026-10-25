@@ -15,11 +15,15 @@
 //!   模型算的"，与用户当前配置是两件事。
 //! - `vector_items.vec` 的格式就是 `vector::index::encode` 的小端 f32 拼接。
 
+use futures_util::TryStreamExt;
 use sqlx::PgConnection;
+use sqlx::Row;
 use sqlx::postgres::PgPool;
 
 use crate::result::Result;
-use crate::vector::index::{decode, encode};
+#[cfg(test)]
+use crate::vector::index::decode;
+use crate::vector::index::encode;
 
 /// `vector_items.collection` 的三个取值（§5.7）。
 pub(crate) const PHRASE: &str = "phrase";
@@ -43,6 +47,8 @@ pub(crate) struct CollectionState {
     pub(crate) active_model_id: Option<i16>,
     pub(crate) pending_generation: Option<i64>,
     pub(crate) status: String,
+    /// 内存索引可能和 PG 不一致（更新索引失败 / 对账发现漂移），下次加载必须重建。
+    pub(crate) dirty: bool,
 }
 
 /// 一处集合的元数据（`man::vector_report` 用，B-29）。
@@ -61,6 +67,8 @@ pub(crate) struct CollectionStats {
     pub(crate) active_model: Option<String>,
     pub(crate) pending_generation: Option<i64>,
     pub(crate) status: String,
+    /// 见 [`CollectionState::dirty`]。
+    pub(crate) dirty: bool,
 }
 
 /// 建 state 行（已存在则不动）。机器人还不存在时 FK 会报错——调用方都在机器人
@@ -106,7 +114,7 @@ pub(crate) async fn state(
     collection: &str,
 ) -> Result<Option<CollectionState>> {
     Ok(sqlx::query_as(
-        "SELECT active_generation, active_model_id, pending_generation, status
+        "SELECT active_generation, active_model_id, pending_generation, status, dirty
            FROM vector_collection_state
           WHERE robot_id = $1 AND collection = $2",
     )
@@ -114,6 +122,29 @@ pub(crate) async fn state(
     .bind(collection)
     .fetch_optional(pool)
     .await?)
+}
+
+/// 标记/清除"内存索引可能与 PG 不一致"（B-28）。
+///
+/// `dirty = true` 由"更新索引失败"和"后台对账发现行数漂移"写入；`ensure_loaded`
+/// 成功重建后清掉。没有 state 行时什么都不做（没写过向量就没有缓存可脏）。
+pub(crate) async fn set_dirty(
+    pool: &PgPool,
+    robot_id: &str,
+    collection: &str,
+    dirty: bool,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE vector_collection_state
+            SET dirty = $3, updated_at = now()
+          WHERE robot_id = $1 AND collection = $2",
+    )
+    .bind(robot_id)
+    .bind(collection)
+    .bind(dirty)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// 记录（或复用）一份模型定义，返回 `embedding_models.id`。
@@ -295,20 +326,16 @@ pub(crate) async fn entities_with_vector(
 }
 
 /// 载入 active generation 的全部向量行：`(vector_items.id, vec)`。
+///
+/// 只给测试用：生产路径走 [`for_each_generation_row`] 流式加载（B-27），不会先把
+/// 整张表拉成 `Vec`。
+#[cfg(test)]
 pub(crate) async fn load_active(
     pool: &PgPool,
     robot_id: &str,
     collection: &str,
 ) -> Result<Vec<(i64, Vec<f32>)>> {
-    let generation: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(
-                    (SELECT active_generation FROM vector_collection_state
-                      WHERE robot_id = $1 AND collection = $2), 0)",
-    )
-    .bind(robot_id)
-    .bind(collection)
-    .fetch_one(pool)
-    .await?;
+    let (generation, _) = active_generation_shape(pool, robot_id, collection).await?;
     let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
         "SELECT id, vec FROM vector_items
           WHERE robot_id = $1 AND collection = $2 AND generation = $3
@@ -324,6 +351,83 @@ pub(crate) async fn load_active(
         out.push((id, decode(&blob)?));
     }
     Ok(out)
+}
+
+/// active generation 的维度（`vector_items.vec` 的字节数 / 4）；空集合返回 0。
+///
+/// 与 [`count_generation`] 一起用于加载前的内存估算（B-27），只读一行元数据。
+pub(crate) async fn generation_dim(
+    pool: &PgPool,
+    robot_id: &str,
+    collection: &str,
+    generation: i64,
+) -> Result<usize> {
+    let bytes: Option<i32> = sqlx::query_scalar(
+        "SELECT octet_length(vec)
+           FROM vector_items
+          WHERE robot_id = $1 AND collection = $2 AND generation = $3
+          LIMIT 1",
+    )
+    .bind(robot_id)
+    .bind(collection)
+    .bind(generation)
+    .fetch_optional(pool)
+    .await?;
+    Ok(bytes.unwrap_or(0).max(0) as usize / 4)
+}
+
+/// 流式遍历一个 generation 的所有向量行，逐行交给 `f` 解码/写入索引。
+///
+/// 这样加载一份 100 万行的集合时，内存里最多只有一条 `BYTEA`（不是整张表），
+/// 降精度（B-27）才能真正生效。
+pub(crate) async fn for_each_generation_row<F>(
+    pool: &PgPool,
+    robot_id: &str,
+    collection: &str,
+    generation: i64,
+    mut f: F,
+) -> Result<()>
+where
+    F: FnMut(i64, &[u8]) -> Result<()>,
+{
+    let mut rows = sqlx::query(
+        "SELECT id, vec FROM vector_items
+          WHERE robot_id = $1 AND collection = $2 AND generation = $3
+          ORDER BY id",
+    )
+    .bind(robot_id)
+    .bind(collection)
+    .bind(generation)
+    .fetch(pool);
+    while let Some(row) = rows.try_next().await? {
+        let id: i64 = row.try_get("id")?;
+        let blob: Vec<u8> = row.try_get("vec")?;
+        f(id, &blob)?;
+    }
+    Ok(())
+}
+
+/// `(active_generation, 该代行数)`，没有 state 行时是 `(0, 0)`。测试辅助。
+#[cfg(test)]
+async fn active_generation_shape(
+    pool: &PgPool,
+    robot_id: &str,
+    collection: &str,
+) -> Result<(i64, i64)> {
+    let (generation, rows): (i64, i64) = sqlx::query_as(
+        "SELECT s.active_generation,
+                (SELECT count(*) FROM vector_items v
+                  WHERE v.robot_id = s.robot_id AND v.collection = s.collection
+                    AND v.generation = s.active_generation)
+           FROM vector_collection_state s
+          WHERE s.robot_id = $1 AND s.collection = $2",
+    )
+    .bind(robot_id)
+    .bind(collection)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or((0, 0));
+    Ok((generation, rows))
 }
 
 /// active generation 的向量行数（重建进度的 before / after）。
@@ -567,14 +671,15 @@ pub(crate) async fn collection_stats(
     dims.sort_unstable();
 
     let state = state(pool, robot_id, collection).await?;
-    let (active_generation, active_model, pending_generation, status) = match &state {
+    let (active_generation, active_model, pending_generation, status, dirty) = match &state {
         Some(s) => (
             s.active_generation,
             active_model_fingerprint(pool, s.active_model_id).await?,
             s.pending_generation,
             s.status.clone(),
+            s.dirty,
         ),
-        None => (0, None, None, String::from("idle")),
+        None => (0, None, None, String::from("idle"), false),
     };
     Ok(CollectionStats {
         collection: String::from(collection),
@@ -584,6 +689,7 @@ pub(crate) async fn collection_stats(
         active_model,
         pending_generation,
         status,
+        dirty,
     })
 }
 

@@ -1,18 +1,21 @@
 //! 纯内存向量索引（D35 / §6.3）。
 //!
-//! v1 **不引第三方 ANN**：每个 `(robot_id, collection)` 一份连续 `Vec<f32>`，
+//! v1 **不引第三方 ANN**：每个 `(robot_id, collection)` 一份连续向量数组，
 //! 查询线性扫描。没有图结构、没有磁盘索引文件，进程重启后从 PG 重建。
 //!
 //! 分数一律是**相似度**（越大越近，D41）：`sim = 1 - cos_distance = cos_similarity`。
 //! A 里 QA / 文档检索用的是 `distance <= recall_distance`，方向相反；统一入口见
 //! [`is_hit`]（B-31）。
 //!
+//! 精度（B-27）：默认 f32；一份索引超过内存预算时降成 **f16**（`Precision::F16`），
+//! 内存减半、余弦相似度误差在 1e-3 量级。小于 `2^-14` 的分量编码时刷成 0 ——
+//! 对归一化后的句向量没有影响，却省掉 f16 subnormal 的边界复杂度。
+//! 再不够就轮到 ANN（C 阶段，D35），v1 不做。
+//!
 //! 分派用 `enum IndexBackend` 而不是 `dyn VectorIndex`：C 阶段接 ES8 / Milvus 时
 //! 只需要加一个枚举成员。trait 本身用**同步**方法 —— v1 只有本地内存后端，异步
-//! 签名只会让每个调用点多一层 `await`；远程后端接入时在枚举这一层包异步即可
+//! 签名只会让每个调用点多一层 `await`；远程后端在枚举这一层包异步即可
 //! （D35 里"trait 用 async fn"的动机是给远程后端留口，位置在这里）。
-//!
-//! `ItemId` 来自 `vector_items.id`（D7：ANN 行 ID 与业务 ID 解耦）。
 
 use std::collections::HashMap;
 
@@ -33,11 +36,31 @@ pub(crate) struct ScoredId {
     pub(crate) score: f32,
 }
 
-/// 索引的规模（诊断 / 测试）。
+/// 索引的规模与内存占用（诊断 / 测试 / 预算）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct IndexStats {
     pub(crate) len: usize,
     pub(crate) dimension: usize,
+    /// 估算的常驻字节数（向量数据 + id + 范数 + 槽位）。
+    pub(crate) bytes: usize,
+    /// 内存里用的分量精度（B-27）。
+    pub(crate) precision: Precision,
+}
+
+/// 内存里的分量精度。f16 只用于预算不够时（B-27）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Precision {
+    F32,
+    F16,
+}
+
+impl Precision {
+    pub(crate) fn bytes_per_component(self) -> usize {
+        match self {
+            Precision::F32 => 4,
+            Precision::F16 => 2,
+        }
+    }
 }
 
 /// 一个 `(robot_id, collection)` 的索引。方法都是同步的，见模块注释。
@@ -108,51 +131,270 @@ pub(crate) fn decode(b: &[u8]) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// v1 的索引实现：连续 `Vec<f32>` + 线性扫描。
+// --------------------------------------------------------------------------- f16
+
+/// f32 → IEEE 754 binary16 的位模式（round-to-nearest-even）。
 ///
-/// 内存 = `N × dim × 4B`（另有 `N × 4B` 的范数与 id/槽位开销）。10 万条 × 1024 维
-/// ≈ 400 MB —— 因此 store 层按 `(robot, collection)` 懒加载并限制常驻数量
-/// （见 `vector::mod`）。
+/// 只用于**内存索引**的降精度存储，不写回 PG（`vector_items.vec` 仍是 f32）。
+/// `2^-14` 以下的分量刷成 0（embeddings 里这些值对余弦相似度没有可见影响）。
+pub(crate) fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        // inf / NaN
+        let m = if mant != 0 { 0x0200 } else { 0 };
+        return sign | 0x7c00 | m;
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00; // 溢出 → inf
+    }
+    if e <= 0 {
+        return sign; // 下溢（含 0）→ ±0
+    }
+    let mut m = (mant >> 13) as u16;
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1) {
+        m += 1;
+        if m == 0x0400 {
+            // 尾数进位到指数
+            if e + 1 >= 0x1f {
+                return sign | 0x7c00;
+            }
+            return sign | (((e + 1) as u16) << 10);
+        }
+    }
+    sign | ((e as u16) << 10) | m
+}
+
+/// binary16 位模式 → f32。保留 subnormal 解码（虽然编码器不会产出）。
+pub(crate) fn f16_to_f32(bits: u16) -> f32 {
+    let sign = (bits >> 15) & 1;
+    let exp = ((bits >> 10) & 0x1f) as i32;
+    let mant = (bits & 0x03ff) as f32;
+    let out = if exp == 0 {
+        mant * 2f32.powi(-24)
+    } else if exp == 0x1f {
+        if mant == 0.0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+    };
+    if sign == 1 { -out } else { out }
+}
+
+/// 一份索引的估算字节数：向量数据 + 每行的 id/范数/槽位开销。
+///
+/// 用于**加载前**决定精度与是否需要淘汰；建好之后以 [`BruteForce::bytes`]
+/// 的实际值为准（两者用同一个公式，测试里对齐）。
+pub(crate) fn estimated_bytes(rows: usize, dim: usize, precision: Precision) -> usize {
+    rows * dim * precision.bytes_per_component() + rows * ROW_OVERHEAD_BYTES
+}
+
+/// 每行的 id(8) + 范数(4) + HashMap 槽位估算(24)。
+const ROW_OVERHEAD_BYTES: usize = 8 + 4 + 24;
+
+/// 预算不够时选精度：能放下 f32 就用 f32，否则 f16。
+pub(crate) fn choose_precision(rows: usize, dim: usize, budget: usize) -> Precision {
+    if estimated_bytes(rows, dim, Precision::F32) <= budget {
+        Precision::F32
+    } else {
+        Precision::F16
+    }
+}
+
+// --------------------------------------------------------------------------- 存储
+
+/// 扁平行主序的向量数据，按精度选择底层数组。
+enum Data {
+    F32(Vec<f32>),
+    /// f16 的位模式（2 字节），解码见 [`f16_to_f32`]。
+    F16(Vec<u16>),
+}
+
+impl Data {
+    fn new(precision: Precision) -> Self {
+        match precision {
+            Precision::F32 => Data::F32(Vec::new()),
+            Precision::F16 => Data::F16(Vec::new()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Data::F32(v) => v.len(),
+            Data::F16(v) => v.len(),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.len() * self.bytes_per_component()
+    }
+
+    fn bytes_per_component(&self) -> usize {
+        match self {
+            Data::F32(_) => 4,
+            Data::F16(_) => 2,
+        }
+    }
+
+    fn push(&mut self, v: &[f32]) {
+        match self {
+            Data::F32(d) => d.extend_from_slice(v),
+            Data::F16(d) => d.extend(v.iter().map(|x| f32_to_f16(*x))),
+        }
+    }
+
+    fn set(&mut self, slot: usize, dim: usize, v: &[f32]) {
+        match self {
+            Data::F32(d) => d[slot * dim..(slot + 1) * dim].copy_from_slice(v),
+            Data::F16(d) => {
+                for (i, x) in v.iter().enumerate() {
+                    d[slot * dim + i] = f32_to_f16(*x);
+                }
+            }
+        }
+    }
+
+    fn get(&self, i: usize) -> f32 {
+        match self {
+            Data::F32(d) => d[i],
+            Data::F16(d) => f16_to_f32(d[i]),
+        }
+    }
+
+    /// 第 `slot` 行的点积（query 的长度必须等于 `dim`）。
+    fn dot(&self, slot: usize, dim: usize, query: &[f32]) -> f32 {
+        let base = slot * dim;
+        let mut dot = 0.0f32;
+        for (d, q) in query.iter().enumerate() {
+            dot += self.get(base + d) * q;
+        }
+        dot
+    }
+
+    /// 第 `slot` 行的范数（按**存下来的**分量算，f16 降精度后仍自洽）。
+    fn norm(&self, slot: usize, dim: usize) -> f32 {
+        let base = slot * dim;
+        let mut sq = 0.0f32;
+        for d in 0..dim {
+            let x = self.get(base + d);
+            sq += x * x;
+        }
+        sq.sqrt()
+    }
+
+    fn swap_row(&mut self, a: usize, b: usize, dim: usize) {
+        match self {
+            Data::F32(d) => {
+                for k in 0..dim {
+                    d.swap(a * dim + k, b * dim + k);
+                }
+            }
+            Data::F16(d) => {
+                for k in 0..dim {
+                    d.swap(a * dim + k, b * dim + k);
+                }
+            }
+        }
+    }
+
+    fn truncate(&mut self, components: usize) {
+        match self {
+            Data::F32(d) => d.truncate(components),
+            Data::F16(d) => d.truncate(components),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Data::F32(d) => d.clear(),
+            Data::F16(d) => d.clear(),
+        }
+    }
+}
+
+/// v1 的索引实现：连续向量数组 + 线性扫描。
+///
+/// 内存 = `N × dim × (4 或 2)B` + 每行约 36B 的 id/范数/槽位开销。
+/// 10 万条 × 1024 维 f32 ≈ 400 MB，f16 ≈ 204 MB —— 因此 store 层按
+/// `(robot, collection)` 懒加载、按预算淘汰、超预算时降精度（B-27）。
 pub(crate) struct BruteForce {
     dim: usize,
+    precision: Precision,
     ids: Vec<ItemId>,
-    /// 扁平行主序：第 i 条向量是 `data[i * dim .. (i + 1) * dim]`。
-    data: Vec<f32>,
-    /// 预计算范数，避免每次查询重复开方。
+    data: Data,
+    /// 预计算范数（由**存储中的分量**算出），避免每次查询重复开方。
     norms: Vec<f32>,
     slots: HashMap<ItemId, usize>,
 }
 
 impl BruteForce {
-    pub(crate) fn new(dim: usize) -> Self {
+    pub(crate) fn new(dim: usize, precision: Precision) -> Self {
         Self {
             dim,
+            precision,
             ids: Vec::new(),
-            data: Vec::new(),
+            data: Data::new(precision),
             norms: Vec::new(),
             slots: HashMap::new(),
         }
     }
 
-    /// 从 `(vector_items.id, vec)` 建索引；空集合允许任意维度（第一次 upsert 定下来）。
+    /// 从 `(vector_items.id, vec)` 建索引（f32 精度）。测试辅助。
+    #[cfg(test)]
     pub(crate) fn from_items(items: Vec<(ItemId, Vec<f32>)>) -> Result<Self> {
+        Self::from_items_with(items, Precision::F32)
+    }
+
+    /// 从 `(vector_items.id, vec)` 建索引，指定精度。测试辅助。
+    #[cfg(test)]
+    pub(crate) fn from_items_with(
+        items: Vec<(ItemId, Vec<f32>)>,
+        precision: Precision,
+    ) -> Result<Self> {
         let dim = items.first().map(|(_, v)| v.len()).unwrap_or(0);
-        let mut idx = Self::new(dim);
-        let items: Vec<VectorItem> = items
-            .into_iter()
-            .map(|(id, vec)| VectorItem { id, vec })
-            .collect();
-        idx.upsert(&items)?;
+        let mut idx = Self::new(dim, precision);
+        for (id, vec) in items {
+            idx.insert(id, &vec)?;
+        }
         Ok(idx)
     }
 
-    fn push(&mut self, id: ItemId, vec: &[f32]) {
-        let slot = self.ids.len();
-        self.ids.push(id);
-        self.data.extend_from_slice(vec);
-        self.norms
-            .push(vec.iter().map(|x| x * x).sum::<f32>().sqrt());
-        self.slots.insert(id, slot);
+    /// 插入或覆盖一条向量（`from_items` / 流式加载 / 写后同步共用）。
+    pub(crate) fn insert(&mut self, id: ItemId, vec: &[f32]) -> Result<()> {
+        if self.dim == 0 {
+            self.dim = vec.len();
+        }
+        if vec.len() != self.dim {
+            // 混合维度是真问题（换维度却没重建），但这里不是报错的地方：
+            // 索引是缓存，调用方会把整份缓存丢掉重载，由 PG 决定事实。
+            return Err(Error::WithMessage(format!(
+                "Vector dimension mismatch: index has {} dims, item has {}",
+                self.dim,
+                vec.len()
+            )));
+        }
+        match self.slots.get(&id).copied() {
+            Some(slot) => {
+                self.data.set(slot, self.dim, vec);
+                self.norms[slot] = self.data.norm(slot, self.dim);
+            }
+            None => {
+                let slot = self.ids.len();
+                self.ids.push(id);
+                self.data.push(vec);
+                self.norms.push(self.data.norm(slot, self.dim));
+                self.slots.insert(id, slot);
+            }
+        }
+        Ok(())
+    }
+
+    /// 估算的常驻字节数。
+    pub(crate) fn bytes(&self) -> usize {
+        self.data.bytes() + self.ids.len() * 8 + self.norms.len() * 4 + self.slots.len() * 24
     }
 
     /// 把第 `slot` 条挪走（与最后一条交换），并维护 `slots`。
@@ -160,9 +402,7 @@ impl BruteForce {
         let last = self.ids.len() - 1;
         if slot != last {
             self.ids.swap(slot, last);
-            for d in 0..self.dim {
-                self.data.swap(slot * self.dim + d, last * self.dim + d);
-            }
+            self.data.swap_row(slot, last, self.dim);
             self.norms.swap(slot, last);
             let moved = self.ids[slot];
             self.slots.insert(moved, slot);
@@ -176,25 +416,7 @@ impl BruteForce {
 impl VectorIndex for BruteForce {
     fn upsert(&mut self, items: &[VectorItem]) -> Result<()> {
         for item in items {
-            if self.dim == 0 {
-                self.dim = item.vec.len();
-            }
-            if item.vec.len() != self.dim {
-                // 混合维度是真问题（换维度却没重建），但这里不是报错的地方：
-                // 索引是缓存，调用方会把整份缓存丢掉重载，由 PG 决定事实。
-                return Err(Error::WithMessage(format!(
-                    "Vector dimension mismatch: index has {} dims, item has {}",
-                    self.dim,
-                    item.vec.len()
-                )));
-            }
-            match self.slots.get(&item.id).copied() {
-                Some(slot) => {
-                    self.data[slot * self.dim..(slot + 1) * self.dim].copy_from_slice(&item.vec);
-                    self.norms[slot] = item.vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-                }
-                None => self.push(item.id, &item.vec),
-            }
+            self.insert(item.id, &item.vec)?;
         }
         Ok(())
     }
@@ -225,17 +447,11 @@ impl VectorIndex for BruteForce {
         }
         let mut scored: Vec<ScoredId> = Vec::with_capacity(self.ids.len());
         for (i, id) in self.ids.iter().enumerate() {
-            let row = &self.data[i * self.dim..(i + 1) * self.dim];
-            let dot: f32 = row
-                .iter()
-                .zip(query.iter())
-                .map(|(a, b)| a * b)
-                .sum::<f32>();
             let denom = self.norms[i] * qn;
             let score = if denom <= f32::EPSILON {
                 0.0
             } else {
-                dot / denom
+                self.data.dot(i, self.dim, query) / denom
             };
             scored.push(ScoredId { id: *id, score });
         }
@@ -260,6 +476,8 @@ impl VectorIndex for BruteForce {
         Ok(IndexStats {
             len: self.ids.len(),
             dimension: self.dim,
+            bytes: self.bytes(),
+            precision: self.precision,
         })
     }
 }
@@ -351,6 +569,25 @@ mod tests {
         assert!(decode(&[]).unwrap().is_empty());
     }
 
+    /// f16 编码器只用于内存索引（B-27），必须和 IEEE binary16 对齐。
+    #[test]
+    fn f16_matches_known_values() {
+        assert_eq!(f32_to_f16(0.0), 0x0000);
+        assert_eq!(f32_to_f16(1.0), 0x3c00);
+        assert_eq!(f32_to_f16(0.5), 0x3800);
+        assert_eq!(f32_to_f16(-2.0), 0xc000);
+        assert_eq!(f32_to_f16(65504.0), 0x7bff);
+        assert_eq!(f32_to_f16(100000.0), 0x7c00, "溢出要变成 inf");
+        assert!(f32_to_f16(f32::INFINITY) == 0x7c00);
+        // 1.0 与 -1.0 的往返是精确的；0.1 只能到 f16 的分辨率。
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0xc000), -2.0);
+        assert!((f16_to_f32(f32_to_f16(0.1)) - 0.1).abs() < 1e-3);
+        // 下溢刷成 0（embeddings 里远小于 2^-14 的分量没有意义）。
+        assert_eq!(f32_to_f16(1e-6), 0x0000);
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+    }
+
     #[test]
     fn search_returns_best_first_with_similarity_scores() {
         let idx = BruteForce::from_items(vec![
@@ -417,5 +654,70 @@ mod tests {
         assert_eq!(s.len, 0);
         assert_eq!(s.dimension, 2);
         assert!(idx.search(&v(&[1.0, 0.0]), 1).unwrap().is_empty());
+    }
+
+    /// B-27 的核心：精度降级后内存明显变小，命中结果不变（误差在 1e-3 量级）。
+    #[test]
+    fn f16_index_ranks_like_f32_with_less_memory() {
+        /// 确定性、两两可区分的 128 维向量（伪随机，互相近似正交）。
+        fn item(i: u64) -> Vec<f32> {
+            let mut state = i
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (0..128u64)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((state >> 33) as f32) / ((1u64 << 31) as f32) - 1.0
+                })
+                .collect()
+        }
+        let items: Vec<(ItemId, Vec<f32>)> = (0..1000u64).map(|i| (i + 1, item(i))).collect();
+        let f32_idx = BruteForce::from_items_with(items.clone(), Precision::F32).unwrap();
+        let f16_idx = BruteForce::from_items_with(items, Precision::F16).unwrap();
+        assert!(
+            f16_idx.bytes() * 3 <= f32_idx.bytes() * 2,
+            "f16 至少省三分之一：{} vs {}",
+            f16_idx.bytes(),
+            f32_idx.bytes()
+        );
+        // 每条向量自己当查询：降精度不能让它输给别人，自相似度仍接近 1。
+        for i in 0..50u64 {
+            let q = item(i);
+            let id = i + 1;
+            assert_eq!(f32_idx.search(&q, 1).unwrap()[0].id, id);
+            let hit = f16_idx.search(&q, 1).unwrap()[0];
+            assert_eq!(hit.id, id, "f16 下自查询必须仍然命中自己（第 {i} 条）");
+            assert!(
+                (hit.score - 1.0).abs() < 1e-3,
+                "自相似度应该约等于 1：{}",
+                hit.score
+            );
+        }
+    }
+
+    /// 预算与精度选择的数学要和实际占用一致（测试用同一公式对齐）。
+    #[test]
+    fn estimated_bytes_match_the_built_index() {
+        let items: Vec<(ItemId, Vec<f32>)> = (0..10u64).map(|i| (i + 1, vec![0.5f32; 8])).collect();
+        for precision in [Precision::F32, Precision::F16] {
+            let idx = BruteForce::from_items_with(items.clone(), precision).unwrap();
+            let actual = idx.stats().unwrap().bytes;
+            let estimated = estimated_bytes(10, 8, precision);
+            assert!(
+                actual <= estimated && estimated - actual <= 10 * 32,
+                "{precision:?}: 估算 {estimated} 与实际 {actual} 差太多"
+            );
+        }
+    }
+
+    #[test]
+    fn precision_falls_back_to_f16_only_when_the_budget_requires_it() {
+        // 100 行 × 8 维：f32 ≈ 100*8*4 + 3600 = 6800 B。
+        assert_eq!(choose_precision(100, 8, 1_000_000), Precision::F32);
+        assert_eq!(choose_precision(100, 8, 1000), Precision::F16);
+        // 空集合任何时候都是 f32（不占内存）。
+        assert_eq!(choose_precision(0, 0, 0), Precision::F32);
     }
 }

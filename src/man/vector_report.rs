@@ -46,6 +46,9 @@ pub(crate) struct VectorColumn {
     pub(crate) pending_generation: Option<i64>,
     /// `idle` / `rebuilding` / `failed`。
     pub(crate) status: String,
+    /// 内存索引可能和 PG 不一致（B-28）：更新索引失败或对账发现漂移时为 `true`，
+    /// 下一次检索会重建并清掉。诊断用。
+    pub(crate) dirty: bool,
 }
 
 fn empty(collection: &str) -> VectorColumn {
@@ -59,6 +62,7 @@ fn empty(collection: &str) -> VectorColumn {
         model: None,
         pending_generation: None,
         status: String::from("idle"),
+        dirty: false,
     }
 }
 
@@ -77,6 +81,7 @@ pub(crate) async fn robot_vector_report(robot_id: &str) -> Vec<VectorColumn> {
                 model: s.active_model,
                 pending_generation: s.pending_generation,
                 status: s.status,
+                dirty: s.dirty,
             }),
             Err(e) => {
                 log::warn!("Reading vector metadata of {robot_id}/{collection} failed: {e}");

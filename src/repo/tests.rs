@@ -1563,6 +1563,81 @@ async fn settings_service_roundtrip_through_global_pool() {
         Some("only")
     );
 
+    // 6.5 B-28：写后同步失败 → 标 dirty；下一次检索从 PG 重载并清掉标记。
+    assert!(
+        !super::vector::state(&db.pool, "rKb", super::vector::QA)
+            .await
+            .unwrap()
+            .unwrap()
+            .dirty
+    );
+    // QA 索引是 4 维；塞一条 3 维向量会被 BruteForce 拒绝（模拟"索引更新失败"）。
+    vector::upsert("rKb", super::vector::QA, &[(999_u64, vec![1.0, 0.0, 0.0])]).await;
+    let st = super::vector::state(&db.pool, "rKb", super::vector::QA)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(st.dirty, "索引同步失败必须标 dirty");
+    let (found, _) = crate::kb::qa::retrieve_answer("rKb", "hello")
+        .await
+        .unwrap();
+    assert_eq!(found.expect("重载后仍要命中").answer, "world");
+    assert!(
+        !super::vector::state(&db.pool, "rKb", super::vector::QA)
+            .await
+            .unwrap()
+            .unwrap()
+            .dirty,
+        "从 PG 重载成功后 dirty 必须清掉"
+    );
+
+    // 6.6 对账：先让 doc 索引载入，再手工插一条"进程外写入"的向量，行数漂移必须
+    // 被发现 → 作废缓存 + 标 dirty；下一次检索重载后恢复。
+    // 注意 generation 必须是 active 那一代（重建后是 1），否则不计入行数。
+    let _ = vector::search("rKb", super::vector::DOC, &[1.0, 0.0, 0.0, 0.0], 1)
+        .await
+        .unwrap();
+    let doc_generation = super::vector::state(&db.pool, "rKb", super::vector::DOC)
+        .await
+        .unwrap()
+        .unwrap()
+        .active_generation;
+    sqlx::query(
+        "INSERT INTO vector_items (robot_id, collection, entity_id, generation, vec)
+         VALUES ('rKb', 'doc', 'ghost', $2, $1)",
+    )
+    .bind(crate::vector::index::encode(&[1.0, 0.0, 0.0, 0.0]))
+    .bind(doc_generation)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let fixed = crate::vector::reconcile::reconcile_once().await.unwrap();
+    assert!(fixed >= 1, "行数漂移必须被对账发现");
+    assert!(
+        super::vector::state(&db.pool, "rKb", super::vector::DOC)
+            .await
+            .unwrap()
+            .unwrap()
+            .dirty,
+        "对账作废缓存时要标 dirty"
+    );
+    let _ = vector::search("rKb", super::vector::DOC, &[1.0, 0.0, 0.0, 0.0], 5)
+        .await
+        .unwrap();
+    assert!(
+        !super::vector::state(&db.pool, "rKb", super::vector::DOC)
+            .await
+            .unwrap()
+            .unwrap()
+            .dirty,
+        "重载成功后 dirty 必须清掉"
+    );
+    sqlx::query("DELETE FROM vector_items WHERE robot_id = 'rKb' AND entity_id = 'ghost'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    vector::invalidate("rKb", super::vector::DOC);
+
     // 本地文件清理（PG 数据随 schema drop 一起消失）。
     crate::kb::doc::remove_uploads("rKb").await.unwrap();
 
@@ -1948,6 +2023,70 @@ async fn vector_dimension_change_is_rejected_at_write_time() {
     assert_eq!(stats.rows, 0);
     assert!(stats.dims.is_empty());
     assert_eq!(stats.status, "idle");
+
+    db.cleanup().await;
+}
+
+/// B-28：`dirty` 是"内存索引可能与 PG 不一致"的持久标记（migration `0005`），
+/// 状态查询与报告都要能读到它。
+#[tokio::test]
+async fn vector_state_dirty_flag_roundtrips() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rDirty", "dirty"))
+        .await
+        .unwrap();
+    let mut tx = db.pool.begin().await.unwrap();
+    super::vector::put_many_active(
+        &mut tx,
+        "rDirty",
+        super::vector::PHRASE,
+        &test_model(),
+        &[(String::from("p1"), unit_vec(2, 0))],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let st = super::vector::state(&db.pool, "rDirty", super::vector::PHRASE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!st.dirty, "新写的集合默认不是 dirty");
+
+    super::vector::set_dirty(&db.pool, "rDirty", super::vector::PHRASE, true)
+        .await
+        .unwrap();
+    let stats = super::vector::collection_stats(&db.pool, "rDirty", super::vector::PHRASE)
+        .await
+        .unwrap();
+    assert!(stats.dirty, "报告要能暴露 dirty");
+    assert!(stats.rows >= 1);
+
+    super::vector::set_dirty(&db.pool, "rDirty", super::vector::PHRASE, false)
+        .await
+        .unwrap();
+    assert!(
+        !super::vector::state(&db.pool, "rDirty", super::vector::PHRASE)
+            .await
+            .unwrap()
+            .unwrap()
+            .dirty
+    );
+
+    // migration 0005 的列必须真的在（migration 是事实，文档是意图）。
+    let column: Option<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns
+          WHERE table_schema = $1 AND table_name = 'vector_collection_state'
+            AND column_name = 'dirty'",
+    )
+    .bind(&db.schema)
+    .fetch_optional(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(column.as_deref(), Some("dirty"));
 
     db.cleanup().await;
 }

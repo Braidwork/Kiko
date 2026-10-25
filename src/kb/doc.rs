@@ -117,7 +117,7 @@ async fn save_with_chunks(
         .zip(chunks.iter())
         .map(|(id, c)| (*id as u64, c.vec.clone()))
         .collect();
-    vector::upsert(robot_id, repo::vector::DOC, &rows);
+    vector::upsert(robot_id, repo::vector::DOC, &rows).await;
     if let Err(e) = settings::stamp_embedding_index(robot_id).await {
         log::warn!("Stamping embedding index of {robot_id} failed: {e:?}");
     }

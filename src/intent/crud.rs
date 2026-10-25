@@ -238,7 +238,8 @@ pub(crate) async fn add_phrase(Json(params): Json<IntentFormData>) -> impl IntoR
             &params.robot_id,
             repo::vector::PHRASE,
             &[(vector_id as u64, vec)],
-        );
+        )
+        .await;
         if let Err(e) = crate::man::settings::stamp_embedding_index(&params.robot_id).await {
             log::warn!("Stamping embedding index failed: {e:?}");
         }
@@ -261,7 +262,7 @@ pub(crate) async fn remove_phrase(Json(params): Json<IntentFormData>) -> impl In
         )
         .await?;
         let ids: Vec<u64> = ids.into_iter().map(|i| i as u64).collect();
-        crate::vector::delete(&params.robot_id, repo::vector::PHRASE, &ids);
+        crate::vector::delete(&params.robot_id, repo::vector::PHRASE, &ids).await;
         Ok(())
     }
     .await;
@@ -301,7 +302,7 @@ pub(crate) async fn regenerate_embeddings(
             .zip(items)
             .map(|(id, (_, vec))| (id as u64, vec))
             .collect();
-        crate::vector::upsert(&params.robot_id, repo::vector::PHRASE, &rows);
+        crate::vector::upsert(&params.robot_id, repo::vector::PHRASE, &rows).await;
         if let Err(e) = crate::man::settings::stamp_embedding_index(&params.robot_id).await {
             log::warn!("Stamping embedding index failed: {e:?}");
         }
