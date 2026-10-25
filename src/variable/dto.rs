@@ -39,6 +39,9 @@ pub(crate) struct Variable {
     pub(crate) read_timeout_milliseconds: u64,
     #[serde(rename = "cacheEnabled")]
     pub(crate) cache_enabled: bool,
+    /// 乐观锁版本（B-17）：读接口返回，编辑时原样带回。
+    #[serde(default)]
+    pub(crate) version: Option<i64>,
 }
 
 impl Variable {
@@ -261,7 +264,8 @@ impl Variable {
                     return self.get_data_from_res(ctx, c);
                 }
                 if let Ok(Some(api)) =
-                    crate::external::http::crud::get_detail(&req.robot_id, &self.var_associate_data).await
+                    crate::external::http::crud::get_detail(&req.robot_id, &self.var_associate_data)
+                        .await
                 {
                     return match crate::external::http::client::req(
                         api,

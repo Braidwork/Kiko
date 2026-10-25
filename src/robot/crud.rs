@@ -29,6 +29,7 @@ pub(crate) async fn init(is_en: bool) -> Result<()> {
         robot_id: get_robot_id(),
         robot_name: String::from(name),
         robot_type: RobotType::TextBot,
+        version: None,
     };
     new(&d, is_en).await
 }
@@ -48,7 +49,21 @@ pub(crate) async fn save(
         return to_res(Ok(()));
     }
     // 编辑已有机器人：机器人行、设置、流程、意图、知识库都在 PG。
-    to_res(persist(&d).await)
+    // B-17 强制乐观锁：编辑必须带上读到的版本，缺了直接拒绝。
+    let Some(version) = d.version else {
+        return to_res(Err(repo::version_required("Robot")));
+    };
+    let r = async {
+        if !repo::robot::update(repo::pool(), &d, version).await? {
+            return Err(Error::WithMessage(format!(
+                "Robot {} does not exist any more.",
+                d.robot_id
+            )));
+        }
+        Ok(())
+    }
+    .await;
+    to_res(r)
 }
 
 async fn new(d: &RobotData, is_en: bool) -> Result<()> {

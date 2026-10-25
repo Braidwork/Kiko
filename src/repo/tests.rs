@@ -22,6 +22,7 @@ fn robot(id: &str, name: &str) -> RobotData {
         robot_id: String::from(id),
         robot_name: String::from(name),
         robot_type: RobotType::TextBot,
+        version: None,
     }
 }
 
@@ -55,6 +56,7 @@ fn variable(name: &str) -> Variable {
         connect_timeout_milliseconds: 1000,
         read_timeout_milliseconds: 1500,
         cache_enabled: true,
+        version: None,
     }
 }
 
@@ -252,6 +254,7 @@ fn param(name: &str, value: &str, vs: ValueSource) -> HttpReqParam {
 fn http_api(id: &str, name: &str) -> HttpReqInfo {
     HttpReqInfo {
         id: String::from(id),
+        version: None,
         name: String::from(name),
         description: String::from("desc"),
         protocol: Protocol::HTTPS,
@@ -2296,6 +2299,72 @@ async fn optimistic_locking_rejects_stale_updates() {
         version: None,
     };
     assert!(!mainflow::update(&db.pool, "rLock", &gone, 0).await.unwrap());
+
+    // --- 机器人改名（元数据实体，B-17 补齐） ---
+    let mut bot = robot("rMeta", "meta");
+    robot::upsert(&db.pool, &bot).await.unwrap();
+    assert_eq!(
+        robot::get(&db.pool, "rMeta")
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        Some(0)
+    );
+    bot.robot_name = String::from("renamed");
+    assert!(robot::update(&db.pool, &bot, 0).await.unwrap());
+    conflict(robot::update(&db.pool, &bot, 0).await.unwrap_err());
+    assert!(robot::update(&db.pool, &bot, 1).await.unwrap());
+
+    // --- 变量（按名字 upsert，编辑必须带 version） ---
+    let mut var = variable("vmeta");
+    variable::upsert(&db.pool, "rMeta", &var).await.unwrap();
+    assert_eq!(
+        variable::get(&db.pool, "rMeta", "vmeta")
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        Some(0)
+    );
+    var.var_constant_value = String::from("x");
+    assert!(variable::update(&db.pool, "rMeta", &var, 0).await.unwrap());
+    conflict(
+        variable::update(&db.pool, "rMeta", &var, 0)
+            .await
+            .unwrap_err(),
+    );
+    assert!(variable::update(&db.pool, "rMeta", &var, 1).await.unwrap());
+
+    // --- 外部 HTTP（主表 + 参数同事务，编辑必须带 version） ---
+    let mut api = http_api("api1", "api");
+    external_http::upsert(&db.pool, "rMeta", &api)
+        .await
+        .unwrap();
+    assert_eq!(
+        external_http::get(&db.pool, "rMeta", "api1")
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        Some(0)
+    );
+    api.name = String::from("api-renamed");
+    assert!(
+        external_http::update(&db.pool, "rMeta", &api, 0)
+            .await
+            .unwrap()
+    );
+    conflict(
+        external_http::update(&db.pool, "rMeta", &api, 0)
+            .await
+            .unwrap_err(),
+    );
+    assert!(
+        external_http::update(&db.pool, "rMeta", &api, 1)
+            .await
+            .unwrap()
+    );
 
     db.cleanup().await;
 }

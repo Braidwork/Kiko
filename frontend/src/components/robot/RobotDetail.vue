@@ -29,6 +29,8 @@ const robotData = reactive({
     robotId: "",
     robotName: "",
     robotType: "",
+    // 乐观锁版本（B-17）：详情接口返回，保存时原样带回。
+    version: null,
 });
 const dialogFormVisible = ref(false);
 const formLabelWidth = "90px";

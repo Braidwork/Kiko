@@ -37,6 +37,9 @@ pub(crate) struct HttpReqParam {
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct HttpReqInfo {
     pub(crate) id: String,
+    /// 乐观锁版本（B-17）：读接口返回，编辑时原样带回。
+    #[serde(default)]
+    pub(crate) version: Option<i64>,
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) protocol: Protocol,

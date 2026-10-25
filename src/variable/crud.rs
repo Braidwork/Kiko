@@ -34,6 +34,7 @@ pub(crate) async fn init(robot_id: &str, is_en: bool) -> Result<()> {
         connect_timeout_milliseconds: 1000u64,
         read_timeout_milliseconds: 1500u64,
         cache_enabled: true,
+        version: None,
     };
     // 变量表已经在 PG（S3.1），这里只写这一条种子变量。
     repo::variable::upsert(repo::pool(), robot_id, &v).await
@@ -79,8 +80,25 @@ pub(crate) async fn add(
     }
 
     if let Some(robot_id) = q.get("robotId") {
-        // 同名变量的整条覆盖（A 的 redb `write` 语义），见 repo 里的 upsert 说明。
-        let r = repo::variable::upsert(repo::pool(), robot_id, &v).await;
+        // 新增走 insert/upsert；已存在的同名变量必须带 version（B-17 强制模式）。
+        let r: Result<()> = async {
+            let existing = repo::variable::get(repo::pool(), robot_id, &v.var_name).await?;
+            if existing.is_some() {
+                let Some(version) = v.version else {
+                    return Err(repo::version_required("Variable"));
+                };
+                if !repo::variable::update(repo::pool(), robot_id, &v, version).await? {
+                    return Err(Error::WithMessage(format!(
+                        "Variable {} does not exist any more.",
+                        v.var_name
+                    )));
+                }
+            } else {
+                repo::variable::upsert(repo::pool(), robot_id, &v).await?;
+            }
+            Ok(())
+        }
+        .await;
         to_res(r)
     } else {
         to_res(Err(Error::WithMessage(String::from(

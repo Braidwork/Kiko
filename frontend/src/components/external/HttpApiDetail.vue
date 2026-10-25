@@ -21,6 +21,8 @@ const router = useRouter();
 const robotId = route.params.robotId;
 const httpApiData = reactive({
   id: '',
+  // 乐观锁版本（B-17）：详情接口返回，保存时原样带回。
+  version: null,
   name: '',
   description: '',
   protocol: 'http://',

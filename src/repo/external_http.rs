@@ -32,6 +32,7 @@ struct ApiRow {
     request_body: Option<String>,
     content_type: Option<String>,
     user_agent: Option<String>,
+    version: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -44,7 +45,7 @@ struct ParamRow {
 }
 
 const API_COLUMNS: &str = "id, name, description, protocol, method, address, \
-                           post_content_type, request_body, content_type, user_agent";
+                           post_content_type, request_body, content_type, user_agent, version";
 
 /// 一个机器人的全部 API。顺序沿用 A 的 redb key 序（id 字节序，§5.1）。
 pub(crate) async fn list(pool: &PgPool, robot_id: &str) -> Result<Vec<HttpReqInfo>> {
@@ -146,9 +147,68 @@ pub(crate) async fn upsert(pool: &PgPool, robot_id: &str, info: &HttpReqInfo) ->
     .execute(&mut *tx)
     .await?;
 
+    replace_params(&mut tx, info).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 更新一个已存在的 API（B-17 强制乐观锁）。主表与参数在同一个事务里；版本不符
+/// 返回 [`crate::repo::version_conflict`]，不存在返回 `false`。
+pub(crate) async fn update(
+    pool: &PgPool,
+    robot_id: &str,
+    info: &HttpReqInfo,
+    expected_version: i64,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let r = sqlx::query(
+        "UPDATE external_http_apis
+            SET name = $3, description = $4, protocol = $5, method = $6, address = $7,
+                post_content_type = $8, request_body = $9, content_type = $10,
+                user_agent = $11, updated_at = now(), version = version + 1
+          WHERE id = $1 AND robot_id = $2 AND version = $12",
+    )
+    .bind(&info.id)
+    .bind(robot_id)
+    .bind(&info.name)
+    .bind(&info.description)
+    .bind(protocol_to_db(&info.protocol))
+    .bind(method_to_db(&info.method))
+    .bind(&info.address)
+    .bind(post_content_type_to_db(&info.post_content_type))
+    .bind(&info.request_body)
+    .bind(&info.content_type)
+    .bind(&info.user_agent)
+    .bind(expected_version)
+    .execute(&mut *tx)
+    .await?;
+    if r.rows_affected() == 0 {
+        tx.rollback().await?;
+        let exists: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM external_http_apis WHERE id = $1 AND robot_id = $2")
+                .bind(&info.id)
+                .bind(robot_id)
+                .fetch_optional(pool)
+                .await?;
+        return if exists.is_some() {
+            Err(crate::repo::version_conflict("External HTTP API"))
+        } else {
+            Ok(false)
+        };
+    }
+    replace_params(&mut tx, info).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// 整组替换一个 API 的参数（调用方负责事务）。
+async fn replace_params(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    info: &HttpReqInfo,
+) -> Result<()> {
     sqlx::query("DELETE FROM external_http_params WHERE api_id = $1")
         .bind(&info.id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
     for (kind, list) in [
@@ -169,12 +229,10 @@ pub(crate) async fn upsert(pool: &PgPool, robot_id: &str, info: &HttpReqInfo) ->
             .bind(&p.name)
             .bind(&p.value)
             .bind(value_source_to_db(&p.value_source))
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
     }
-
-    tx.commit().await?;
     Ok(())
 }
 
@@ -213,6 +271,7 @@ fn build_info(api: ApiRow, params: Vec<ParamRow>) -> Result<HttpReqInfo> {
 
     Ok(HttpReqInfo {
         id: api.id,
+        version: Some(api.version),
         name: api.name,
         description: api.description.unwrap_or_default(),
         protocol: protocol_from_db(&api.protocol)?,

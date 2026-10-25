@@ -11,6 +11,8 @@ const route = useRoute();
 const router = useRouter();
 const robotId = route.params.robotId;
 const varData = reactive({
+    // 乐观锁版本（B-17）：列表/详情返回，保存时原样带回。
+    version: null,
     varName: '',
     varType: '',
     varValueSource: '',
@@ -83,6 +85,7 @@ const goBack = () => {
 }
 
 const newVar = () => {
+    varData.version = null
     varData.varName = ''
     varData.varType = ''
     varData.varValueSource = ''

@@ -11,35 +11,66 @@ use crate::robot::dto::{RobotData, RobotType};
 /// 清单顺序：A 的 redb 按 key 的字节序迭代，用 `COLLATE "C"` 保持同样的顺序，
 /// 不跟库默认的本地化排序走（§5.1）。
 pub(crate) async fn list(pool: &PgPool) -> Result<Vec<RobotData>> {
-    let rows: Vec<(String, String, String)> =
-        sqlx::query_as(r#"SELECT id, robot_name, robot_type FROM robots ORDER BY id COLLATE "C""#)
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        r#"SELECT id, robot_name, robot_type, version FROM robots ORDER BY id COLLATE "C""#,
+    )
+    .fetch_all(pool)
+    .await?;
     rows.into_iter()
-        .map(|(robot_id, robot_name, robot_type)| {
+        .map(|(robot_id, robot_name, robot_type, version)| {
             Ok(RobotData {
                 robot_id,
                 robot_name,
                 robot_type: robot_type_from_db(&robot_type)?,
+                version: Some(version),
             })
         })
         .collect()
 }
 
 pub(crate) async fn get(pool: &PgPool, robot_id: &str) -> Result<Option<RobotData>> {
-    let row: Option<(String, String, String)> =
-        sqlx::query_as("SELECT id, robot_name, robot_type FROM robots WHERE id = $1")
+    let row: Option<(String, String, String, i64)> =
+        sqlx::query_as("SELECT id, robot_name, robot_type, version FROM robots WHERE id = $1")
             .bind(robot_id)
             .fetch_optional(pool)
             .await?;
-    row.map(|(robot_id, robot_name, robot_type)| {
+    row.map(|(robot_id, robot_name, robot_type, version)| {
         Ok(RobotData {
             robot_id,
             robot_name,
             robot_type: robot_type_from_db(&robot_type)?,
+            version: Some(version),
         })
     })
     .transpose()
+}
+
+/// 更新机器人（改名/改类型）。`expected_version` 必填（B-17），版本不符返回
+/// [`crate::repo::version_conflict`]；行不存在返回 `false`。
+pub(crate) async fn update(pool: &PgPool, d: &RobotData, expected_version: i64) -> Result<bool> {
+    let r = sqlx::query(
+        "UPDATE robots
+            SET robot_name = $2, robot_type = $3, updated_at = now(), version = version + 1
+          WHERE id = $1 AND version = $4",
+    )
+    .bind(&d.robot_id)
+    .bind(&d.robot_name)
+    .bind(robot_type_to_db(&d.robot_type))
+    .bind(expected_version)
+    .execute(pool)
+    .await?;
+    if r.rows_affected() > 0 {
+        return Ok(true);
+    }
+    let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM robots WHERE id = $1")
+        .bind(&d.robot_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_some() {
+        Err(crate::repo::version_conflict("Robot"))
+    } else {
+        Ok(false)
+    }
 }
 
 /// 插入或覆盖。A 的 `persist` 是整条覆盖（redb 写入即替换），这里保持同样语义。

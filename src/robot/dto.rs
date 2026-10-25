@@ -21,4 +21,7 @@ pub(crate) struct RobotData {
     pub(crate) robot_name: String,
     #[serde(rename = "robotType")]
     pub(crate) robot_type: RobotType,
+    /// 乐观锁版本（B-17）：读接口返回，编辑时原样带回。
+    #[serde(default)]
+    pub(crate) version: Option<i64>,
 }

@@ -27,6 +27,7 @@ struct VariableRow {
     connect_timeout_ms: Option<i64>,
     read_timeout_ms: Option<i64>,
     cache_enabled: Option<bool>,
+    version: i64,
 }
 
 /// 一个机器人的全部变量。顺序与 A 的 redb key 序一致（字节序，`COLLATE "C"`）。
@@ -34,7 +35,7 @@ pub(crate) async fn list(pool: &PgPool, robot_id: &str) -> Result<Vec<Variable>>
     let rows: Vec<VariableRow> = sqlx::query_as(
         r#"SELECT var_name, var_type, var_value_source, var_constant_value, var_associate_data,
                   obtain_value_expression_type, obtain_value_expression,
-                  connect_timeout_ms, read_timeout_ms, cache_enabled
+                  connect_timeout_ms, read_timeout_ms, cache_enabled, version
              FROM variables
             WHERE robot_id = $1
             ORDER BY var_name COLLATE "C""#,
@@ -49,7 +50,7 @@ pub(crate) async fn get(pool: &PgPool, robot_id: &str, var_name: &str) -> Result
     let row: Option<VariableRow> = sqlx::query_as(
         r#"SELECT var_name, var_type, var_value_source, var_constant_value, var_associate_data,
                   obtain_value_expression_type, obtain_value_expression,
-                  connect_timeout_ms, read_timeout_ms, cache_enabled
+                  connect_timeout_ms, read_timeout_ms, cache_enabled, version
              FROM variables
             WHERE robot_id = $1 AND var_name = $2"#,
     )
@@ -112,6 +113,64 @@ pub(crate) async fn delete(pool: &PgPool, robot_id: &str, var_name: &str) -> Res
     Ok(())
 }
 
+/// 更新一个已存在的变量（B-17 强制乐观锁）。返回是否更新了一行；版本不符返回
+/// [`crate::repo::version_conflict`]，不存在返回 `false`。
+pub(crate) async fn update(
+    pool: &PgPool,
+    robot_id: &str,
+    v: &Variable,
+    expected_version: i64,
+) -> Result<bool> {
+    let connect_timeout_ms = i64::try_from(v.connect_timeout_milliseconds)
+        .map_err(|_| Error::WithMessage(String::from("connectTimeoutMilliseconds 超出范围")))?;
+    let read_timeout_ms = i64::try_from(v.read_timeout_milliseconds)
+        .map_err(|_| Error::WithMessage(String::from("readTimeoutMilliseconds 超出范围")))?;
+
+    let r = sqlx::query(
+        "UPDATE variables
+            SET var_type                     = $3,
+                var_value_source             = $4,
+                var_constant_value           = $5,
+                var_associate_data           = $6,
+                obtain_value_expression_type = $7,
+                obtain_value_expression      = $8,
+                connect_timeout_ms           = $9,
+                read_timeout_ms              = $10,
+                cache_enabled                = $11,
+                updated_at                   = now(),
+                version                      = version + 1
+          WHERE robot_id = $1 AND var_name = $2 AND version = $12",
+    )
+    .bind(robot_id)
+    .bind(&v.var_name)
+    .bind(var_type_to_db(&v.var_type))
+    .bind(value_source_to_db(&v.var_val_source))
+    .bind(&v.var_constant_value)
+    .bind(&v.var_associate_data)
+    .bind(expression_type_to_db(&v.obtain_value_expression_type))
+    .bind(&v.obtain_value_expression)
+    .bind(connect_timeout_ms)
+    .bind(read_timeout_ms)
+    .bind(v.cache_enabled)
+    .bind(expected_version)
+    .execute(pool)
+    .await?;
+    if r.rows_affected() > 0 {
+        return Ok(true);
+    }
+    let exists: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM variables WHERE robot_id = $1 AND var_name = $2")
+            .bind(robot_id)
+            .bind(&v.var_name)
+            .fetch_optional(pool)
+            .await?;
+    if exists.is_some() {
+        Err(crate::repo::version_conflict("Variable"))
+    } else {
+        Ok(false)
+    }
+}
+
 impl TryFrom<VariableRow> for Variable {
     type Error = Error;
 
@@ -134,6 +193,7 @@ impl TryFrom<VariableRow> for Variable {
                 |_| Error::WithMessage(String::from("数据库里的 read_timeout_ms 是负数")),
             )?,
             cache_enabled: r.cache_enabled.unwrap_or(true),
+            version: Some(r.version),
         })
     }
 }

@@ -45,8 +45,22 @@ pub(crate) async fn save(
     if let Some(robot_id) = q.get("robotId") {
         if params.id.is_empty() || params.id.eq("new") {
             params.id = scru128::new_string();
+            return to_res(repo::external_http::upsert(repo::pool(), robot_id, &params).await);
         }
-        let r = repo::external_http::upsert(repo::pool(), robot_id, &params).await;
+        // 编辑已有 API：B-17 强制乐观锁。
+        let Some(version) = params.version else {
+            return to_res::<()>(Err(repo::version_required("External HTTP API")));
+        };
+        let r = async {
+            if !repo::external_http::update(repo::pool(), robot_id, &params, version).await? {
+                return Err(Error::WithMessage(format!(
+                    "External HTTP API {} does not exist any more.",
+                    params.id
+                )));
+            }
+            Ok(())
+        }
+        .await;
         to_res(r)
     } else {
         to_res(Err(Error::WithMessage(String::from(
