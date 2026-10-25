@@ -22,6 +22,7 @@ struct SubFlowRow {
     id: String,
     name: String,
     canvas: Value,
+    version: i64,
 }
 
 /// 一个主流程下的全部子流程，按 `position`。
@@ -31,7 +32,7 @@ pub(crate) async fn list(
     main_flow_id: &str,
 ) -> Result<Vec<SubFlowDetail>> {
     let rows: Vec<SubFlowRow> = sqlx::query_as(
-        r#"SELECT id, name, canvas FROM subflows
+        r#"SELECT id, name, canvas, version FROM subflows
             WHERE robot_id = $1 AND main_flow_id = $2
             ORDER BY position, id COLLATE "C""#,
     )
@@ -46,6 +47,7 @@ pub(crate) async fn list(
                 id: r.id,
                 name: r.name,
                 canvas: canvas_to_string(r.canvas)?,
+                version: Some(r.version),
             })
         })
         .collect()
@@ -101,27 +103,52 @@ pub(crate) async fn create(
     list(pool, robot_id, main_flow_id).await
 }
 
-/// 保存一条子流程的画布。返回是否真的更新了一行（不存在/不属于该主流程时为 false）。
+/// 保存一条子流程的画布。
+///
+/// `expected_version = Some(v)` 时做乐观锁（B-17）：版本不符返回冲突错误；`None`
+/// 是旧客户端/内部调用的"最后写入胜出"路径。返回是否真的更新了一行（不存在/
+/// 不属于该主流程时为 false）。
 pub(crate) async fn save_canvas(
     pool: &PgPool,
     robot_id: &str,
     main_flow_id: &str,
     subflow_id: &str,
     canvas: &str,
+    expected_version: Option<i64>,
 ) -> Result<bool> {
     let canvas = canvas_to_db(canvas)?;
     let r = sqlx::query(
         "UPDATE subflows
             SET canvas = $4, updated_at = now(), version = version + 1
-          WHERE id = $1 AND robot_id = $2 AND main_flow_id = $3",
+          WHERE id = $1 AND robot_id = $2 AND main_flow_id = $3
+            AND ($5::BIGINT IS NULL OR version = $5)",
     )
     .bind(subflow_id)
     .bind(robot_id)
     .bind(main_flow_id)
     .bind(canvas)
+    .bind(expected_version)
     .execute(pool)
     .await?;
-    Ok(r.rows_affected() > 0)
+    if r.rows_affected() > 0 {
+        return Ok(true);
+    }
+    if expected_version.is_none() {
+        return Ok(false);
+    }
+    let exists: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM subflows WHERE id = $1 AND robot_id = $2 AND main_flow_id = $3",
+    )
+    .bind(subflow_id)
+    .bind(robot_id)
+    .bind(main_flow_id)
+    .fetch_optional(pool)
+    .await?;
+    if exists.is_some() {
+        Err(crate::repo::version_conflict("Sub-flow"))
+    } else {
+        Ok(false)
+    }
 }
 
 /// 按 id 删除一条子流程。返回是否删掉了行。

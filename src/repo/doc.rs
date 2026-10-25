@@ -26,6 +26,8 @@ pub(crate) struct DocRow {
     pub(crate) file_name: String,
     pub(crate) file_size: i64,
     pub(crate) doc_content: String,
+    /// 乐观锁版本（B-17）。
+    pub(crate) version: i64,
 }
 
 /// 一篇文档的正文（重建索引用）。
@@ -65,7 +67,7 @@ pub(crate) struct KeywordHit {
 
 pub(crate) async fn list(pool: &PgPool, robot_id: &str) -> Result<Vec<DocRow>> {
     Ok(sqlx::query_as(
-        r#"SELECT id, file_name, file_size, doc_content
+        r#"SELECT id, file_name, file_size, doc_content, version
              FROM documents
             WHERE robot_id = $1
             ORDER BY created_at DESC, id COLLATE "C""#,
@@ -123,6 +125,10 @@ pub(crate) async fn create(
 
 /// 改正文：更新 `documents` 并**整篇替换**分块与向量（同一个事务）。
 ///
+/// `expected_version = Some(v)` 时做乐观锁（B-17）：版本不符返回
+/// [`crate::repo::version_conflict`]，不会覆盖别人的编辑。`None` 是旧客户端/
+/// 内部调用的"最后写入胜出"路径。
+///
 /// 返回 `None` 表示文档已经不存在（调用方按"找不到文档"处理）。
 pub(crate) async fn update_content(
     pool: &PgPool,
@@ -131,21 +137,37 @@ pub(crate) async fn update_content(
     doc_content: &str,
     chunks: &[ChunkInput],
     model: &ModelRef,
+    expected_version: Option<i64>,
 ) -> Result<Option<Vec<i64>>> {
     let mut tx = pool.begin().await?;
     let updated = sqlx::query(
         "UPDATE documents
             SET doc_content = $3, updated_at = now(), version = version + 1
-          WHERE id = $1 AND robot_id = $2",
+          WHERE id = $1 AND robot_id = $2
+            AND ($4::BIGINT IS NULL OR version = $4)",
     )
     .bind(doc_id)
     .bind(robot_id)
     .bind(doc_content)
+    .bind(expected_version)
     .execute(&mut *tx)
     .await?;
     if updated.rows_affected() == 0 {
         tx.rollback().await?;
-        return Ok(None);
+        if expected_version.is_none() {
+            return Ok(None);
+        }
+        let exists: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM documents WHERE id = $1 AND robot_id = $2")
+                .bind(doc_id)
+                .bind(robot_id)
+                .fetch_optional(pool)
+                .await?;
+        return if exists.is_some() {
+            Err(crate::repo::version_conflict("Document"))
+        } else {
+            Ok(None)
+        };
     }
     let vec_ids = replace_chunks(&mut tx, robot_id, doc_id, chunks, model, None).await?;
     tx.commit().await?;

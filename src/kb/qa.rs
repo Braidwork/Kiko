@@ -41,6 +41,7 @@ fn to_dto(d: QaDetail) -> QuestionAnswerPair {
     QuestionAnswerPair {
         question: QuestionData { question },
         id: Some(d.id),
+        version: Some(d.version),
         similar_questions: similar,
         answer: d.answer,
     }
@@ -82,6 +83,7 @@ pub(crate) async fn save(robot_id: &str, d: QuestionAnswerPair) -> Result<String
         repo::pool(),
         robot_id,
         d.id.as_deref(),
+        d.version,
         &d.answer,
         &inputs,
         &model,
@@ -155,6 +157,7 @@ mod tests {
         QaDetail {
             id: String::from("q1"),
             answer: String::from("answer"),
+            version: 0,
             questions: questions
                 .into_iter()
                 .map(|(q, primary)| QuestionRow {

@@ -36,6 +36,16 @@ use crate::result::{Error, Result};
 /// 固定 schema（D37）：不用 `public`，客户库里多半已经有一堆业务表。
 pub(crate) const SCHEMA: &str = "kiko";
 
+/// 乐观锁冲突（B-17）：调用方带上了 `version`，但行已经被别人改过。
+///
+/// 文案要能让前端直接提示"刷新后重试"，测试也按这句断言。用 `WithMessage` 而不是
+/// 新错误变体，是为了不改变 `{status, data, err}` 的形状（D9）。
+pub(crate) fn version_conflict(entity: &str) -> Error {
+    Error::WithMessage(format!(
+        "{entity} has been modified by someone else; reload it and try again"
+    ))
+}
+
 static POOL: OnceLock<PgPool> = OnceLock::new();
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/pg");

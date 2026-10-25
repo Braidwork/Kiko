@@ -22,6 +22,9 @@ pub(crate) struct SubFlowDetail {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) canvas: String,
+    /// 乐观锁版本（B-17）：列表返回，保存画布时原样带回。
+    #[serde(default)]
+    pub(crate) version: Option<i64>,
     // #[serde(skip_serializing)]
     // pub(crate) nodes: String,
     // pub(crate) valid: bool,
@@ -575,7 +578,9 @@ mod tests {
             "branches": []
         }"#;
         match serde_json::from_str::<Node>(json) {
-            Ok(Node::LlmChatNode(n)) => assert!(n.enable_thinking, "enableThinking must be honoured"),
+            Ok(Node::LlmChatNode(n)) => {
+                assert!(n.enable_thinking, "enableThinking must be honoured")
+            }
             Ok(other) => panic!("expected LlmChatNode, got {}", node_name(&other)),
             Err(e) => panic!("canvas JSON with enableThinking must load: {e}"),
         }

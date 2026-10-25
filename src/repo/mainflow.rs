@@ -14,8 +14,8 @@ use crate::result::Result;
 
 /// 一个机器人的全部主流程，按 `position`。
 pub(crate) async fn list(pool: &PgPool, robot_id: &str) -> Result<Vec<MainFlowDetail>> {
-    let rows: Vec<(String, String, bool)> = sqlx::query_as(
-        r#"SELECT id, name, enabled FROM mainflows
+    let rows: Vec<(String, String, bool, i64)> = sqlx::query_as(
+        r#"SELECT id, name, enabled, version FROM mainflows
             WHERE robot_id = $1
             ORDER BY position, id COLLATE "C""#,
     )
@@ -24,7 +24,12 @@ pub(crate) async fn list(pool: &PgPool, robot_id: &str) -> Result<Vec<MainFlowDe
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, name, enabled)| MainFlowDetail { id, name, enabled })
+        .map(|(id, name, enabled, version)| MainFlowDetail {
+            id,
+            name,
+            enabled,
+            version: Some(version),
+        })
         .collect())
 }
 
@@ -66,6 +71,7 @@ pub(crate) async fn create(
         id,
         name: String::from(name),
         enabled: true,
+        version: Some(0),
     })
 }
 
@@ -73,7 +79,15 @@ pub(crate) async fn create(
 ///
 /// 走 upsert 是因为 A 的 `write` 也是「没有就建」；但 `id` 属于另一个机器人时
 /// 不更新（`WHERE mainflows.robot_id = EXCLUDED.robot_id`），避免拿别人的 id 改数据。
-pub(crate) async fn upsert(pool: &PgPool, robot_id: &str, d: &MainFlowDetail) -> Result<bool> {
+///
+/// `expected_version = Some(v)` 时做乐观锁（B-17）：版本不符返回
+/// [`crate::repo::version_conflict`]，不会覆盖别人的编辑。
+pub(crate) async fn upsert(
+    pool: &PgPool,
+    robot_id: &str,
+    d: &MainFlowDetail,
+    expected_version: Option<i64>,
+) -> Result<bool> {
     let mut tx = pool.begin().await?;
     let _ = sqlx::query_scalar::<_, String>("SELECT id FROM robots WHERE id = $1 FOR UPDATE")
         .bind(robot_id)
@@ -90,16 +104,34 @@ pub(crate) async fn upsert(pool: &PgPool, robot_id: &str, d: &MainFlowDetail) ->
                 enabled    = EXCLUDED.enabled,
                 updated_at = now(),
                 version    = mainflows.version + 1
-          WHERE mainflows.robot_id = EXCLUDED.robot_id",
+          WHERE mainflows.robot_id = EXCLUDED.robot_id
+            AND ($5::BIGINT IS NULL OR mainflows.version = $5)",
     )
     .bind(&d.id)
     .bind(robot_id)
     .bind(&d.name)
     .bind(d.enabled)
+    .bind(expected_version)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(r.rows_affected() > 0)
+    if r.rows_affected() > 0 {
+        return Ok(true);
+    }
+    if expected_version.is_none() {
+        return Ok(false);
+    }
+    let exists: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM mainflows WHERE id = $1 AND robot_id = $2")
+            .bind(&d.id)
+            .bind(robot_id)
+            .fetch_optional(pool)
+            .await?;
+    if exists.is_some() {
+        Err(crate::repo::version_conflict("Main flow"))
+    } else {
+        Ok(false)
+    }
 }
 
 /// 删除主流程。运行时节点没有指向 `mainflows` 的外键（demo 流程没有主流程行，

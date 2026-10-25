@@ -45,6 +45,7 @@ pub(crate) async fn list(robot_id: &str) -> Result<Vec<DocData>> {
         .into_iter()
         .map(|d| DocData {
             id: d.id,
+            version: Some(d.version),
             file_name: d.file_name,
             file_size: d.file_size,
             doc_content: d.doc_content,
@@ -123,11 +124,24 @@ async fn save_with_chunks(
     Ok(())
 }
 
-/// 改正文：整篇重新分块 + 重算向量（同一个事务）。
-pub(crate) async fn update(robot_id: &str, doc_id: &str, doc_content: &str) -> Result<()> {
+/// 改正文：整篇重新分块 + 重算向量（同一个事务）。`version` 是乐观锁（B-17）。
+pub(crate) async fn update(
+    robot_id: &str,
+    doc_id: &str,
+    doc_content: &str,
+    version: Option<i64>,
+) -> Result<()> {
     let (chunks, model) = chunks_with_vectors(robot_id, doc_content, EmbedMode::Active).await?;
-    let r = repo::doc::update_content(repo::pool(), robot_id, doc_id, doc_content, &chunks, &model)
-        .await?;
+    let r = repo::doc::update_content(
+        repo::pool(),
+        robot_id,
+        doc_id,
+        doc_content,
+        &chunks,
+        &model,
+        version,
+    )
+    .await?;
     if r.is_none() {
         return Err(Error::WithMessage(format!(
             "Document {doc_id} does not exist any more."

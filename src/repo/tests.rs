@@ -972,7 +972,11 @@ async fn mainflow_create_lists_and_cascades() {
     let mut renamed = first.clone();
     renamed.name = String::from("renamed");
     renamed.enabled = false;
-    assert!(mainflow::upsert(&db.pool, "rF", &renamed).await.unwrap());
+    assert!(
+        mainflow::upsert(&db.pool, "rF", &renamed, None)
+            .await
+            .unwrap()
+    );
     let list = mainflow::list(&db.pool, "rF").await.unwrap();
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].name, "renamed");
@@ -1039,7 +1043,7 @@ async fn subflow_crud_by_id_and_position() {
     // 保存画布按 id（不再按下标）。
     let canvas = r#"{"cells":[{"id":"a","shape":"edge"}]}"#;
     assert!(
-        subflow::save_canvas(&db.pool, "rG", &mf.id, &two_id, canvas)
+        subflow::save_canvas(&db.pool, "rG", &mf.id, &two_id, canvas, None)
             .await
             .unwrap()
     );
@@ -1048,7 +1052,7 @@ async fn subflow_crud_by_id_and_position() {
 
     // 空画布写库是合法 JSON（{}），读回仍是空串。
     assert!(
-        subflow::save_canvas(&db.pool, "rG", &mf.id, &two_id, "")
+        subflow::save_canvas(&db.pool, "rG", &mf.id, &two_id, "", None)
             .await
             .unwrap()
     );
@@ -1063,7 +1067,7 @@ async fn subflow_crud_by_id_and_position() {
 
     // 另一个机器人不能通过别人的 mainflow id 改数据。
     assert!(
-        !subflow::save_canvas(&db.pool, "rOther", &mf.id, &two_id, "{}")
+        !subflow::save_canvas(&db.pool, "rOther", &mf.id, &two_id, "{}", None)
             .await
             .unwrap()
     );
@@ -1458,6 +1462,7 @@ async fn settings_service_roundtrip_through_global_pool() {
         "rKb",
         crate::kb::dto::QuestionAnswerPair {
             id: None,
+            version: None,
             question: crate::kb::dto::QuestionData {
                 question: String::from("hello"),
             },
@@ -1593,6 +1598,7 @@ async fn settings_service_roundtrip_through_global_pool() {
         "rKb",
         crate::kb::dto::QuestionAnswerPair {
             id: None,
+            version: None,
             question: crate::kb::dto::QuestionData {
                 question: String::from("fresh"),
             },
@@ -1882,6 +1888,7 @@ async fn qa_questions_and_vectors_are_replaced_together() {
         &db.pool,
         "rQa",
         None,
+        None,
         "answer",
         &[q("hello", true, 0), q("hi", false, 1)],
         &model,
@@ -1907,6 +1914,7 @@ async fn qa_questions_and_vectors_are_replaced_together() {
         &db.pool,
         "rQa",
         Some(&qa_id),
+        None,
         "answer2",
         &[q("hello again", true, 0)],
         &model,
@@ -2105,8 +2113,234 @@ async fn vector_dimension_change_is_rejected_at_write_time() {
     db.cleanup().await;
 }
 
-/// B-28：`dirty` 是"内存索引可能与 PG 不一致"的持久标记（migration `0005`），
-/// 状态查询与报告都要能读到它。
+/// B-17：四个内容型实体的更新都带 `version`，旧版本必须被拒绝（不静默覆盖）。
+#[tokio::test]
+async fn optimistic_locking_rejects_stale_updates() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rLock", "locking"))
+        .await
+        .unwrap();
+    let model = test_model();
+    let conflict = |e: crate::result::Error| {
+        assert!(
+            e.message().contains("modified by someone else"),
+            "冲突错误文案不对：{}",
+            e.message()
+        );
+    };
+
+    // --- 文档 ---
+    let chunks = vec![chunk(0, "alpha", 0)];
+    doc::create(
+        &db.pool,
+        "rLock",
+        "doc1",
+        &doc::NewDocument {
+            file_name: String::from("a.docx"),
+            file_size: 1,
+            mime_type: None,
+            original_path: None,
+            content_hash: None,
+            doc_content: String::from("alpha"),
+        },
+        &chunks,
+        &model,
+    )
+    .await
+    .unwrap();
+    assert_eq!(doc::list(&db.pool, "rLock").await.unwrap()[0].version, 0);
+    doc::update_content(
+        &db.pool,
+        "rLock",
+        "doc1",
+        "alpha2",
+        &chunks,
+        &model,
+        Some(0),
+    )
+    .await
+    .unwrap();
+    assert_eq!(doc::list(&db.pool, "rLock").await.unwrap()[0].version, 1);
+    let e = doc::update_content(&db.pool, "rLock", "doc1", "stale", &chunks, &model, Some(0))
+        .await
+        .unwrap_err();
+    conflict(e);
+    doc::update_content(
+        &db.pool,
+        "rLock",
+        "doc1",
+        "alpha3",
+        &chunks,
+        &model,
+        Some(1),
+    )
+    .await
+    .unwrap();
+
+    // --- 问答 ---
+    let (qa_id, _) = qa::save(
+        &db.pool,
+        "rLock",
+        None,
+        None,
+        "answer",
+        &[q("hello", true, 0)],
+        &model,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        qa::get(&db.pool, "rLock", &qa_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        0
+    );
+    qa::save(
+        &db.pool,
+        "rLock",
+        Some(&qa_id),
+        Some(0),
+        "answer2",
+        &[q("hello", true, 0)],
+        &model,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        qa::get(&db.pool, "rLock", &qa_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        1
+    );
+    let e = qa::save(
+        &db.pool,
+        "rLock",
+        Some(&qa_id),
+        Some(0),
+        "stale",
+        &[q("hello", true, 0)],
+        &model,
+    )
+    .await
+    .unwrap_err();
+    conflict(e);
+    qa::save(
+        &db.pool,
+        "rLock",
+        Some(&qa_id),
+        Some(1),
+        "answer3",
+        &[q("hello", true, 0)],
+        &model,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // --- 子流程画布 ---
+    let mf = mainflow::create(&db.pool, "rLock", "mf", "one")
+        .await
+        .unwrap();
+    let subflow_id = subflow::list(&db.pool, "rLock", &mf.id).await.unwrap()[0]
+        .id
+        .clone();
+    assert!(
+        subflow::save_canvas(&db.pool, "rLock", &mf.id, &subflow_id, "{}", Some(0))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        subflow::list(&db.pool, "rLock", &mf.id).await.unwrap()[0].version,
+        Some(1)
+    );
+    let e = subflow::save_canvas(&db.pool, "rLock", &mf.id, &subflow_id, "{}", Some(0))
+        .await
+        .unwrap_err();
+    conflict(e);
+    assert!(
+        subflow::save_canvas(&db.pool, "rLock", &mf.id, &subflow_id, "{}", Some(1))
+            .await
+            .unwrap()
+    );
+
+    // --- 主流程 ---
+    assert_eq!(
+        mainflow::list(&db.pool, "rLock").await.unwrap()[0].version,
+        Some(0)
+    );
+    let mut flow = mainflow::list(&db.pool, "rLock").await.unwrap()[0].clone();
+    flow.name = String::from("renamed");
+    assert!(
+        mainflow::upsert(&db.pool, "rLock", &flow, Some(0))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        mainflow::list(&db.pool, "rLock").await.unwrap()[0].version,
+        Some(1)
+    );
+    let e = mainflow::upsert(&db.pool, "rLock", &flow, Some(0))
+        .await
+        .unwrap_err();
+    conflict(e);
+    assert!(
+        mainflow::upsert(&db.pool, "rLock", &flow, Some(1))
+            .await
+            .unwrap()
+    );
+
+    db.cleanup().await;
+}
+
+/// B-17 / §16.4：打 `indexedEmbedding` 不能覆盖并发的设置保存（单字段 JSONB 更新）。
+#[tokio::test]
+async fn stamping_the_embedding_index_only_touches_one_field() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rStamp", "stamp"))
+        .await
+        .unwrap();
+    let mut s = Settings::default();
+    s.chat_provider.model = String::from("keep-me");
+    settings_repo::save_robot(&db.pool, "rStamp", &s, &[])
+        .await
+        .unwrap();
+
+    settings_repo::stamp_robot_indexed_embedding(&db.pool, "rStamp", "v1|test|x|4")
+        .await
+        .unwrap();
+
+    let back = settings_repo::get_robot(&db.pool, "rStamp")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.chat_provider.model, "keep-me", "其他设置不能被覆盖");
+    assert_eq!(
+        back.sentence_embedding_provider
+            .indexed_embedding
+            .as_deref(),
+        Some("v1|test|x|4")
+    );
+    let version: i64 = sqlx::query_scalar("SELECT version FROM robot_settings WHERE robot_id = $1")
+        .bind("rStamp")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 1, "单字段更新也要推进 version");
+
+    db.cleanup().await;
+}
 #[tokio::test]
 async fn vector_state_dirty_flag_roundtrips() {
     let Some(db) = TestDb::new().await else {

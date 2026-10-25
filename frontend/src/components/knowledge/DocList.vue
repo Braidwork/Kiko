@@ -22,6 +22,8 @@ const loading = ref(false);
 const docFile = reactive({
     // 文档 id 现在是 scru128 字符串（D6 / §5.1），新建时用空串表示"还没保存"。
     id: "",
+    // 乐观锁版本（B-17）：编辑时原样带回，保存时服务端比对。
+    version: null,
     fileName: "",
     fileSize: 0,
     docContent: "",
@@ -70,6 +72,7 @@ const showDocDetail = (idx) => {
 };
 const editDoc = (idx) => {
     docFile.id = tableData[idx].id;
+    docFile.version = tableData[idx].version;
     docFile.fileName = tableData[idx].fileName;
     docFile.docContent = tableData[idx].docContent;
     editFormVisible.value = true;

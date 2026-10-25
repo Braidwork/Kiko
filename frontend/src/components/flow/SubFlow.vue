@@ -673,6 +673,8 @@ async function saveSubFlow() {
         id: source.id,
         name: source.name,
         canvas: JSON.stringify(canvas),
+        // 乐观锁版本（B-17）：列表返回的版本原样带回，服务端比对后再写。
+        version: source.version,
         // nodes: JSON.stringify(nodes),
     };
     const r = await httpReq(

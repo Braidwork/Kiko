@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct QuestionAnswerPair {
     pub(crate) id: Option<String>,
+    /// 乐观锁版本（B-17）：读接口返回，编辑时原样带回；新建时为 `None`。
+    #[serde(default)]
+    pub(crate) version: Option<i64>,
     pub(crate) question: QuestionData,
     #[serde(rename = "similarQuestions")]
     pub(crate) similar_questions: Vec<QuestionData>,
@@ -24,6 +27,9 @@ pub(crate) struct QuestionData {
 pub(crate) struct DocData {
     /// `documents.id`（scru128）。A 用的是自增行号，换成 PG 后按 D6/§5.1 用字符串。
     pub(crate) id: String,
+    /// 乐观锁版本（B-17）：读接口返回，编辑时原样带回。
+    #[serde(default)]
+    pub(crate) version: Option<i64>,
     #[serde(rename = "fileName")]
     pub(crate) file_name: String,
     #[serde(rename = "fileSize")]
@@ -41,6 +47,7 @@ mod tests {
     fn question_json_has_no_vector_row_id() {
         let d = QuestionAnswerPair {
             id: Some(String::from("qa1")),
+            version: Some(0),
             question: QuestionData {
                 question: String::from("q"),
             },
@@ -61,6 +68,7 @@ mod tests {
     fn doc_json_uses_string_id_and_camel_case() {
         let d = DocData {
             id: String::from("doc1"),
+            version: Some(3),
             file_name: String::from("a.docx"),
             file_size: 12,
             doc_content: String::from("hello"),

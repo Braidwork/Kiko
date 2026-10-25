@@ -72,7 +72,7 @@ pub(crate) async fn save(
             return to_res::<()>(Err(e));
         }
         let r: Result<()> = async {
-            repo::mainflow::upsert(repo::pool(), robot_id, &data).await?;
+            repo::mainflow::upsert(repo::pool(), robot_id, &data, data.version).await?;
             Ok(())
         }
         .await;
@@ -124,6 +124,7 @@ mod tests {
             id: String::from(id),
             name: String::from("demo"),
             enabled: true,
+            version: None,
         }
     }
 

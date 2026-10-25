@@ -62,6 +62,7 @@ pub(crate) async fn save(
             &q.main_flow_id,
             &data.id,
             &data.canvas,
+            data.version,
         )
         .await?;
         repo::subflow::list(repo::pool(), &q.robot_id, &q.main_flow_id).await
@@ -118,6 +119,7 @@ mod tests {
             id: String::from("s1"),
             name: String::from("x"),
             canvas: String::from("{}"),
+            version: None,
         };
         let body = body_string(save(Query(demo_form()), Json(data)).await.into_response()).await;
         assert!(body.contains("read-only"), "{body}");

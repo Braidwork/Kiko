@@ -27,6 +27,8 @@ pub(crate) struct QuestionRow {
 pub(crate) struct QaDetail {
     pub(crate) id: String,
     pub(crate) answer: String,
+    /// 乐观锁版本（B-17）。
+    pub(crate) version: i64,
     /// 主问题在前，其余按 `position`。
     pub(crate) questions: Vec<QuestionRow>,
 }
@@ -39,8 +41,8 @@ pub(crate) struct QuestionInput {
 }
 
 pub(crate) async fn list(pool: &PgPool, robot_id: &str) -> Result<Vec<QaDetail>> {
-    let pairs: Vec<(String, String)> = sqlx::query_as(
-        r#"SELECT id, answer FROM qa
+    let pairs: Vec<(String, String, i64)> = sqlx::query_as(
+        r#"SELECT id, answer, version FROM qa
             WHERE robot_id = $1
             ORDER BY created_at DESC, id COLLATE "C""#,
     )
@@ -69,21 +71,23 @@ pub(crate) async fn list(pool: &PgPool, robot_id: &str) -> Result<Vec<QaDetail>>
     }
     Ok(pairs
         .into_iter()
-        .map(|(id, answer)| QaDetail {
+        .map(|(id, answer, version)| QaDetail {
             questions: by_qa.remove(&id).unwrap_or_default(),
             id,
             answer,
+            version,
         })
         .collect())
 }
 
 pub(crate) async fn get(pool: &PgPool, robot_id: &str, qa_id: &str) -> Result<Option<QaDetail>> {
-    let Some(answer) =
-        sqlx::query_scalar::<_, String>("SELECT answer FROM qa WHERE id = $1 AND robot_id = $2")
-            .bind(qa_id)
-            .bind(robot_id)
-            .fetch_optional(pool)
-            .await?
+    let Some((answer, version)) = sqlx::query_as::<_, (String, i64)>(
+        "SELECT answer, version FROM qa WHERE id = $1 AND robot_id = $2",
+    )
+    .bind(qa_id)
+    .bind(robot_id)
+    .fetch_optional(pool)
+    .await?
     else {
         return Ok(None);
     };
@@ -99,6 +103,7 @@ pub(crate) async fn get(pool: &PgPool, robot_id: &str, qa_id: &str) -> Result<Op
     Ok(Some(QaDetail {
         id: String::from(qa_id),
         answer,
+        version,
         questions: questions
             .into_iter()
             .map(|(id, question, is_primary)| QuestionRow {
@@ -113,11 +118,15 @@ pub(crate) async fn get(pool: &PgPool, robot_id: &str, qa_id: &str) -> Result<Op
 /// 新建或整体替换一条问答对。
 ///
 /// `qa_id = None` 表示新建（返回新 id）；`Some` 表示编辑，行不存在时返回 `None`
-/// （调用方按"问答对已被删掉"处理）。返回 `(qa_id, 与 questions 同序的 vector id)`。
+/// （调用方按"问答对已被删掉"处理）。`expected_version` 是乐观锁（B-17）：版本不符
+/// 返回 [`crate::repo::version_conflict`]。
+///
+/// 返回 `(qa_id, 与 questions 同序的 vector id)`。
 pub(crate) async fn save(
     pool: &PgPool,
     robot_id: &str,
     qa_id: Option<&str>,
+    expected_version: Option<i64>,
     answer: &str,
     questions: &[QuestionInput],
     model: &ModelRef,
@@ -132,16 +141,31 @@ pub(crate) async fn save(
         Some(id) => {
             let r = sqlx::query(
                 "UPDATE qa SET answer = $3, updated_at = now(), version = version + 1
-                  WHERE id = $1 AND robot_id = $2",
+                  WHERE id = $1 AND robot_id = $2
+                    AND ($4::BIGINT IS NULL OR version = $4)",
             )
             .bind(id)
             .bind(robot_id)
             .bind(answer)
+            .bind(expected_version)
             .execute(&mut *tx)
             .await?;
             if r.rows_affected() == 0 {
                 tx.rollback().await?;
-                return Ok(None);
+                if expected_version.is_none() {
+                    return Ok(None);
+                }
+                let exists: Option<i32> =
+                    sqlx::query_scalar("SELECT 1 FROM qa WHERE id = $1 AND robot_id = $2")
+                        .bind(id)
+                        .bind(robot_id)
+                        .fetch_optional(pool)
+                        .await?;
+                return if exists.is_some() {
+                    Err(crate::repo::version_conflict("Question–answer pair"))
+                } else {
+                    Ok(None)
+                };
             }
             String::from(id)
         }

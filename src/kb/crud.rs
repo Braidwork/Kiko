@@ -56,7 +56,7 @@ pub(crate) async fn update_doc(
     Query(q): Query<RobotQuery>,
     Json(doc): Json<DocData>,
 ) -> impl IntoResponse {
-    let r = super::doc::update(&q.robot_id, &doc.id, &doc.doc_content).await;
+    let r = super::doc::update(&q.robot_id, &doc.id, &doc.doc_content, doc.version).await;
     to_res(r)
 }
 

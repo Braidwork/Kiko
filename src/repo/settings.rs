@@ -46,6 +46,33 @@ pub(crate) async fn save_robot(
     Ok(())
 }
 
+/// 只更新设置 JSON 里的 `sentenceEmbeddingProvider.indexedEmbedding`（B-17 / §16.4）。
+///
+/// 向量写入/重建之后要打这个指纹。原来的实现是"读整条设置 → 改一个字段 → 写回"，
+/// 与并发的设置页保存互相覆盖。这里用 `jsonb_set` 做单字段更新，**不碰**任何其他
+/// 字段，也不重新加密敏感引用（`indexedEmbedding` 不是敏感字段）。
+pub(crate) async fn stamp_robot_indexed_embedding(
+    pool: &PgPool,
+    robot_id: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE robot_settings
+            SET data = jsonb_set(
+                    data,
+                    '{sentenceEmbeddingProvider,indexedEmbedding}',
+                    to_jsonb($2::text)),
+                updated_at = now(),
+                version = robot_settings.version + 1
+          WHERE robot_id = $1",
+    )
+    .bind(robot_id)
+    .bind(fingerprint)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// 给新机器人插一份默认设置；**已存在就不动**（幂等，不会覆盖用户设置/密钥）。
 pub(crate) async fn init_robot(pool: &PgPool, robot_id: &str, data: &Settings) -> Result<()> {
     sqlx::query(

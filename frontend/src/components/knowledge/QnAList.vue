@@ -11,6 +11,8 @@ const route = useRoute();
 const robotId = route.params.robotId
 const qaData = reactive({
     id: null,
+    // 乐观锁版本（B-17）：新建为 null，编辑时由 resetForm 从列表行带入。
+    version: null,
     question: {
         question: ''
     },
@@ -30,6 +32,8 @@ onMounted(() => {
 // `id` 是 `qa.id`（scru128 字符串）；向量行号不再出现在契约里（B-30）。
 const resetForm = (d) => {
     qaData.id = d ? d.id : null;
+    // 乐观锁版本（B-17）：列表返回，保存时原样带回。
+    qaData.version = d ? d.version : null;
     qaData.question = d ? cloneObj(d.question) : { question: '' };
     qaData.similarQuestions = d ? cloneObj(d.similarQuestions) : [];
     qaData.answer = d ? d.answer : '';

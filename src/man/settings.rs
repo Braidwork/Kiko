@@ -764,19 +764,18 @@ impl Settings {
 /// 最多是下次少一条警告，而向量已经写成功了，所以调用方通常只记一笔日志，不把
 /// 整个请求判失败。
 pub(crate) async fn stamp_embedding_index(robot_id: &str) -> Result<()> {
-    // 只改 `indexed_embedding`（非敏感），所以从**存库形态**读、写回；不能拿
-    // hydrated 形态去写，否则会把 `env:`/`file:` 引用替换成解析后的明文。
-    let Some(mut stored) = get_stored_settings(robot_id).await? else {
+    // 只改 `indexed_embedding`（非敏感），指纹必须按**存库形态**算：不能拿 hydrated
+    // 形态去写，否则会把 `env:`/`file:` 引用替换成解析后的明文。
+    let Some(stored) = get_stored_settings(robot_id).await? else {
         return Ok(());
     };
-    stored.sentence_embedding_provider.indexed_embedding =
-        Some(stored.current_embedding_identity());
-    let (stored, changes) = split_settings(&stored)?;
-    repo::settings::save_robot(repo::pool(), robot_id, &stored, &changes).await?;
-    let hydrated = hydrate_settings(robot_id, stored).await?;
-    SETTINGS_CACHE
-        .lock()?
-        .insert(String::from(robot_id), hydrated);
+    let fingerprint = stored.current_embedding_identity();
+    // §16.4 / B-17：单字段 JSONB 更新，避免"读整条 → 改 → 写回"覆盖并发的设置保存。
+    repo::settings::stamp_robot_indexed_embedding(repo::pool(), robot_id, &fingerprint).await?;
+    // 缓存里存的是 hydrated 形态；只同步这个非敏感字段，不整条重读。
+    if let Some(s) = SETTINGS_CACHE.lock()?.get_mut(robot_id) {
+        s.sentence_embedding_provider.indexed_embedding = Some(fingerprint);
+    }
     Ok(())
 }
 
