@@ -85,23 +85,8 @@ pub async fn start_app() {
         std::process::exit(1);
     }
 
-    // unsafe {
-    //     libsqlite3_sys::sqlite3_auto_extension(Some(std::mem::transmute(
-    //         sqlite_vec::sqlite3_vec_init as *const (),
-    //     )));
-    // }
-
-    crate::intent::phrase::init_datasource()
-        .await
-        .expect("Failed initialize intent phrase vector database.");
-
-    crate::kb::qa::init_datasource()
-        .await
-        .expect("Failed initialize knowledge base QnA vector database.");
-
-    crate::kb::doc::init_datasource()
-        .await
-        .expect("Failed initialize knowledge base QnA vector database.");
+    // 知识库与向量的存储全部在 PG（S4）；进程内索引按 `(robot, collection)` 懒加载，
+    // 启动时不需要初始化任何嵌入式数据库。
 
     let settings = {
         let is_en = *IS_EN;
@@ -800,7 +785,10 @@ mod tests {
             1,
             "the response must be chunked exactly once: {head}"
         );
-        assert!(head.contains("content-type: application/x-ndjson"), "{head}");
+        assert!(
+            head.contains("content-type: application/x-ndjson"),
+            "{head}"
+        );
 
         let seen: Vec<std::time::Instant> = seen
             .into_iter()

@@ -20,7 +20,8 @@ const docDetailVisible = ref(false);
 const editFormVisible = ref(false);
 const loading = ref(false);
 const docFile = reactive({
-    id: 0,
+    // 文档 id 现在是 scru128 字符串（D6 / §5.1），新建时用空串表示"还没保存"。
+    id: "",
     fileName: "",
     fileSize: 0,
     docContent: "",

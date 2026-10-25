@@ -147,6 +147,16 @@ fn convert_subflow(
     Ok(())
 }
 
+/// 流程里的 `recallThresholds`（0–100，**相似度**百分比）→ 运行时节点存的阈值。
+///
+/// D41 / B-31：A 在运行时节点里存的是 `1 - thresholds/100` 的**距离**，比较用
+/// `distance <=`；B 统一成相似度 `thresholds / 100`，比较用 `similarity >=`。
+/// 同一个百分比下两种写法判定结果完全一致（`1 - sim <= 1 - t ⟺ sim >= t`），
+/// 单独抽出来是为了让这个换算只有一个地方可改、并且能被测试钉住。
+fn recall_similarity(thresholds: u8) -> f64 {
+    f64::from(thresholds) / 100f64
+}
+
 /// 把一个画布节点序列化成运行时节点。写失败返回错误，不再 `unwrap`（§16.1）。
 fn push_node(
     nodes: &mut Vec<(String, Vec<u8>)>,
@@ -366,7 +376,10 @@ fn convert_node(node: &mut Node, nodes: &mut Vec<(String, Vec<u8>)>) -> Result<(
         }
         Node::KnowledgeBaseAnswerNode(n) => {
             let node = KnowledgeBaseAnswerNode {
-                recall_distance: 1f64 - n.recall_thresholds as f64 / 100f64,
+                // D41：运行时节点存**相似度阈值**（越大越严格），直接是百分比 / 100。
+                // A 存的是 `1 - thresholds/100` 的距离，比较时再翻回去 —— 数学等价，
+                // 但两个方向散在不同文件里，容易改反（B-31 的由来）。
+                recall_similarity: recall_similarity(n.recall_thresholds),
                 retrieve_answer_sources: n.retrieve_answer_sources.clone(),
                 no_recall_then: n.no_answer_then.clone(),
                 next_node_id: n.branches[0].target_node_id.clone(),
@@ -413,3 +426,38 @@ fn t2(n: impl TestT) {
     println!("{}", n.say());
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 画布上的百分比是**相似度**：85% → 0.85。0 和 100 是两端（100% = 只有
+    /// 完全相同才命中）。
+    #[test]
+    fn recall_threshold_percentage_maps_to_similarity() {
+        assert!((recall_similarity(0) - 0.0).abs() < 1e-9);
+        assert!((recall_similarity(85) - 0.85).abs() < 1e-9);
+        assert!((recall_similarity(100) - 1.0).abs() < 1e-9);
+    }
+
+    /// 对照测试（B-31）：同一个百分比、同一个相似度下，A 的"距离阈值比较"和 B 的
+    /// "相似度阈值比较"必须给出完全相同的结论，否则这次统一会静默改变召回行为。
+    ///
+    /// A：`recall_distance = 1 - t/100`，`distance(1 - sim) <= recall_distance`。
+    /// B：`recall_similarity = t/100`，`sim >= recall_similarity`。
+    ///
+    /// 两边都用 f32 运算：同一个常数减法在 IEEE 下单调，所以等价关系是精确的。
+    #[test]
+    fn distance_and_similarity_comparisons_agree() {
+        for thresholds in [0u8, 1, 50, 85, 100] {
+            let t = recall_similarity(thresholds) as f32;
+            let old_recall_distance = 1.0f32 - t;
+            for step in 0..=1000 {
+                let sim = step as f32 / 1000.0;
+                let old = (1.0f32 - sim) <= old_recall_distance;
+                let new = crate::vector::is_hit(sim, t);
+                assert_eq!(old, new, "thresholds={thresholds} sim={sim}");
+            }
+        }
+    }
+}

@@ -47,7 +47,7 @@ pub(crate) async fn save(
         }
         return to_res(Ok(()));
     }
-    // 编辑已有机器人：机器人行与设置/流程/意图等都在 PG；KB 向量仍在 turso。
+    // 编辑已有机器人：机器人行、设置、流程、意图、知识库都在 PG。
     to_res(persist(&d).await)
 }
 
@@ -55,17 +55,14 @@ async fn new(d: &RobotData, is_en: bool) -> Result<()> {
     persist(d).await?;
     // 机器人意图
     settings::init(&d.robot_id).await?;
-    // crate::intent::phrase::init_tables(&d.robot_id).await?;
-    crate::kb::qa::init_tables(&d.robot_id).await?;
-    crate::kb::doc::init_tables(&d.robot_id).await?;
+    // 知识库（documents / doc_chunks / qa / qa_questions / vector_items）全部由
+    // migration 建表、按 robot_id 外键挂在机器人下，新机器人**不需要建表**。
     // 意图
     intent::init(&d.robot_id, is_en).await?;
     // 变量（已在 PG）
     variable::init(&d.robot_id, is_en).await?;
     // 主流程
     mainflow::init(&d.robot_id).await?;
-    // 外部 HTTP 接口：表在 PG，按 robot_id 外键挂在机器人下，不需要建表。
-    // 流程上下文：表在 PG，不需要建表（也不再是每机器人一张）。
     Ok(())
 }
 
@@ -87,25 +84,21 @@ pub(crate) async fn delete(Query(q): Query<RobotQuery>) -> impl IntoResponse {
     to_res(purge(&q.robot_id).await)
 }
 
-/// 删机器人 = 跨库的两段式清理（§15.3 硬规矩 2）：**不做双写**，每一步都幂等、
-/// 可重试，允许中间态残留。
+/// 删机器人：全部数据都在 PG，`robots` 的 FK 级联负责业务行；剩下两处要显式清。
 ///
-/// 顺序是有意的：先把 turso 里按 `robot_id` 命名的表清掉，再删 PG 里的 `robots`
-/// 行（`variables` / `intents` / `contexts` / `external_http_apis` / `mainflows` /
-/// `subflows` / `runtime_nodes` / `robot_settings` 由 FK 级联），最后清 `secrets`
-/// （它没有外键，不会跟着级联）。反过来先删 robots 会留下「机器人还在、子数据
-/// 已删」的半截状态；按这个顺序失败，残留的是孤儿表/孤儿 secret，重跑一次 purge
-/// 就能补齐。
+/// 1. `secrets.scope` 没有外键，不跟着级联 —— 必须显式删；
+/// 2. `data/uploads/<robot_id>/` 是本地文件（D30 / §5.6，A 里这段被注释掉了）。
+///
+/// 顺序：先清文件、再删机器人行、最后清 secrets。反过来失败会留下"机器人还在、
+/// 文件没了"；按这个顺序失败，残留的是可重试的孤儿目录或孤儿 secret。每一步都
+/// 幂等（目录不存在 / 行已不存在都当成功），所以重跑一次 purge 就能补齐。
+/// 删完还要把这个机器人的内存向量索引作废（`vector::invalidate_robot`）。
 async fn purge(robot_id: &str) -> Result<()> {
-    // turso 三件套：这些表在各自文件里都只属于这一个机器人，整表删掉。
-    // 三个 helper 都带 `IF EXISTS` —— 表是懒创建的，没建过就得跳过而不是报错，
-    // 否则第一步失败会让整个 purge 什么都不做。
-    crate::intent::phrase::remove_tables(robot_id).await?;
-    crate::kb::qa::remove_tables(robot_id).await?;
-    crate::kb::doc::remove_tables(robot_id).await?;
-    // secrets.scope 没有外键，必须显式清。放在删机器人**之后**：如果删机器人失败，
-    // 至少不会先把还活着的机器人的密钥清掉；反过来失败只留下可重试的孤儿 secret。
+    crate::kb::doc::remove_uploads(robot_id).await?;
     repo::robot::delete(repo::pool(), robot_id).await?;
     repo::secret::delete_scope(repo::pool(), robot_id).await?;
+    for collection in repo::vector::COLLECTIONS {
+        crate::vector::clear(robot_id, collection);
+    }
     Ok(())
 }

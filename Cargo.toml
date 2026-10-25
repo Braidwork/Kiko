@@ -79,7 +79,7 @@ lettre = { version = "0.11.23", default-features = false, features = ["builder",
 unicase = "2.10.0"
 unicode-normalization = "0.1.25"
 # D40：sqlx 0.9，default-features 必须关掉（默认带 `any`）；TLS 特性名是 `tls-rustls`。
-# redb 已移除；turso 要等 S4（向量/知识库）搬完才能删。
+# redb / turso 都已移除（B-20 / S4）：关系型数据、知识库载荷与向量全部在 PG。
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
@@ -104,7 +104,8 @@ quick-xml = "0.42.0"
 # text-splitter = { version = "0.28.0", default-features = false, features = ["tokenizers"] }
 text-splitter = "0.33"
 # num_cpus = "1.17.0"
-turso = "0.8.2"
+# SHA-256：知识库原文件的 content_hash（§5.6 / D30）。sqlx 等依赖已经带了这个 crate。
+sha2 = "0.10.9"
 unicode-casefold = "0.2.0"
 # sqlite-vec = { path = "/mnt/d/work/sqlite-vec/bindings/rust/" }
 

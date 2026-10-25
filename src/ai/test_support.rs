@@ -122,6 +122,75 @@ pub(crate) fn sse_head() -> String {
     String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
 }
 
+/// 本地假 embedding 端点：服务 `requests` 次，按请求里的 `input` 生成**确定性**
+/// 4 维向量（同样文本 → 同样向量，相似度 1）。知识库端到端测试用它替代真模型：
+/// 既不需要下载权重，也不会出网。
+pub(crate) async fn serve_embeddings(requests: usize) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for _ in 0..requests {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut raw: Vec<u8> = Vec::with_capacity(4096);
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                raw.extend_from_slice(&buf[..n]);
+                if let Some(end) = head_end(&raw)
+                    && raw.len() >= end + content_length(&raw[..end])
+                {
+                    break;
+                }
+            }
+            let body = format!(
+                "{{\"data\":[{{\"embedding\":{}}}]}}",
+                fake_embedding(&request_input(&raw))
+            );
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    format!("http://{addr}/v1/embeddings")
+}
+
+/// 从请求体里取 `"input":"…"`。测试用的文本不含引号/反斜杠，所以不需要完整 JSON 解析。
+fn request_input(raw: &[u8]) -> String {
+    let Some(end) = head_end(raw) else {
+        return String::new();
+    };
+    let body = String::from_utf8_lossy(&raw[end..]).into_owned();
+    let Some(i) = body.find("\"input\":\"") else {
+        return String::new();
+    };
+    body[i + 9..]
+        .split('"')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 确定性 4 维向量：同样文本 → 完全相同的向量。
+fn fake_embedding(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let second = (chars.len() % 7) as f32 / 7.0 + 0.01;
+    let third = (chars.first().map(|c| *c as u32).unwrap_or(0) % 11) as f32 / 11.0 + 0.01;
+    format!("[1.0,{second:.4},{third:.4},0.5]")
+}
+
 pub(crate) fn sse_event(text: &str) -> String {
     format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n")
 }
@@ -134,7 +203,9 @@ pub(crate) fn prompt() -> Option<Vec<Prompt>> {
 }
 
 /// Collects what the stream pushed, in order.
-pub(crate) fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamingResponseData>) -> Vec<String> {
+pub(crate) fn drain(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamingResponseData>,
+) -> Vec<String> {
     let mut out = Vec::new();
     while let Ok(f) = rx.try_recv() {
         assert_eq!(f.content_seq, Some(0), "every delta belongs to answer 0");

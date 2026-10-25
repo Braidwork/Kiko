@@ -1338,9 +1338,8 @@ const changeSentenceEmbeddingProvider = async (n) => {
 const sentenceEmbeddingModelListLoading = ref(false);
 
 // 「检测已存向量维度」：设置里那一栏 `dimensions` 说的是"**以后**按几维算"，而库里
-// 已有的向量是既成事实——改过设置又还没重新索引时两者就不一致，而 turso 的
-// `vector_distance_cos` 遇到维度不一致会让**整条检索报错**。所以这个按钮只读地
-// 数一遍 blob（维度 = 字节数 / 4），给一个"不看设置、只看数据"的答案。
+// 已有的向量是既成事实——改过设置又还没重新索引时两者就不一致。后端从 PG 元数据
+// （embedding_models / vector_collection_state）报告维度与行数，不扫 BLOB（B-29）。
 const checkingVectorDimensions = ref(false);
 const vectorDimensionsVisible = ref(false);
 const vectorDimensions = reactive({ configured: null, stored: [] });

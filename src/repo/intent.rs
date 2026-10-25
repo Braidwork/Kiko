@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use sqlx::postgres::PgPool;
 
 use crate::intent::dto::{IntentDetail, IntentKeywordData, IntentPhraseData, IntentRegexData};
+use crate::repo::vector::{self, ModelRef};
 use crate::result::Result;
 
 #[derive(sqlx::FromRow)]
@@ -49,19 +50,11 @@ struct PhraseRow {
     phrase: String,
 }
 
-/// 意图的最小身份：加短语前要拿 `name` 去算向量，没必要把整条详情读出来。
-#[derive(sqlx::FromRow)]
-pub(crate) struct IntentMeta {
-    pub(crate) name: String,
-}
-
-/// 一条短语的载荷 + 它在 `phrase.dat` 里的向量行号。
-///
-/// `vec_row_id` 是存储层的过渡引用（见 `0002_intent_phrase_vec_row_id.sql`），
-/// 不进 API。
-#[derive(sqlx::FromRow)]
-pub(crate) struct PhraseVector {
-    pub(crate) vec_row_id: Option<i64>,
+/// 一条短语的载荷（重建/重算向量用）。向量身份是 `vector_items.id`（D7），
+/// 不再是过渡列 `vec_row_id`（B-30）。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct PhrasePayload {
+    pub(crate) id: String,
     pub(crate) phrase: String,
 }
 
@@ -278,13 +271,27 @@ pub(crate) async fn create(
     Ok(id)
 }
 
-/// 删除意图。子表由 FK 级联。返回是否真的删掉了一行。
+/// 删除意图。子表由 FK 级联，但**短语的向量行不会级联**（`vector_items.entity_id`
+/// 是通用列，没有外键），所以先按 `intent_phrases.id` 显式删掉它们，再删意图 ——
+/// 同一个事务（B-22）。返回是否真的删掉了一行。
 pub(crate) async fn delete(pool: &PgPool, robot_id: &str, intent_id: &str) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let phrase_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT p.id FROM intent_phrases p
+           JOIN intents i ON i.id = p.intent_id
+          WHERE p.intent_id = $1 AND i.robot_id = $2",
+    )
+    .bind(intent_id)
+    .bind(robot_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    vector::delete_entities(&mut tx, robot_id, vector::PHRASE, &phrase_ids).await?;
     let r = sqlx::query("DELETE FROM intents WHERE id = $1 AND robot_id = $2")
         .bind(intent_id)
         .bind(robot_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(r.rows_affected() > 0)
 }
 
@@ -405,80 +412,63 @@ pub(crate) async fn remove_regex(
     Ok(r.rows_affected() > 0)
 }
 
-/// 加短语之前的身份查询（算向量要用意图名）。
-pub(crate) async fn get_meta(
-    pool: &PgPool,
-    robot_id: &str,
-    intent_id: &str,
-) -> Result<Option<IntentMeta>> {
-    Ok(
-        sqlx::query_as("SELECT name FROM intents WHERE id = $1 AND robot_id = $2")
-            .bind(intent_id)
-            .bind(robot_id)
-            .fetch_optional(pool)
-            .await?,
-    )
-}
-
-/// 记录一条短语。向量已经由 `intent/phrase.rs` 写入 turso，这里只落载荷 +
-/// 过渡用的 `vec_row_id`。意图不存在时返回 `None`，调用方负责清掉刚写的向量行。
+/// 记录一条短语：载荷与向量**同一个事务**（B-22）。返回 `(短语 id, vector_items.id)`。
+///
+/// 意图不存在时返回 `None`；`vec` 由调用方在事务外算好（模型推理不占事务）。
 pub(crate) async fn add_phrase(
     pool: &PgPool,
     robot_id: &str,
     intent_id: &str,
     phrase: &str,
-    vec_row_id: i64,
-) -> Result<Option<String>> {
+    vec: Vec<f32>,
+    model: &ModelRef,
+) -> Result<Option<(String, i64)>> {
     let mut tx = pool.begin().await?;
     if !lock_intent(&mut tx, robot_id, intent_id).await? {
         return Ok(None);
     }
     let id = scru128::new_string();
     sqlx::query(
-        "INSERT INTO intent_phrases (id, intent_id, position, phrase, vec_row_id)
+        "INSERT INTO intent_phrases (id, intent_id, position, phrase)
          VALUES ($1, $2,
                  (SELECT COALESCE(MAX(position), -1) + 1
                     FROM intent_phrases WHERE intent_id = $2),
-                 $3, $4)",
+                 $3)",
     )
     .bind(&id)
     .bind(intent_id)
     .bind(phrase)
-    .bind(vec_row_id)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
-    Ok(Some(id))
-}
-
-/// 按 id 取一条短语（含向量行号）。
-pub(crate) async fn get_phrase(
-    pool: &PgPool,
-    robot_id: &str,
-    intent_id: &str,
-    phrase_id: &str,
-) -> Result<Option<PhraseVector>> {
-    Ok(sqlx::query_as(
-        r#"SELECT p.vec_row_id, p.phrase
-             FROM intent_phrases p
-             JOIN intents i ON i.id = p.intent_id
-            WHERE p.id = $1 AND p.intent_id = $2 AND i.robot_id = $3"#,
+    let ids = vector::put_many_active(
+        &mut tx,
+        robot_id,
+        vector::PHRASE,
+        model,
+        &[(id.clone(), vec)],
     )
-    .bind(phrase_id)
-    .bind(intent_id)
-    .bind(robot_id)
-    .fetch_optional(pool)
-    .await?)
+    .await?;
+    tx.commit().await?;
+    Ok(ids.first().map(|v| (id, *v)))
 }
 
-/// 按 id 删除短语行。向量行由调用方先删（turso 与 PG 不能同事务，见 §15.3）。
+/// 按 id 删除短语行，**连同它的向量行**（同一个事务）。返回被删的
+/// `vector_items.id`，调用方据此同步内存索引。
 pub(crate) async fn delete_phrase(
     pool: &PgPool,
     robot_id: &str,
     intent_id: &str,
     phrase_id: &str,
-) -> Result<bool> {
-    let r = sqlx::query(
+) -> Result<Vec<i64>> {
+    let mut tx = pool.begin().await?;
+    let ids = vector::delete_entities(
+        &mut tx,
+        robot_id,
+        vector::PHRASE,
+        &[String::from(phrase_id)],
+    )
+    .await?;
+    sqlx::query(
         r#"DELETE FROM intent_phrases p
              USING intents i
             WHERE p.id = $1
@@ -489,19 +479,20 @@ pub(crate) async fn delete_phrase(
     .bind(phrase_id)
     .bind(intent_id)
     .bind(robot_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(r.rows_affected() > 0)
+    tx.commit().await?;
+    Ok(ids)
 }
 
-/// 一个意图的全部短语 + 向量行号，按 `position`。重建/重算向量用。
-pub(crate) async fn list_phrase_vectors(
+/// 一个意图的全部短语（载荷），按 `position`。重算向量用。
+pub(crate) async fn list_phrases(
     pool: &PgPool,
     robot_id: &str,
     intent_id: &str,
-) -> Result<Vec<PhraseVector>> {
+) -> Result<Vec<PhrasePayload>> {
     Ok(sqlx::query_as(
-        r#"SELECT p.vec_row_id, p.phrase
+        r#"SELECT p.id, p.phrase
              FROM intent_phrases p
              JOIN intents i ON i.id = p.intent_id
             WHERE p.intent_id = $1 AND i.robot_id = $2
@@ -513,27 +504,105 @@ pub(crate) async fn list_phrase_vectors(
     .await?)
 }
 
-/// 重建向量后把新的 turso 行号写回 PG。
-///
-/// 整批一个事务：一次重建要么全部换成新行号，要么保持旧行号（下一轮重建会
-/// 重新清表，残留旧行号不会造成不可恢复的错误）。
-pub(crate) async fn update_phrase_vec_row_ids(
+/// 还没有 `generation` 向量的短语（重建续跑用，D47）。
+pub(crate) async fn pending_phrases(
     pool: &PgPool,
-    intent_id: &str,
-    updates: &[(String, i64)],
+    robot_id: &str,
+    generation: i64,
+) -> Result<Vec<PhrasePayload>> {
+    Ok(sqlx::query_as(
+        r#"SELECT p.id, p.phrase
+             FROM intent_phrases p
+             JOIN intents i ON i.id = p.intent_id
+            WHERE i.robot_id = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM vector_items v
+                   WHERE v.robot_id = i.robot_id
+                     AND v.collection = 'phrase'
+                     AND v.generation = $2
+                     AND v.entity_id = p.id)
+            ORDER BY i.position, i.id COLLATE "C", p.position, p.id COLLATE "C""#,
+    )
+    .bind(robot_id)
+    .bind(generation)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// 重建进度里的短语总数（与 [`pending_phrases`] 同口径）。
+pub(crate) async fn count_phrases(pool: &PgPool, robot_id: &str) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM intent_phrases p
+           JOIN intents i ON i.id = p.intent_id
+          WHERE i.robot_id = $1",
+    )
+    .bind(robot_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// 重建时给一条**已存在**的短语写指定 generation 的向量（幂等 upsert）。
+pub(crate) async fn put_phrase_vector(
+    pool: &PgPool,
+    robot_id: &str,
+    phrase_id: &str,
+    generation: i64,
+    vec: Vec<f32>,
+    model: &ModelRef,
 ) -> Result<()> {
-    if updates.is_empty() {
-        return Ok(());
-    }
     let mut tx = pool.begin().await?;
-    for (phrase_id, vec_row_id) in updates {
-        sqlx::query("UPDATE intent_phrases SET vec_row_id = $1 WHERE id = $2 AND intent_id = $3")
-            .bind(vec_row_id)
-            .bind(phrase_id)
-            .bind(intent_id)
-            .execute(&mut *tx)
-            .await?;
-    }
+    vector::put_many(
+        &mut tx,
+        robot_id,
+        vector::PHRASE,
+        generation,
+        model,
+        &[(String::from(phrase_id), vec)],
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// 给一组**已存在**的短语重算 active generation 的向量（`regenerate-all`）。
+///
+/// 实体 id 不变，所以是覆盖而不是换行 —— 返回同序的 `vector_items.id` 供内存索引
+/// 原地更新。
+pub(crate) async fn put_phrase_vectors(
+    pool: &PgPool,
+    robot_id: &str,
+    items: &[(String, Vec<f32>)],
+    model: &ModelRef,
+) -> Result<Vec<i64>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut tx = pool.begin().await?;
+    let ids = vector::put_many_active(&mut tx, robot_id, vector::PHRASE, model, items).await?;
+    tx.commit().await?;
+    Ok(ids)
+}
+
+/// 一组短语向量命中的意图名（短语检索 top-k → 回载荷）。
+pub(crate) async fn intent_names_for_phrase_vectors(
+    pool: &PgPool,
+    robot_id: &str,
+    vector_ids: &[i64],
+) -> Result<Vec<(i64, String)>> {
+    if vector_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query_as(
+        "SELECT v.id, i.name
+           FROM vector_items v
+           JOIN intent_phrases p ON p.id = v.entity_id
+           JOIN intents i ON i.id = p.intent_id
+          WHERE v.robot_id = $1 AND v.collection = $2 AND v.id = ANY($3)
+            AND i.robot_id = $1",
+    )
+    .bind(robot_id)
+    .bind(vector::PHRASE)
+    .bind(vector_ids)
+    .fetch_all(pool)
+    .await?)
 }

@@ -4,21 +4,24 @@
 //! 每个仓储方法显式接收 `&PgPool` 是有意的 —— 集成测试因此可以给每个用例一个
 //! 独立 schema 的池（`tmp_<uuid>`），而不必去改全局单例（§7 测试约定）。
 //!
-//! 迁移状态：redb 已彻底移除（S2/S3 完成），这里覆盖全部关系型业务数据；
-//! turso 只剩知识库/意图的向量与载荷（S4 再搬）。**新表、新字段一律只落在 PG**
+//! 迁移状态：redb 与 turso 都已移除（S4 完成），关系型数据、知识库载荷与向量全部
+//! 落在 PG；进程内的向量索引只是缓存（D4/D35）。**新表、新字段一律只落在 PG**
 //! （硬约束 3）。
 
 pub(crate) mod app_meta;
 pub(crate) mod context;
+pub(crate) mod doc;
 pub(crate) mod external_http;
 pub(crate) mod intent;
 pub(crate) mod mainflow;
+pub(crate) mod qa;
 pub(crate) mod robot;
 pub(crate) mod runtime_node;
 pub(crate) mod secret;
 pub(crate) mod settings;
 pub(crate) mod subflow;
 pub(crate) mod variable;
+pub(crate) mod vector;
 
 #[cfg(test)]
 mod tests;

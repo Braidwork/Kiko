@@ -41,17 +41,19 @@ pub(crate) async fn embedding(robot_id: &str, s: &str) -> Result<(Vec<f32>, f32)
         let dims_hint = dimensions.map(|d| d as usize);
         let v = match settings.sentence_embedding_provider.provider {
             SentenceEmbeddingProvider::HuggingFace(m) => hugging_face(robot_id, &m.get_info(), s),
-            SentenceEmbeddingProvider::OpenAICompatible(m) => open_ai_compatible(
-                &m,
-                s,
-                &settings.sentence_embedding_provider.api_url,
-                &settings.sentence_embedding_provider.api_key,
-                settings.sentence_embedding_provider.connect_timeout_millis,
-                settings.sentence_embedding_provider.read_timeout_millis,
-                &settings.sentence_embedding_provider.proxy_url,
-                dimensions,
-            )
-            .await,
+            SentenceEmbeddingProvider::OpenAICompatible(m) => {
+                open_ai_compatible(
+                    &m,
+                    s,
+                    &settings.sentence_embedding_provider.api_url,
+                    &settings.sentence_embedding_provider.api_key,
+                    settings.sentence_embedding_provider.connect_timeout_millis,
+                    settings.sentence_embedding_provider.read_timeout_millis,
+                    &settings.sentence_embedding_provider.proxy_url,
+                    dimensions,
+                )
+                .await
+            }
         }?;
         // 设了维度就必须真按这个维度回来。失败时**不能**放行：一旦把长度不对的
         // 向量写进库，那张表就同时存在两种维度，而 turso 的
@@ -234,14 +236,8 @@ async fn open_ai_compatible(
     Ok(embedding_result)
 }
 
-pub(crate) fn vec_to_db(v: &Vec<f32>) -> turso::Value {
-    turso::Value::Blob(
-        v.iter()
-            .map(|f| f.to_le_bytes())
-            .flatten()
-            .collect::<Vec<u8>>(),
-    )
-}
+// 向量落库的编码在 `vector::index::encode`（小端 f32 拼接），
+// 这里不再保留 turso 专用的 `vec_to_db`。
 
 #[cfg(test)]
 mod tests {
@@ -330,6 +326,9 @@ mod tests {
             .unwrap_err();
         let e = format!("{e:?}");
         assert!(e.contains("401"), "the error should name the status: {e}");
-        assert!(e.contains("bad key"), "the error should carry the body: {e}");
+        assert!(
+            e.contains("bad key"),
+            "the error should carry the body: {e}"
+        );
     }
 }

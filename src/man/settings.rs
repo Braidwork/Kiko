@@ -351,7 +351,8 @@ pub(crate) struct SentenceEmbeddingProvider {
     /// 它和当前配置是两件事：换掉模型之后，库里旧向量还在，要等重新索引（或重建）
     /// 才会变。设置页拿它和当前配置比，不一致就警告（见 `Settings.vue` 的
     /// `embeddingIndexWarning`）：换了模型的话向量空间整个不同，检索**不会报错**、
-    /// 只会全是噪声；只换了维度的话 `vector_distance_cos` 会让整条检索直接失败。
+    /// 只会全是噪声；只换了维度的话新向量写不进同一个 generation（写入点直接报
+    /// "dimension changed"），检索侧也不会把两种维度混在一起算。
     #[serde(rename = "indexedEmbedding", default)]
     pub(crate) indexed_embedding: Option<String>,
 }
@@ -976,15 +977,15 @@ pub(crate) struct ModelFileCheck {
 ///
 /// 为什么要单独看"库里已经存了什么"：设置页那一栏 `dimensions` 说的是"**以后**按
 /// 几维算"，和库里已有的向量是两件事——改过设置又还没重新索引时，两者不一致，
-/// 而 turso 的 `vector_distance_cos` 遇到维度不一致会让**整条检索报错**。所以用户
-/// 需要一个"不看设置、只看数据"的答案。
+/// 而库里的维度是既成事实。S4 之后这份报告来自 PG 元数据（`embedding_models` /
+/// `vector_collection_state`），不再扫 BLOB（B-29）。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct VectorDimensions {
     /// 当前配置会算出来的维度（设置里填了就是它，没填就是 `null` = 由模型决定）。
     /// 只用于界面提示，不是事实来源。
     pub(crate) configured: Option<u32>,
-    /// 库里实际存着的维度（每处向量列一条）。`exists = false` 表示"还没写过向量"。
+    /// 库里实际存着的维度（每处集合一条）。`exists = false` 表示"还没写过向量"。
     pub(crate) stored: Vec<crate::man::vector_report::VectorColumn>,
 }
 

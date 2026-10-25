@@ -11,8 +11,8 @@ use super::context::Context;
 use super::dto::{
     AnswerContentType, AnswerData, CollectData, Request, ResponseChannelWrapper, ResponseData,
 };
-use crate::ai::chat::{ResultSender, SenderWrapper};
 use crate::ai::chat::Prompt;
+use crate::ai::chat::{ResultSender, SenderWrapper};
 use crate::external::http::client as http;
 use crate::flow::rt::collector;
 use crate::flow::subflow::dto::NextActionType;
@@ -1127,7 +1127,11 @@ pub(crate) enum KnowledgeBaseAnswerSource {
 #[derive(Archive, Clone, Deserialize, Serialize)]
 #[rkyv(compare(PartialEq))]
 pub(crate) struct KnowledgeBaseAnswerNode {
-    pub(super) recall_distance: f64,
+    /// 命中阈值，**相似度**（越大越严格），来自流程里配置的 `recallThresholds / 100`
+    /// （D41 / B-31）。A 存的是 `1 - thresholds/100` 的"距离"，比较方向相反；统一成
+    /// 相似度后，这个字段对**已经发布过的旧版运行时节点**语义不同（旧值是 0.15 这种
+    /// 距离），升级后需要重新发布一次知识库节点（见 §18）。
+    pub(super) recall_similarity: f64,
     pub(super) retrieve_answer_sources: Vec<crate::flow::rt::node::KnowledgeBaseAnswerSource>,
     pub(super) no_recall_then: KnowledgeBaseAnswerNoRecallThen,
     pub(super) next_node_id: String,
@@ -1136,14 +1140,15 @@ pub(crate) struct KnowledgeBaseAnswerNode {
 impl KnowledgeBaseAnswerNode {
     async fn retrieve_qa_answer(&self, req: &Request) -> Option<String> {
         match crate::kb::qa::retrieve_answer(&req.robot_id, &req.user_input).await {
-            Ok((answer, distance)) => {
+            Ok((answer, similarity)) => {
                 log::info!(
-                    "distance {} recall_distance {}",
-                    distance,
-                    self.recall_distance
+                    "similarity {} recall_similarity {}",
+                    similarity,
+                    self.recall_similarity
                 );
+                // D41 / B-31：统一用相似度比较（越大越近）。
                 if let Some(a) = answer
-                    && distance <= self.recall_distance
+                    && crate::vector::is_hit(similarity, self.recall_similarity as f32)
                 {
                     Some(a.answer)
                 } else {
@@ -1151,7 +1156,7 @@ impl KnowledgeBaseAnswerNode {
                 }
             }
             Err(e) => {
-                log::error!("KnowledgeBaseAnswerNode retrieve QnA failed: {:?}", &e);
+                log::error!("KnowledgeBaseAnswerNode retrieve QnA failed: {e:?}");
                 None
             }
         }
@@ -1160,7 +1165,7 @@ impl KnowledgeBaseAnswerNode {
         let r = crate::kb::doc::search_doc(
             &req.robot_id,
             &req.user_input,
-            self.recall_distance,
+            self.recall_similarity as f32,
             1000,
             5000,
         )

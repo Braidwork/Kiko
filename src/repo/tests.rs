@@ -4,7 +4,7 @@
 //! 没配 `KIKO_TEST_DATABASE_URL` 时整组跳过 —— 没有 PG 的环境不该因此红一片。
 
 use super::{
-    context, external_http, intent, mainflow, robot, runtime_node, secret,
+    context, doc, external_http, intent, mainflow, qa, robot, runtime_node, secret,
     settings as settings_repo, subflow, test_support::TestDb, variable,
 };
 use crate::external::http::dto::{
@@ -15,6 +15,7 @@ use crate::robot::dto::{RobotData, RobotType};
 use crate::variable::dto::{
     Variable, VariableObtainValueExpressionType, VariableType, VariableValueSource,
 };
+use crate::vector;
 
 fn robot(id: &str, name: &str) -> RobotData {
     RobotData {
@@ -22,6 +23,24 @@ fn robot(id: &str, name: &str) -> RobotData {
         robot_name: String::from(name),
         robot_type: RobotType::TextBot,
     }
+}
+
+/// 测试用的模型定义：2 维向量，指纹与 `vector::current_model` 同格式。
+fn test_model() -> crate::repo::vector::ModelRef {
+    crate::repo::vector::ModelRef {
+        provider: String::from("test"),
+        model: String::from("test-model"),
+        dimension: 2,
+        normalized: false,
+        fingerprint: String::from("v1|test|test-model|2"),
+    }
+}
+
+/// 一小段可区分的测试向量（第 `i` 维为 1，其余 0）：相同文本 → 相似度 1。
+fn unit_vec(dim: usize, i: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; dim];
+    v[i] = 1.0;
+    v
 }
 
 fn variable(name: &str) -> Variable {
@@ -432,10 +451,18 @@ async fn intent_crud_roundtrip_and_position_order() {
         .await
         .unwrap()
         .expect("意图存在时必须返回新正则 id");
-    let p1 = intent::add_phrase(&db.pool, "rI", &alpha, "hello", 101)
-        .await
-        .unwrap()
-        .expect("意图存在时必须返回新短语 id");
+    let p1 = intent::add_phrase(
+        &db.pool,
+        "rI",
+        &alpha,
+        "hello",
+        unit_vec(2, 0),
+        &test_model(),
+    )
+    .await
+    .unwrap()
+    .expect("意图存在时必须返回新短语 id")
+    .0;
 
     let got = intent::get(&db.pool, "rI", &alpha)
         .await
@@ -472,23 +499,34 @@ async fn intent_crud_roundtrip_and_position_order() {
     let keywords: Vec<&str> = got.keywords.iter().map(|k| k.keyword.as_str()).collect();
     assert_eq!(keywords, ["k1", "k3"]);
 
-    // 短语的向量行号是内部列，但删除短语需要它。
-    let phrase = intent::get_phrase(&db.pool, "rI", &alpha, &p1)
+    // 短语的向量与载荷同事务：`vector_items` 里必须有一条指向这条短语的行
+    // （B-22 / B-30：向量身份是 `vector_items.id`，不再有 `vec_row_id`）。
+    let vectors: Vec<String> = sqlx::query_scalar(
+        "SELECT entity_id FROM vector_items WHERE robot_id = $1 AND collection = 'phrase'",
+    )
+    .bind("rI")
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(vectors, vec![p1.clone()], "短语必须同时有向量行");
+    let removed = intent::delete_phrase(&db.pool, "rI", &alpha, &p1)
         .await
-        .unwrap()
-        .expect("p1 应该存在");
-    assert_eq!(phrase.vec_row_id, Some(101));
-    assert_eq!(phrase.phrase, "hello");
+        .unwrap();
+    assert_eq!(removed.len(), 1, "删短语要返回被删的 vector id");
+    let left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vector_items WHERE robot_id = $1 AND collection = 'phrase'",
+    )
+    .bind("rI")
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "删短语不能留下孤儿向量");
     assert!(
         intent::delete_phrase(&db.pool, "rI", &alpha, &p1)
             .await
             .unwrap()
-    );
-    assert!(
-        intent::get_phrase(&db.pool, "rI", &alpha, &p1)
-            .await
-            .unwrap()
-            .is_none()
+            .is_empty(),
+        "重复删除是幂等的"
     );
 
     // 删意图：子表全部级联。
@@ -640,10 +678,11 @@ async fn intent_isolates_robots() {
         .await
         .unwrap()
         .unwrap();
-    let phrase = intent::add_phrase(&db.pool, "rA", &id, "p", 7)
+    let phrase = intent::add_phrase(&db.pool, "rA", &id, "p", unit_vec(2, 0), &test_model())
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .0;
 
     // 另一个机器人既读不到，也不能通过别人的 id 改数据。
     assert!(intent::get(&db.pool, "rB", &id).await.unwrap().is_none());
@@ -661,7 +700,7 @@ async fn intent_isolates_robots() {
             .is_none()
     );
     assert!(
-        intent::add_phrase(&db.pool, "rB", &id, "stolen", 8)
+        intent::add_phrase(&db.pool, "rB", &id, "stolen", unit_vec(2, 1), &test_model())
             .await
             .unwrap()
             .is_none()
@@ -672,17 +711,12 @@ async fn intent_isolates_robots() {
             .unwrap()
     );
     assert!(
-        !intent::delete_phrase(&db.pool, "rB", &id, &phrase)
+        intent::delete_phrase(&db.pool, "rB", &id, &phrase)
             .await
             .unwrap()
+            .is_empty()
     );
     assert!(!intent::delete(&db.pool, "rB", &id).await.unwrap());
-    assert!(
-        intent::get_meta(&db.pool, "rB", &id)
-            .await
-            .unwrap()
-            .is_none()
-    );
 
     // rA 的数据原封不动。
     let got = intent::get(&db.pool, "rA", &id).await.unwrap().unwrap();
@@ -708,7 +742,7 @@ async fn deleting_robot_cascades_intents() {
         .await
         .unwrap()
         .unwrap();
-    intent::add_phrase(&db.pool, "rD", &id, "d", 9)
+    intent::add_phrase(&db.pool, "rD", &id, "d", unit_vec(2, 0), &test_model())
         .await
         .unwrap()
         .unwrap();
@@ -719,6 +753,7 @@ async fn deleting_robot_cascades_intents() {
         "intent_keywords",
         "intent_regexes",
         "intent_phrases",
+        "vector_items",
     ] {
         let left: i64 =
             sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
@@ -1401,6 +1436,518 @@ async fn settings_service_roundtrip_through_global_pool() {
         .unwrap()
         .value;
     assert_eq!(before, after);
+
+    // 6. 知识库端到端（S4）：假 embedding 端点 + 真实 PG + 进程内索引。
+    //
+    //    这一段覆盖三条检索：QA（相似度）、文档（分块 + 向量 + 原文件落盘）、
+    //    意图短语（阈值方向 D41）。模型推理被换成本地假端点，所以既不需要下载权重，
+    //    也不会出网。
+    let embed_url = crate::ai::test_support::serve_embeddings(16).await;
+    robot::upsert(&db.pool, &robot("rKb", "kb")).await.unwrap();
+    crate::man::settings::init("rKb").await.unwrap();
+    let mut s = Settings::default();
+    s.sentence_embedding_provider.provider =
+        crate::ai::embedding::SentenceEmbeddingProvider::OpenAICompatible(String::from(
+            "fake-embed",
+        ));
+    s.sentence_embedding_provider.api_url = embed_url;
+    crate::man::settings::save_settings("rKb", s).await.unwrap();
+
+    // 6.1 QA：保存 → 列表 → 检索。
+    let qa_id = crate::kb::qa::save(
+        "rKb",
+        crate::kb::dto::QuestionAnswerPair {
+            id: None,
+            question: crate::kb::dto::QuestionData {
+                question: String::from("hello"),
+            },
+            similar_questions: Vec::new(),
+            answer: String::from("world"),
+        },
+    )
+    .await
+    .unwrap();
+    let qa_list = crate::kb::qa::list("rKb").await.unwrap();
+    assert_eq!(qa_list.len(), 1);
+    assert_eq!(qa_list[0].id.as_deref(), Some(qa_id.as_str()));
+    let (found, similarity) = crate::kb::qa::retrieve_answer("rKb", "hello")
+        .await
+        .unwrap();
+    assert!(similarity > 0.99, "同一文本的相似度应接近 1：{similarity}");
+    assert_eq!(found.expect("必须命中").answer, "world");
+
+    // 6.2 文档：docx → 分块 + 向量 + 原文件 → 索引检索。
+    let docx = minimal_docx(&["Rust 知识库", "second paragraph"]);
+    let text = crate::kb::doc::save("rKb", "a.docx", DOCX_MIME, &docx)
+        .await
+        .unwrap();
+    assert!(text.contains("Rust 知识库"));
+    let docs = crate::kb::doc::list("rKb").await.unwrap();
+    assert_eq!(docs.len(), 1);
+    let doc_id = docs[0].id.clone();
+    let upload = std::path::Path::new("data")
+        .join("uploads")
+        .join("rKb")
+        .join(format!("{doc_id}.docx"));
+    assert!(upload.exists(), "原文件必须落盘：{}", upload.display());
+    let q = crate::ai::embedding::embedding("rKb", "Rust 知识库")
+        .await
+        .unwrap()
+        .0;
+    let hits = vector::search("rKb", super::vector::DOC, &q, 8)
+        .await
+        .unwrap();
+    assert!(!hits.is_empty(), "文档向量必须进索引");
+    assert!(
+        hits[0].score > 0.85,
+        "同一段文本命中分数应高于默认阈值：{}",
+        hits[0].score
+    );
+    let payload = doc::chunks_for_vectors(&db.pool, "rKb", &[hits[0].id as i64])
+        .await
+        .unwrap();
+    assert!(
+        payload[0].2.contains("Rust 知识库"),
+        "索引命中的分块应包含原文：{}",
+        payload[0].2
+    );
+
+    // 6.3 意图短语：加一条 → 检测命中（相似度阈值方向）。
+    let intent_id = intent::create(&db.pool, "rKb", "only", &[]).await.unwrap();
+    let (vec, model) = crate::intent::phrase::embed("rKb", "exact phrase")
+        .await
+        .unwrap();
+    intent::add_phrase(&db.pool, "rKb", &intent_id, "exact phrase", vec, &model)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::intent::detector::detect("rKb", "exact phrase")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("only")
+    );
+
+    // 6.4 重建（B-23 / D47）：三个集合各翻到第 1 代，旧代清掉，检索仍然命中。
+    crate::man::reindex::run("rKb").await.unwrap();
+    for collection in super::vector::COLLECTIONS {
+        let st = super::vector::state(&db.pool, "rKb", collection)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{collection} 应该有 state 行"));
+        assert_eq!(st.active_generation, 1, "{collection} 应该翻到第 1 代");
+        assert_eq!(st.pending_generation, None, "{collection} pending 必须清空");
+        assert_eq!(st.status, "idle", "{collection} 状态必须回到 idle");
+        let generations: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT generation FROM vector_items
+              WHERE robot_id = 'rKb' AND collection = $1",
+        )
+        .bind(collection)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(generations, vec![1], "{collection} 旧代向量必须清掉");
+    }
+    // 重建作废了索引缓存；下一次检索要从 PG 重载新代并继续命中。
+    let (found, similarity) = crate::kb::qa::retrieve_answer("rKb", "hello")
+        .await
+        .unwrap();
+    assert!(similarity > 0.99, "重建后同一文本仍应接近 1：{similarity}");
+    assert_eq!(found.expect("重建后仍要命中").answer, "world");
+    assert_eq!(
+        crate::intent::detector::detect("rKb", "exact phrase")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("only")
+    );
+
+    // 本地文件清理（PG 数据随 schema drop 一起消失）。
+    crate::kb::doc::remove_uploads("rKb").await.unwrap();
+
+    db.cleanup().await;
+}
+
+const DOCX_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+/// 内存里拼一个最小 docx（WordprocessingML），供上传路径测试用。
+fn minimal_docx(paragraphs: &[&str]) -> Vec<u8> {
+    use std::io::Write;
+
+    use zip::write::SimpleFileOptions;
+
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut w = zip::ZipWriter::new(&mut cursor);
+        w.start_file("word/document.xml", SimpleFileOptions::default())
+            .unwrap();
+        let mut xml = String::from(
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>",
+        );
+        for p in paragraphs {
+            xml.push_str(&format!("<w:p><w:r><w:t>{p}</w:t></w:r></w:p>"));
+        }
+        xml.push_str("</w:body></w:document>");
+        w.write_all(xml.as_bytes()).unwrap();
+        w.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+// ============================================================ S4 知识库 + 向量
+
+fn chunk(position: i32, text: &str, axis: usize) -> doc::ChunkInput {
+    doc::ChunkInput {
+        position,
+        text: String::from(text),
+        norm: text.to_lowercase(),
+        vec: unit_vec(2, axis),
+    }
+}
+
+fn q(text: &str, is_primary: bool, axis: usize) -> qa::QuestionInput {
+    qa::QuestionInput {
+        question: String::from(text),
+        is_primary,
+        vec: unit_vec(2, axis),
+    }
+}
+
+/// B-21：文档、分块（含 `chunk_text_norm`）与向量在同一个事务里落库；删文档时
+/// 三者一起消失，并带回原文件路径。
+#[tokio::test]
+async fn document_chunks_and_vectors_are_written_in_one_transaction() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rDoc", "doc"))
+        .await
+        .unwrap();
+    let model = test_model();
+    let chunks = vec![chunk(0, "Rust 知识库", 0), chunk(1, "second chunk", 1)];
+    let ids = doc::create(
+        &db.pool,
+        "rDoc",
+        "doc1",
+        &doc::NewDocument {
+            file_name: String::from("a.docx"),
+            file_size: 10,
+            mime_type: Some(String::from(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )),
+            original_path: Some(String::from("uploads/rDoc/doc1.docx")),
+            content_hash: Some(String::from("hash")),
+            doc_content: String::from("Rust 知识库\nsecond chunk"),
+        },
+        &chunks,
+        &model,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids.len(), 2, "每个分块一条向量");
+
+    let rows = doc::list(&db.pool, "rDoc").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "doc1");
+    assert_eq!(rows[0].doc_content, "Rust 知识库\nsecond chunk");
+
+    // chunk_text 保原文、chunk_text_norm 小写（§16.3：原文要进 prompt）。
+    let (orig, norm): (String, String) = sqlx::query_as(
+        "SELECT chunk_text, chunk_text_norm FROM doc_chunks
+          WHERE document_id = 'doc1' ORDER BY position LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(orig, "Rust 知识库", "chunk_text 不能小写化");
+    assert_eq!(norm, "rust 知识库", "chunk_text_norm 是应用层小写化结果");
+
+    // 实体与向量同事务：每个向量行都能找回自己的分块。
+    let orphan: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vector_items v
+          WHERE v.collection = 'doc'
+            AND NOT EXISTS (SELECT 1 FROM doc_chunks c WHERE c.id = v.entity_id)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan, 0, "不能出现有向量无分块");
+
+    // 关键词召回走 chunk_text_norm，大小写无关。仓储收到的已经是 LIKE 模式
+    // （`%kw%` 由 `kb::doc` 负责拼，见 §16.3）。
+    let hits = doc::keyword_recall(&db.pool, "rDoc", &[String::from("%rust%")], 10)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "keyword_recall 应该是子串匹配");
+    assert_eq!(hits[0].chunk_text, "Rust 知识库");
+
+    // 索引 top-k → 回 PG 取载荷：vector id 能映射回分块 id + 原文。
+    let payload = doc::chunks_for_vectors(&db.pool, "rDoc", &[ids[0]])
+        .await
+        .unwrap();
+    assert_eq!(payload.len(), 1);
+    assert_eq!(payload[0].2, "Rust 知识库");
+    let entities = super::vector::entities_with_vector(&db.pool, "rDoc", super::vector::DOC)
+        .await
+        .unwrap();
+    assert_eq!(entities.len(), 2, "two vectors for two chunks");
+    let vectors = super::vector::vector_ids(&db.pool, "rDoc", super::vector::DOC)
+        .await
+        .unwrap();
+    assert_eq!(vectors.len(), 2);
+
+    let path = doc::delete(&db.pool, "rDoc", "doc1").await.unwrap();
+    assert_eq!(path.as_deref(), Some("uploads/rDoc/doc1.docx"));
+    let chunks_left: i64 = sqlx::query_scalar("SELECT count(*) FROM doc_chunks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(chunks_left, 0);
+    let vectors_left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM vector_items WHERE collection = 'doc'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(vectors_left, 0, "删文档不能留下孤儿向量");
+
+    db.cleanup().await;
+}
+
+/// B-21/B-22：问答整体替换时，旧问题与它们的向量一起删、新的一起写。
+#[tokio::test]
+async fn qa_questions_and_vectors_are_replaced_together() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rQa", "qa")).await.unwrap();
+    let model = test_model();
+
+    let (qa_id, vec_ids) = qa::save(
+        &db.pool,
+        "rQa",
+        None,
+        "answer",
+        &[q("hello", true, 0), q("hi", false, 1)],
+        &model,
+    )
+    .await
+    .unwrap()
+    .expect("新建必须成功");
+    assert_eq!(vec_ids.len(), 2);
+    let detail = qa::get(&db.pool, "rQa", &qa_id).await.unwrap().unwrap();
+    assert_eq!(detail.questions.len(), 2);
+    assert!(detail.questions[0].is_primary, "主问题排第一");
+    assert!(!detail.questions[1].is_primary);
+
+    let (vid, found_qa_id) = qa::qa_ids_for_vectors(&db.pool, "rQa", &[vec_ids[0]])
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(vid, vec_ids[0]);
+    assert_eq!(found_qa_id, qa_id);
+
+    // 编辑：整体替换成一条问题，旧的两条问题行与向量行都必须消失。
+    let (same_id, new_vecs) = qa::save(
+        &db.pool,
+        "rQa",
+        Some(&qa_id),
+        "answer2",
+        &[q("hello again", true, 0)],
+        &model,
+    )
+    .await
+    .unwrap()
+    .expect("编辑必须成功");
+    assert_eq!(same_id, qa_id);
+    assert_eq!(new_vecs.len(), 1);
+    let detail = qa::get(&db.pool, "rQa", &qa_id).await.unwrap().unwrap();
+    assert_eq!(detail.answer, "answer2");
+    assert_eq!(detail.questions.len(), 1);
+    let vec_left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM vector_items WHERE collection = 'qa'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(vec_left, 1, "旧问题的向量行必须被同事务删掉");
+
+    assert!(qa::delete(&db.pool, "rQa", &qa_id).await.unwrap());
+    assert!(qa::get(&db.pool, "rQa", &qa_id).await.unwrap().is_none());
+    let vec_left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM vector_items WHERE collection = 'qa'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(vec_left, 0);
+
+    db.cleanup().await;
+}
+
+/// B-23 / D47：重建写进 pending generation，续跑复用同一代，翻转 active 后旧代
+/// 的向量行被清掉；元数据报告读出维度/模型而不扫 BLOB。
+#[tokio::test]
+async fn rebuild_flips_generation_and_drops_the_old_one() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rGen", "gen"))
+        .await
+        .unwrap();
+    let model = test_model();
+    let chunks = vec![chunk(0, "alpha", 0), chunk(1, "beta", 1)];
+    let old_ids = doc::create(
+        &db.pool,
+        "rGen",
+        "doc1",
+        &doc::NewDocument {
+            file_name: String::from("a.docx"),
+            file_size: 1,
+            mime_type: None,
+            original_path: None,
+            content_hash: None,
+            doc_content: String::from("alpha\nbeta"),
+        },
+        &chunks,
+        &model,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        super::vector::state(&db.pool, "rGen", super::vector::DOC)
+            .await
+            .unwrap()
+            .map(|s| s.active_generation),
+        Some(0)
+    );
+
+    let new_model = crate::repo::vector::ModelRef {
+        provider: String::from("test"),
+        model: String::from("m2"),
+        dimension: 2,
+        normalized: false,
+        fingerprint: String::from("v1|test|m2|2"),
+    };
+    let g = super::vector::begin_rebuild(&db.pool, "rGen", super::vector::DOC, &new_model)
+        .await
+        .unwrap();
+    assert_eq!(g, 1, "第一代之后是第二代");
+    // 幂等续跑：重建中再次 begin 必须复用同一代，不能每点一次就 +1。
+    let again = super::vector::begin_rebuild(&db.pool, "rGen", super::vector::DOC, &new_model)
+        .await
+        .unwrap();
+    assert_eq!(again, g);
+
+    // 待办查询按 generation 过滤：还没写过 gen 1 的文档就是待办。
+    let pending = doc::pending_documents(&db.pool, "rGen", g).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    doc::reindex_document(&db.pool, "rGen", "doc1", g, &chunks, &new_model)
+        .await
+        .unwrap();
+    assert!(
+        doc::pending_documents(&db.pool, "rGen", g)
+            .await
+            .unwrap()
+            .is_empty(),
+        "写过 gen 1 之后不再是待办（续跑靠这个跳过）"
+    );
+
+    // 翻转前查询仍然只认 active generation（第 0 代）。文档重建是整篇替换，
+    // 旧分块已删，所以这一代此刻是空的 —— 这是"单篇原子"的已知窗口。
+    let active = super::vector::load_active(&db.pool, "rGen", super::vector::DOC)
+        .await
+        .unwrap();
+    assert!(active.is_empty(), "翻转前 active 还是第 0 代");
+
+    super::vector::finish_rebuild(&db.pool, "rGen", super::vector::DOC, g)
+        .await
+        .unwrap();
+    let st = super::vector::state(&db.pool, "rGen", super::vector::DOC)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(st.active_generation, 1);
+    assert_eq!(st.pending_generation, None);
+    assert_eq!(st.status, "idle");
+
+    let gens: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT generation FROM vector_items
+          WHERE robot_id = 'rGen' AND collection = 'doc'",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(gens, vec![1], "旧 generation 的向量行必须被清掉");
+
+    let stats = super::vector::collection_stats(&db.pool, "rGen", super::vector::DOC)
+        .await
+        .unwrap();
+    assert_eq!(stats.rows, 2);
+    assert_eq!(stats.dims, vec![2], "维度来自 embedding_models，不扫 BLOB");
+    assert_eq!(stats.active_model.as_deref(), Some("v1|test|m2|2"));
+    assert_eq!(stats.status, "idle");
+    let _ = old_ids;
+
+    db.cleanup().await;
+}
+
+/// B-22：换维度但还没重建时，写入点直接拒绝，避免一个 generation 里混两种维度
+/// 把整个索引拖垮（错误文案要能指导用户去重建）。
+#[tokio::test]
+async fn vector_dimension_change_is_rejected_at_write_time() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    robot::upsert(&db.pool, &robot("rDim", "dim"))
+        .await
+        .unwrap();
+    let model = test_model();
+    let mut tx = db.pool.begin().await.unwrap();
+    super::vector::put_many_active(
+        &mut tx,
+        "rDim",
+        super::vector::PHRASE,
+        &model,
+        &[(String::from("p1"), unit_vec(2, 0))],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let model3 = crate::repo::vector::ModelRef {
+        provider: String::from("test"),
+        model: String::from("m3"),
+        dimension: 3,
+        normalized: false,
+        fingerprint: String::from("v1|test|m3|3"),
+    };
+    let mut tx = db.pool.begin().await.unwrap();
+    let e = super::vector::put_many_active(
+        &mut tx,
+        "rDim",
+        super::vector::PHRASE,
+        &model3,
+        &[(String::from("p2"), vec![1.0, 0.0, 0.0])],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        e.message().contains("dimension changed"),
+        "错误要说清楚是维度变了：{}",
+        e.message()
+    );
+    drop(tx);
+
+    // 空集合的报告形状：exists=false（前端据此显示"未建"）。
+    let stats = super::vector::collection_stats(&db.pool, "rDim", super::vector::QA)
+        .await
+        .unwrap();
+    assert_eq!(stats.rows, 0);
+    assert!(stats.dims.is_empty());
+    assert_eq!(stats.status, "idle");
 
     db.cleanup().await;
 }

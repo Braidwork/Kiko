@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 
 use axum::{
     Json,
@@ -23,57 +22,41 @@ pub(crate) async fn upload_doc(
     multipart: Multipart,
 ) -> impl IntoResponse {
     let r = save_doc(&q.robot_id, multipart).await;
-    // if r.is_err() {
-    //     return to_res(r);
-    // }
     to_res(r)
 }
 
 async fn save_doc(robot_id: &str, mut multipart: Multipart) -> Result<String> {
-    let p = Path::new(".")
-        .join("data")
-        .join("uploads");
-    if !p.exists() {
-        std::fs::create_dir_all(&p)?;
-    }
-    loop {
-        let field = multipart.next_field().await?;
-        if field.is_none() {
-            return Err(Error::WithMessage(String::from("File not found.")));
-        }
-        let field = field.unwrap();
-        let Some(file_name) = field.file_name() else {
-            return Err(Error::WithMessage(String::from("File name is missing.")));
-        };
-        let file_name = file_name.to_string();
-        let Some(content_type) = field.content_type() else {
-            return Err(Error::WithMessage(String::from("Content type is missing.")));
-        };
-        let content_type = content_type.to_string();
-        let data = field.bytes().await?;
+    // 只取第一个文件字段（与 A 的行为一致：多文件上传只看第一个）。
+    let Some(field) = multipart.next_field().await? else {
+        return Err(Error::WithMessage(String::from("File not found.")));
+    };
+    let Some(file_name) = field.file_name() else {
+        return Err(Error::WithMessage(String::from("File name is missing.")));
+    };
+    let file_name = file_name.to_string();
+    let Some(content_type) = field.content_type() else {
+        return Err(Error::WithMessage(String::from("Content type is missing.")));
+    };
+    let content_type = content_type.to_string();
+    let data = field.bytes().await?;
 
-        log::info!(
-            "Length of `{file_name}`: `{content_type}` is {} bytes",
-            data.len()
-        );
+    log::info!(
+        "Length of `{file_name}`: `{content_type}` is {} bytes",
+        data.len()
+    );
 
-        let text = match content_type.as_str() {
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
-                doc::parse_docx(data.to_vec())?
-            }
-            _ => return Err(Error::WithMessage(String::from("Unsupported format"))),
-        };
-        log::info!("Extract text: {text}");
-        super::doc::save(robot_id, &file_name, data.len(), &text).await?;
-        return Ok(text);
-    }
+    // 正文解析、分块、推理、落库、原文件保存都在 `kb::doc::save` 里；这里只
+    // 负责把 multipart 拆开。返回值仍是抽取出的正文（与 A 的接口一致）。
+    let text = doc::save(robot_id, &file_name, &content_type, &data).await?;
+    log::info!("Extract text: {text}");
+    Ok(text)
 }
 
 pub(crate) async fn update_doc(
     Query(q): Query<RobotQuery>,
     Json(doc): Json<DocData>,
 ) -> impl IntoResponse {
-    let r = super::doc::update(&q.robot_id, doc.id, &doc.doc_content).await;
+    let r = super::doc::update(&q.robot_id, &doc.id, &doc.doc_content).await;
     to_res(r)
 }
 
@@ -82,7 +65,7 @@ pub(crate) async fn delete_doc(
     Query(q): Query<RobotQuery>,
     Json(doc): Json<DocData>,
 ) -> impl IntoResponse {
-    let r = super::doc::delete(&q.robot_id, doc.id).await;
+    let r = super::doc::delete(&q.robot_id, &doc.id).await;
     to_res(r)
 }
 

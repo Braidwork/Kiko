@@ -125,10 +125,11 @@ async fn add_intent(robot_id: &str, intent_name: &str) -> Result<String> {
 
 pub(crate) async fn remove(Json(params): Json<IntentFormData>) -> impl IntoResponse {
     let r: Result<()> = async {
-        // 短语向量在 turso，先清（幂等），再删 PG 行；PG 级联掉关键词/正则/短语。
-        // 两步之间失败只会留下可由重建补齐的孤儿向量，不会留下「意图还在但向量没了」。
-        super::phrase::remove_by_intent_id(&params.robot_id, params.id.as_str()).await?;
+        // 载荷与短语向量在同一个 PG 事务里删（repo::intent::delete 负责），
+        // 内存索引里这个机器人的短语缓存整份作废即可：删意图不常见，重载比
+        // "先查出所有 vector id 再逐个删"更不容易漏。
         repo::intent::delete(repo::pool(), &params.robot_id, params.id.as_str()).await?;
+        crate::vector::invalidate(&params.robot_id, repo::vector::PHRASE);
         Ok(())
     }
     .await;
@@ -207,82 +208,60 @@ pub(crate) async fn remove_regex(Json(params): Json<IntentFormData>) -> impl Int
     to_res(r)
 }
 
-/// 加一条短语：先算向量写 turso，再落 PG 载荷。返回新短语的 id。
+/// 加一条短语：先算向量（事务外），再把载荷与向量写给仓储（同事务）。返回新短语 id。
 #[axum::debug_handler]
 pub(crate) async fn add_phrase(Json(params): Json<IntentFormData>) -> impl IntoResponse {
     let r: Result<Option<String>> = async {
         let intent_id = params.id.as_str();
         let phrase = params.data.as_str();
-        let Some(meta) = repo::intent::get_meta(repo::pool(), &params.robot_id, intent_id).await?
-        else {
-            return Err(Error::WithMessage(String::from(
-                "Can NOT find intention detail",
-            )));
-        };
-        let vec_row_id = super::phrase::add(&params.robot_id, intent_id, &meta.name, phrase)
+        let (vec, model) = super::phrase::embed(&params.robot_id, phrase)
             .await
             .map_err(|e| {
                 log::error!("{:#?}", e);
                 Error::WithMessage(String::from("Invalid idx parameter."))
             })?;
-
-        match repo::intent::add_phrase(
+        let Some((id, vector_id)) = repo::intent::add_phrase(
             repo::pool(),
             &params.robot_id,
             intent_id,
             phrase,
-            vec_row_id,
+            vec.clone(),
+            &model,
         )
-        .await
-        {
-            Ok(Some(id)) => Ok(Some(id)),
-            Ok(None) => {
-                // 意图在算向量期间被删掉了：回滚刚写的向量行，避免留下孤儿。
-                if let Err(e) = super::phrase::remove(&params.robot_id, vec_row_id).await {
-                    log::warn!("Removing orphan phrase vector failed: {e:?}");
-                }
-                Err(Error::WithMessage(String::from(
-                    "Can NOT find intention detail",
-                )))
-            }
-            Err(e) => {
-                if let Err(e2) = super::phrase::remove(&params.robot_id, vec_row_id).await {
-                    log::warn!("Removing orphan phrase vector failed: {e2:?}");
-                }
-                Err(e)
-            }
+        .await?
+        else {
+            return Err(Error::WithMessage(String::from(
+                "Can NOT find intention detail",
+            )));
+        };
+        crate::vector::upsert(
+            &params.robot_id,
+            repo::vector::PHRASE,
+            &[(vector_id as u64, vec)],
+        );
+        if let Err(e) = crate::man::settings::stamp_embedding_index(&params.robot_id).await {
+            log::warn!("Stamping embedding index failed: {e:?}");
         }
+        Ok(Some(id))
     }
     .await;
     to_res(r)
 }
 
-/// 按 id 删除短语：先删向量行，再删 PG 行。
+/// 按 id 删除短语：载荷与向量在同一个事务里删（repo::intent::delete_phrase）。
 ///
-/// 顺序是有意的：turso 删失败就整体失败、PG 行还在，重试即可；PG 删失败最多留下
-/// 一条指向已不存在向量的载荷，下一次「重建」会把它连向量一起补回来。
+/// 返回被删的 `vector_items.id` 用来同步内存索引，避免整份短语缓存作废。
 pub(crate) async fn remove_phrase(Json(params): Json<IntentFormData>) -> impl IntoResponse {
     let r: Result<()> = async {
-        let Some(p) = repo::intent::get_phrase(
-            repo::pool(),
-            &params.robot_id,
-            params.id.as_str(),
-            params.data.as_str(),
-        )
-        .await?
-        else {
-            return Ok(());
-        };
-        if let Some(vec_row_id) = p.vec_row_id {
-            super::phrase::remove(&params.robot_id, vec_row_id).await?;
-        }
-        repo::intent::delete_phrase(
+        let ids = repo::intent::delete_phrase(
             repo::pool(),
             &params.robot_id,
             params.id.as_str(),
             params.data.as_str(),
         )
         .await?;
+        let ids: Vec<u64> = ids.into_iter().map(|i| i as u64).collect();
+        crate::vector::delete(&params.robot_id, repo::vector::PHRASE, &ids);
         Ok(())
     }
     .await;
@@ -295,26 +274,38 @@ pub(crate) async fn detect(Json(params): Json<IntentFormData>) -> impl IntoRespo
 
 /// 给一个意图的**全部**短语重算向量（模型/维度变了之后用）。
 ///
-/// 按 `vec_row_id` 原地更新，不删表：这些短语的载荷现在在 PG，删 turso 表后
-/// 旧实现用 `UPDATE … WHERE id = ?` 会一行都更新不到（见 §18）。
+/// 短语 id 不变，所以 `put_phrase_vectors` 是覆盖同一批 `vector_items` 行
+/// （`ON CONFLICT (collection, entity_id, generation) DO UPDATE`），内存索引可以
+/// 原地更新。
 pub(crate) async fn regenerate_embeddings(
     Query(params): Query<IntentFormData>,
 ) -> impl IntoResponse {
     let intent_id = params.id.as_str();
     let r: Result<()> = async {
-        let Some(meta) = repo::intent::get_meta(repo::pool(), &params.robot_id, intent_id).await?
-        else {
-            return Err(Error::WithMessage(String::from(
-                "Can NOT find intention detail",
-            )));
-        };
-        let phrases: Vec<(i64, String)> =
-            repo::intent::list_phrase_vectors(repo::pool(), &params.robot_id, intent_id)
-                .await?
-                .into_iter()
-                .filter_map(|p| p.vec_row_id.map(|id| (id, p.phrase)))
-                .collect();
-        super::phrase::update_vectors(&params.robot_id, intent_id, &meta.name, &phrases).await
+        let phrases = repo::intent::list_phrases(repo::pool(), &params.robot_id, intent_id).await?;
+        if phrases.is_empty() {
+            return Ok(());
+        }
+        let mut items: Vec<(String, Vec<f32>)> = Vec::with_capacity(phrases.len());
+        let mut model = None;
+        for p in phrases.iter() {
+            let (vec, m) = super::phrase::embed(&params.robot_id, &p.phrase).await?;
+            model = Some(m);
+            items.push((p.id.clone(), vec));
+        }
+        let model = model.expect("phrases is not empty");
+        let ids = repo::intent::put_phrase_vectors(repo::pool(), &params.robot_id, &items, &model)
+            .await?;
+        let rows: Vec<(u64, Vec<f32>)> = ids
+            .into_iter()
+            .zip(items)
+            .map(|(id, (_, vec))| (id as u64, vec))
+            .collect();
+        crate::vector::upsert(&params.robot_id, repo::vector::PHRASE, &rows);
+        if let Err(e) = crate::man::settings::stamp_embedding_index(&params.robot_id).await {
+            log::warn!("Stamping embedding index failed: {e:?}");
+        }
+        Ok(())
     }
     .await;
     to_res(r)

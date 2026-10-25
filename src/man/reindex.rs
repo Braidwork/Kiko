@@ -1,28 +1,32 @@
-//! 重建向量索引：把**库里已有的载荷**重新算一遍向量，并在过程中报进度。
+//! 重建向量索引（B-23 / D47）：拿库里已有的载荷重算向量，用 **generation** 切换。
 //!
-//! 为什么必须有它：向量不是自描述的。换了 embedding 模型或改了维度之后，库里那些
-//! 旧向量就再也不能用了 —— 两个模型的向量空间毫不相干（检索**不报错**，只是给出
-//! 噪声），维度不同的话 `vector_distance_cos` 会让整条查询直接失败。唯一的修法就是
-//! 拿原文重算一遍。载荷都还在，所以**不需要重新上传任何东西**：
+//! 为什么必须有它：向量不是自描述的。换了 embedding 模型或维度之后，旧向量要么
+//! 是噪声（检索不报错、只是全错），要么维度不一致让相似度计算直接失败。拿原文
+//! 重算一遍是唯一修法，而原文全在 PG：
 //!
-//! | 表 | 载荷 | 重建入口 |
+//! | 集合 | 载荷 | 重建单位 |
 //! | --- | --- | --- |
-//! | 意图短语 `phrase.dat` | PG `intent_phrases.phrase` | [`crate::intent::phrase::reindex`] |
-//! | 问答 `qa.dat` | `{robot_id}.qa_data` 里的主问题 + 相似问题 | [`crate::kb::qa::reindex`] |
-//! | 文档 `doc.dat` | `{robot_id}.doc_content` | [`crate::kb::doc::reindex`] |
+//! | `phrase` | `intent_phrases.phrase` | 一条短语 |
+//! | `qa` | `qa_questions.question` | 一个问题 |
+//! | `doc` | `documents.doc_content` → 重新分块 | 一篇文档（整篇原子） |
 //!
-//! ## 为什么是后台任务 + 轮询
+//! ## generation 切换（B-23）
 //!
-//! 一份长文档就是几百个 chunk，每个都要一次推理/一次远端调用。放在请求里同步做，
-//! 前端只能一直转圈，而且中途断网就没人知道做到哪了。这里沿用设置页那套
-//! [`crate::man::settings::model_load_progress`] 的形状：`POST` 立刻返回，进度写进
-//! [`REINDEX_STATUS`]，前端每秒轮询。
+//! 重建先 `begin_rebuild` 拿到 `pending_generation`，把新向量写进那一代；全部完成后
+//! `finish_rebuild` 才翻转 `active_generation` 并删掉旧代。查询只认 active，所以
+//! 重建期间用户仍然命中旧向量（不会一半新一半旧地参与排序）。
 //!
-//! ## 重建期间库里是**混合**的
+//! ## 幂等续跑（D47，不建 jobs 表）
 //!
-//! 逐条重写没有全局原子性：重建过程的中途，表里同时存在新向量和旧向量。此时检索
-//! 要么报错（维度不同）要么给出噪声。这是"宁可短暂不可用，也不要一直不可用"的取舍；
-//! 前端在重建期间应当明确告知用户先不要用知识库。
+//! 待办 = 该集合里"还没有 pending generation 向量"的实体，由各仓储的
+//! `pending_*` 查询给出。重建失败后 status = `failed`，但 pending generation
+//! 保留；再点一次重建会**复用同一代**，已经写过的实体被跳过，不用从头再推理一遍。
+//!
+//! ## 进度
+//!
+//! 沿用设置页那套 `model_load_progress` 的形状：`POST` 立刻返回，进度写进
+//! [`REINDEX_STATUS`]，前端每秒轮询。`before` / `after` 是 active / pending 两代的
+//! 行数，不是"扫了多少 BLOB"。
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -31,19 +35,18 @@ use axum::extract::Query;
 use axum::response::IntoResponse;
 use serde::Serialize;
 
-use crate::intent::dto::IntentDetail;
-use crate::kb::{doc, qa};
+use crate::ai::embedding;
 use crate::man::settings;
 use crate::repo;
+use crate::repo::vector::{self as vrepo, ModelRef};
 use crate::result::{Error, Result};
 use crate::robot::dto::RobotQuery;
+use crate::vector;
 use crate::web::server::to_res;
 
-/// 重建进行到哪一类数据。
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ReindexPhase {
-    /// 还没开始（`start` 刚记录状态，后台任务还没跑起来）。
     Starting,
     Intents,
     Qa,
@@ -65,13 +68,13 @@ impl ReindexPhase {
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SourceProgress {
-    /// 已经重建完的条数（意图是"短语条数"，问答是"问答对条数"，文档是"chunk 数"）。
+    /// 已经重建完的条数（意图/问答是"条"，文档是"篇"）。
     pub(crate) done: usize,
-    /// 打算重建的总条数。开跑前是 0，所以界面要能显示"统计中"。
+    /// 这一轮要重建的总条数。开跑前是 0，界面显示"统计中"。
     pub(crate) total: usize,
-    /// 这一类**已经有**的向量行数（重建前统计一次，用来展示"从 N 条变成 M 条"）。
+    /// 重建前 active generation 的行数。
     pub(crate) before: usize,
-    /// 重建后实际的向量行数。
+    /// 重建后 pending generation 的行数。
     pub(crate) after: usize,
 }
 
@@ -84,8 +87,6 @@ impl SourceProgress {
     }
 }
 
-/// 一次重建的完整状态。没有记录过的机器人返回 `Default`（`phase = Idle` 那种），
-/// 所以前端不必区分"没跑过"和"刚跑完"——这一点和 `model_load_progress` 一致。
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ReindexStatus {
@@ -93,9 +94,7 @@ pub(crate) struct ReindexStatus {
     pub(crate) intents: SourceProgress,
     pub(crate) qa: SourceProgress,
     pub(crate) docs: SourceProgress,
-    /// 失败原因，原样给前端弹出来（哪个阶段、为什么）。成功时为空串。
     pub(crate) err: String,
-    /// 开始时间（unix 秒），方便界面显示"已经跑了多久"。
     pub(crate) started_at: u64,
     pub(crate) finished_at: u64,
 }
@@ -109,7 +108,6 @@ impl ReindexStatus {
 static REINDEX_STATUS: LazyLock<Mutex<HashMap<String, ReindexStatus>>> =
     LazyLock::new(|| Mutex::new(HashMap::with_capacity(8)));
 
-/// 读一份状态（加锁失败就当没有）。
 fn status_of(robot_id: &str) -> ReindexStatus {
     REINDEX_STATUS
         .lock()
@@ -118,7 +116,6 @@ fn status_of(robot_id: &str) -> ReindexStatus {
         .unwrap_or_default()
 }
 
-/// 改一份状态；每处改动都要连带置 `phase`，否则前端会卡在上一阶段。
 fn update_status<F: FnOnce(&mut ReindexStatus)>(robot_id: &str, f: F) {
     if let Ok(mut m) = REINDEX_STATUS.lock() {
         let s = m.entry(String::from(robot_id)).or_default();
@@ -133,85 +130,146 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 数一张表有多少行；表不存在（还没写过这一类数据）返回 0。
-async fn count_rows(file: &str, table: &str) -> usize {
-    crate::man::vector_report::count_rows(file, table)
-        .await
-        .unwrap_or(0)
-}
-
 /// 真正干活的那段。**必须在后台任务里跑**（[`start`] 负责 spawn）。
-async fn run(robot_id: &str) -> Result<()> {
-    // 0. 先确认当前配置真的能算向量。一个空机器人（三类数据都没有）此前会"成功地
-    //    什么都没做"，用户完全看不出模型是坏的；这里用一句话换来确定性。
-    crate::ai::embedding::embedding(robot_id, "reindex probe").await?;
-
-    // 1. 意图短语。
-    //
-    //    先**清空整张短语向量表**再重建：重建只负责"给现存的数据写新向量"，不会
-    //    删掉已经不存在的短语留下的孤儿行。孤儿行的维度和新配置不一致，会让
-    //    `vector_distance_cos` 在扫到它时报错——那正是我们要修的问题，所以必须连
-    //    它们一起清掉。短语表只有向量列（载荷在 PG `intent_phrases`），可以整表重建。
-    //
-    //    总数要先把所有意图的短语加起来，否则界面上的进度条没有分母。
-    //    载荷在 PG（S3.3），重建时逐条插入新的 turso 向量行并把新行号写回
-    //    `intent_phrases.vec_row_id`。
-    let intents: Vec<IntentDetail> = repo::intent::list(repo::pool(), robot_id).await?;
-    let total_phrases: usize = intents.iter().map(|d| d.phrases.len()).sum();
-    let before_intents = count_rows("phrase.dat", robot_id).await;
-    update_status(robot_id, |s| {
-        s.phase = Some(ReindexPhase::Intents);
-        s.intents.begin(total_phrases, before_intents);
-    });
-    crate::intent::phrase::remove_tables(robot_id).await?;
-    crate::intent::phrase::reindex(repo::pool(), robot_id, &intents).await?;
-    update_status(robot_id, |s| s.intents.done = total_phrases);
-    let after_intents = count_rows("phrase.dat", robot_id).await;
-    update_status(robot_id, |s| s.intents.after = after_intents);
-
-    // 2. 问答。同理先清空 `{robot_id}_vec`：一次 `qa::save` 会重算主问题 + 全部
-    //    相似问题，并把 `qa_data` 里的 `vec_row_id` 刷成新行号，但删掉过的问答对
-    //    留下的孤儿向量它管不到。**只删 `_vec`**，主表（`qa_data`）是载荷，不能动。
-    let pairs = qa::list(robot_id).await?;
-    let before_qa = count_rows("qa.dat", &format!("{robot_id}_vec")).await;
-    update_status(robot_id, |s| {
-        s.phase = Some(ReindexPhase::Qa);
-        s.qa.begin(pairs.len(), before_qa);
-    });
-    qa::remove_vector_table(robot_id).await?;
-    for p in pairs {
-        qa::save(robot_id, p).await?;
-        update_status(robot_id, |s| s.qa.done += 1);
+///
+/// `pub(crate)` 是为了让端到端测试能同步调用它（`start` 只负责 spawn + 状态）。
+pub(crate) async fn run(robot_id: &str) -> Result<()> {
+    // 0. 先确认当前配置真的能算向量，并用它的**实际维度**建模型定义。一个空机器人
+    //    此前会"成功地什么都没做"，用户完全看不出模型是坏的。
+    let probe = embedding::embedding(robot_id, "reindex probe").await?;
+    if probe.0.is_empty() {
+        return Err(Error::WithMessage(String::from("Embedding data is empty.")));
     }
-    let after_qa = count_rows("qa.dat", &format!("{robot_id}_vec")).await;
-    update_status(robot_id, |s| s.qa.after = after_qa);
+    let model = vector::current_model(robot_id, probe.0.len()).await?;
 
-    // 3. 文档。按"文档"计数（不是按 chunk），`doc::reindex` 内部会把该文档的分块
-    //    全部重算并在同一个事务里替换。
-    let docs = doc::list(robot_id).await?;
-    let before_docs = count_rows("doc.dat", &format!("{robot_id}_vec")).await;
-    update_status(robot_id, |s| {
-        s.phase = Some(ReindexPhase::Docs);
-        s.docs.begin(docs.len(), before_docs);
-    });
-    for d in docs.iter() {
-        doc::reindex(robot_id, d.id).await?;
-        update_status(robot_id, |s| s.docs.done += 1);
-    }
-    let after_docs = count_rows("doc.dat", &format!("{robot_id}_vec")).await;
-    update_status(robot_id, |s| s.docs.after = after_docs);
+    rebuild_phrases(robot_id, &model).await?;
+    rebuild_qa(robot_id, &model).await?;
+    rebuild_docs(robot_id, &model).await?;
 
     // 4. 定稿：从现在起库里那份索引就是当前配置算的了（设置页的"模型/维度变了"
-    //    警告靠这个标记来消）。放在**全部成功之后**——中途失败时标不能被改，
-    //    否则用户会以为已经修好了。
+    //    警告靠这个标记来消）。放在**全部成功之后** —— 中途失败时标不能被改。
     settings::stamp_embedding_index(robot_id).await?;
     Ok(())
 }
 
+async fn rebuild_phrases(robot_id: &str, model: &ModelRef) -> Result<()> {
+    let generation = vrepo::begin_rebuild(repo::pool(), robot_id, vrepo::PHRASE, model).await?;
+    let r = async {
+        let total = repo::intent::count_phrases(repo::pool(), robot_id).await? as usize;
+        let before = vrepo::count_active(repo::pool(), robot_id, vrepo::PHRASE).await? as usize;
+        update_status(robot_id, |s| {
+            s.phase = Some(ReindexPhase::Intents);
+            s.intents.begin(total, before);
+        });
+        let pending = repo::intent::pending_phrases(repo::pool(), robot_id, generation).await?;
+        for p in pending {
+            let (vec, _) = crate::intent::phrase::embed(robot_id, &p.phrase).await?;
+            repo::intent::put_phrase_vector(repo::pool(), robot_id, &p.id, generation, vec, model)
+                .await?;
+            update_status(robot_id, |s| s.intents.done += 1);
+        }
+        let after = vrepo::count_generation(repo::pool(), robot_id, vrepo::PHRASE, generation)
+            .await? as usize;
+        update_status(robot_id, |s| {
+            s.intents.after = after;
+            // 续跑时 done 只数了本轮补的；收尾时对齐 total，界面才不会停在 3/10。
+            s.intents.done = total;
+        });
+        Ok::<(), Error>(())
+    }
+    .await;
+    finish_or_fail(robot_id, vrepo::PHRASE, generation, r).await
+}
+
+async fn rebuild_qa(robot_id: &str, model: &ModelRef) -> Result<()> {
+    let generation = vrepo::begin_rebuild(repo::pool(), robot_id, vrepo::QA, model).await?;
+    let r = async {
+        let total = repo::qa::count_questions(repo::pool(), robot_id).await? as usize;
+        let before = vrepo::count_active(repo::pool(), robot_id, vrepo::QA).await? as usize;
+        update_status(robot_id, |s| {
+            s.phase = Some(ReindexPhase::Qa);
+            s.qa.begin(total, before);
+        });
+        let pending = repo::qa::pending_questions(repo::pool(), robot_id, generation).await?;
+        for (question_id, question) in pending {
+            let e = embedding::embedding(robot_id, &question).await?;
+            repo::qa::put_question_vector(
+                repo::pool(),
+                robot_id,
+                &question_id,
+                generation,
+                e.0,
+                model,
+            )
+            .await?;
+            update_status(robot_id, |s| s.qa.done += 1);
+        }
+        let after =
+            vrepo::count_generation(repo::pool(), robot_id, vrepo::QA, generation).await? as usize;
+        update_status(robot_id, |s| {
+            s.qa.after = after;
+            s.qa.done = total;
+        });
+        Ok::<(), Error>(())
+    }
+    .await;
+    finish_or_fail(robot_id, vrepo::QA, generation, r).await
+}
+
+async fn rebuild_docs(robot_id: &str, model: &ModelRef) -> Result<()> {
+    let generation = vrepo::begin_rebuild(repo::pool(), robot_id, vrepo::DOC, model).await?;
+    let r = async {
+        let total = repo::doc::count_chunked_documents(repo::pool(), robot_id).await? as usize;
+        let before = vrepo::count_active(repo::pool(), robot_id, vrepo::DOC).await? as usize;
+        update_status(robot_id, |s| {
+            s.phase = Some(ReindexPhase::Docs);
+            s.docs.begin(total, before);
+        });
+        let pending = repo::doc::pending_documents(repo::pool(), robot_id, generation).await?;
+        for d in pending {
+            // 每篇文档一个事务：分块（可能换切法）+ 新代向量整篇替换。失败时这篇
+            // 保持旧状态，下一轮续跑会重新看到它。
+            crate::kb::doc::reindex_at(robot_id, &d.id, generation).await?;
+            update_status(robot_id, |s| s.docs.done += 1);
+        }
+        let after =
+            vrepo::count_generation(repo::pool(), robot_id, vrepo::DOC, generation).await? as usize;
+        update_status(robot_id, |s| {
+            s.docs.after = after;
+            s.docs.done = total;
+        });
+        Ok::<(), Error>(())
+    }
+    .await;
+    finish_or_fail(robot_id, vrepo::DOC, generation, r).await
+}
+
+/// 成功就翻转 active 并作废内存索引；失败就标 failed（保留 pending 供续跑）。
+async fn finish_or_fail(
+    robot_id: &str,
+    collection: &str,
+    generation: i64,
+    r: Result<()>,
+) -> Result<()> {
+    match r {
+        Ok(()) => {
+            vrepo::finish_rebuild(repo::pool(), robot_id, collection, generation).await?;
+            // 查询只认 active generation，翻转之后必须丢掉旧缓存。
+            vector::invalidate(robot_id, collection);
+            Ok(())
+        }
+        Err(e) => {
+            if let Err(e2) =
+                vrepo::fail_rebuild(repo::pool(), robot_id, collection, generation).await
+            {
+                log::warn!("Marking rebuild of {robot_id}/{collection} failed: {e2}");
+            }
+            Err(e)
+        }
+    }
+}
+
 /// `POST /management/settings/embedding/reindex`：开始重建，立刻返回。
-///
-/// 同一个机器人同时只允许一个重建任务：两个任务并发会同时重写同一批行，除了浪费
-/// 推理什么都不多得到。
 pub(crate) async fn start(Query(q): Query<RobotQuery>) -> impl IntoResponse {
     let robot_id = q.robot_id;
     if status_of(&robot_id).running() {
@@ -290,8 +348,6 @@ pub(crate) fn clear_status(robot_id: &str) {
 mod tests {
     use super::*;
 
-    /// 状态机的关键性质：只有"跑到一半"的四个阶段算运行中，`Done` / `Failed` /
-    /// 没记录过都不算——否则重建失败之后用户再也点不动那个按钮。
     #[test]
     fn only_in_flight_phases_count_as_running() {
         for p in [
@@ -308,8 +364,6 @@ mod tests {
         assert!(!ReindexStatus::default().running(), "没记录过 = 不在跑");
     }
 
-    /// `SourceProgress::begin` 要能把上一轮跑剩的计数清干净：同一个机器人重建两次，
-    /// 第二次的 `done` 不能从第一次的数字接着涨。
     #[test]
     fn begin_resets_leftover_counters() {
         let mut p = SourceProgress {
@@ -325,7 +379,6 @@ mod tests {
         assert_eq!(p.after, 0, "after 要等本轮跑完才填");
     }
 
-    /// 默认状态是"没跑过"，前端不必区分"没跑过"和"刚跑完"。
     #[test]
     fn a_robot_without_a_record_reports_a_default_status() {
         clear_status("no-such-robot-in-this-test");

@@ -68,15 +68,16 @@ pub(crate) async fn detect(robot_id: &str, s: &str) -> Result<Option<String>> {
     // log::info!("detect embedding {}", regex.replace_all(&s, ""));
     // let now = std::time::Instant::now();
     let search_vector: Vec<f32> = embedding.0;
-    let similarity_threshold = embedding.1 as f64;
-    let mut result = phrase::search(robot_id, &search_vector).await?;
-    // log::info!("Searching vector took {:?}", now.elapsed());
-    if let Some(record) = result.first_mut()
-        && (1f64 - record.1) >= similarity_threshold
+    let similarity_threshold = embedding.1;
+    let result = phrase::search(robot_id, &search_vector).await?;
+    // D41 / B-31：短语检索返回的是**相似度**（越大越近），阈值也是相似度阈值。
+    // A 这里写的是 `1.0 - distance >= threshold`，数学上等价，但把方向写在了调用点，
+    // 和 QA / 文档那两处 `distance <= recall_distance` 正好相反；统一后三处都用
+    // `vector::is_hit`。
+    if let Some((name, similarity)) = result.first()
+        && crate::vector::is_hit(*similarity, similarity_threshold)
     {
-        // log::info!("Record distance: {}", record.1);
-        let s = std::mem::take(&mut record.0);
-        return Ok(Some(s));
+        return Ok(Some(name.clone()));
     }
     Ok(None)
 }

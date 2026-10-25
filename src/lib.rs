@@ -15,4 +15,5 @@ pub(crate) mod security;
 // #[cfg(test)]
 // pub mod test;
 pub(crate) mod variable;
+pub(crate) mod vector;
 pub mod web;

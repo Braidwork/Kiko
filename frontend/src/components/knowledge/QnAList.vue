@@ -26,8 +26,8 @@ const listQa = async () => {
 onMounted(() => {
     listQa();
 })
-// Deep-clone the row into the form, so editing never mutates tableData directly
-// (also preserves question/similarQuestions vec_row_id without stale leftovers)
+// Deep-clone the row into the form, so editing never mutates tableData directly.
+// `id` 是 `qa.id`（scru128 字符串）；向量行号不再出现在契约里（B-30）。
 const resetForm = (d) => {
     qaData.id = d ? d.id : null;
     qaData.question = d ? cloneObj(d.question) : { question: '' };

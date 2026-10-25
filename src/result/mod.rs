@@ -10,11 +10,6 @@ pub(crate) enum Error {
     Pg(Box<sqlx::Error>),
     /// schema 迁移失败（启动路径，D33 fail-fast）。
     Migrate(Box<sqlx::migrate::MigrateError>),
-    /// turso 的写锁争用（`Busy` / `BusySnapshot`）。
-    ///
-    /// 从 `turso::Error` 里单独拆出来，是因为它可恢复 —— 调用方可以退避后重试。
-    /// 把它和别的 turso 错误一起压进 `WithMessage` 就失去了这个能力。
-    DbBusy(String),
     Serde(Box<serde_json::Error>),
     TimeFormat(Box<time::error::Format>),
     WithMessage(String),
@@ -45,7 +40,6 @@ impl Error {
                 _ => format!("Database error: {e}"),
             },
             Self::Migrate(e) => format!("Migration error: {e}"),
-            Self::DbBusy(s) => format!("Database is busy: {s}"),
             Self::Serde(e) => format!("{e:?}"),
             Self::TimeFormat(e) => format!("{e:?}"),
             Self::WithMessage(s) => String::from(s),
@@ -217,53 +211,8 @@ impl From<quick_xml::encoding::EncodingError> for Error {
     }
 }
 
-impl From<turso::Error> for Error {
-    fn from(err: turso::Error) -> Self {
-        // 写锁争用是可恢复的，单独成一个变体，好让调用方能退避重试。
-        // 其余 turso 错误仍按原样字符串化，保持既有行为。
-        match err {
-            turso::Error::Busy(s) | turso::Error::BusySnapshot(s) => Error::DbBusy(s),
-            e => Error::WithMessage(format!("turso Error failed: {e:?}")),
-        }
-    }
-}
-
-/// 给写操作套一层 `Busy` 退避重试。
-///
-/// `busy_timeout`（见 `kb/qa.rs` 的 `conn()`）已经把绝大多数写锁争用变成"排队
-/// 等待"，这里是安全网 —— 覆盖超时之后仍然漏出来的 `Busy`：跨进程竞争、别的
-/// 写者拿着锁做长事务（比如把模型推理放在事务里）等等。
-///
-/// 传进来的表达式必须满足两个条件，否则重试会损坏数据：
-///
-/// 1. **每次求值都从头开始** —— 传一个 `async { ... }` 块，不要把状态留在块外。
-/// 2. **可重入** —— 第一次尝试失败后不能留下半提交的状态，也不能就地改写入参后
-///    在下一次尝试里读到它。就地改写入参的函数（编辑前的 `qa::save` 就是）必须
-///    先自己把状态收敛好再套这个宏，
-///
-/// 参考：`qa::save` 用"每轮在副本上改、commit 成功才落回入参"来满足第 2 条；
-/// `doc::save` 用"把 INSERT 收进事务"来满足它。
-#[macro_export]
-macro_rules! retry_on_busy {
-    ($e: expr) => {{
-        const MAX_RETRIES: u32 = 3;
-        let mut retries: u32 = 0;
-        loop {
-            match $e.await {
-                Err($crate::result::Error::DbBusy(m)) if retries < MAX_RETRIES => {
-                    // 100ms / 200ms / 400ms。重试次数很少，加抖动没有意义。
-                    let backoff = std::time::Duration::from_millis(100u64 << retries);
-                    retries += 1;
-                    log::warn!(
-                        "Database is busy ({m}), retrying in {backoff:?} (retry {retries}/{MAX_RETRIES})"
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
-                r => break r,
-            }
-        }
-    }};
-}
+// turso 已随 S4 一起移除：写锁争用（`Busy` / `BusySnapshot`）与 `retry_on_busy!`
+// 的重试语义都不再需要 —— PostgreSQL 的并发由事务与行锁处理，失败直接返回。
 
 // impl From<cxx::Exception> for Error {
 //     fn from(err: cxx::Exception) -> Self {
@@ -274,47 +223,15 @@ macro_rules! retry_on_busy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    #[tokio::test]
-    async fn retry_on_busy_retries_transient_busy() {
-        let n = AtomicU32::new(0);
-        let r: Result<u32> = retry_on_busy!(async {
-            let i = n.fetch_add(1, Ordering::SeqCst);
-            if i < 2 {
-                Err(Error::DbBusy(String::from("busy")))
-            } else {
-                Ok(i)
-            }
-        });
-        // 第三次尝试才成功，且每次尝试都从头开始求值。
-        assert!(matches!(r, Ok(2)), "unexpected result: {r:?}");
-        assert_eq!(n.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn retry_on_busy_gives_up_after_max_retries() {
-        let n = AtomicU32::new(0);
-        let r: Result<u32> = retry_on_busy!(async {
-            n.fetch_add(1, Ordering::SeqCst);
-            Err(Error::DbBusy(String::from("busy")))
-        });
-        assert!(matches!(r, Err(Error::DbBusy(_))), "unexpected result: {r:?}");
-        // 首次 + MAX_RETRIES 次重试；超时后不再无限重试，把 Busy 交回调用方。
-        assert_eq!(n.load(Ordering::SeqCst), 4);
-    }
-
-    #[tokio::test]
-    async fn retry_on_busy_leaves_other_errors_alone() {
-        let n = AtomicU32::new(0);
-        let r: Result<u32> = retry_on_busy!(async {
-            n.fetch_add(1, Ordering::SeqCst);
-            Err(Error::WithMessage(String::from("boom")))
-        });
-        assert!(
-            matches!(r, Err(Error::WithMessage(_))),
-            "unexpected result: {r:?}"
-        );
-        assert_eq!(n.load(Ordering::SeqCst), 1);
+    /// PG 错误映射（B-08）仍然按类别给可读的一句话：唯一约束 / 外键冲突不能把
+    /// `error returned from database: …` 这种原文丢给用户。
+    #[test]
+    fn error_message_is_human_readable() {
+        let e = Error::WithMessage(String::from("boom"));
+        assert_eq!(e.message(), "boom");
+        assert_eq!(format!("{e}"), "boom");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["message"], "boom");
     }
 }
