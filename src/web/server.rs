@@ -87,8 +87,14 @@ pub async fn start_app() {
 
     // 知识库与向量的存储全部在 PG（S4）；进程内索引按 `(robot, collection)` 懒加载，
     // 启动时不需要初始化任何嵌入式数据库。
+    log::info!(
+        "Vector index budget: {} MB; reconciliation every {} s (0 = disabled)",
+        crate::config::vector_index_budget_bytes() / (1024 * 1024),
+        crate::config::vector_reconcile_secs()
+    );
     // 后台对账（B-28）：已载入的索引按行数与 PG 比对，漂移就作废缓存并标 dirty；
-    // `KIKO_VECTOR_RECONCILE_SECS=0` 关闭（默认 60 秒）。必须在 repo::init 之后。
+    // `[vector] reconcile_secs = 0`（或环境变量 `KIKO_VECTOR_RECONCILE_SECS=0`）关闭。
+    // 必须在 repo::init 之后。
     crate::vector::reconcile::spawn();
 
     let settings = {

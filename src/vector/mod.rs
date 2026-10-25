@@ -39,21 +39,10 @@ pub(crate) use index::is_hit;
 /// 常驻集合数硬上限。字节预算是主约束，这个只是防御（防止几千个小集合）。
 pub(crate) const MAX_LOADED_COLLECTIONS: usize = 8;
 
-/// 默认内存预算：512 MB。10 万条 × 1024 维 f32 ≈ 400 MB，f16 ≈ 204 MB。
-const DEFAULT_BUDGET_MB: usize = 512;
-const BUDGET_ENV: &str = "KIKO_VECTOR_INDEX_BUDGET_MB";
-
-/// 索引内存预算（字节）。`KIKO_VECTOR_INDEX_BUDGET_MB` 覆盖，`0` / 非法值回落默认。
+/// 索引内存预算（字节），来自配置文件 `[vector] index_budget_mb`
+/// （环境变量 `KIKO_VECTOR_INDEX_BUDGET_MB` 优先；未加载配置时用内置默认 512 MB）。
 pub(crate) fn budget_bytes() -> usize {
-    static BUDGET: LazyLock<usize> = LazyLock::new(|| {
-        std::env::var(BUDGET_ENV)
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|m| *m > 0)
-            .unwrap_or(DEFAULT_BUDGET_MB)
-            .saturating_mul(1024 * 1024)
-    });
-    *BUDGET
+    crate::config::vector_index_budget_bytes()
 }
 
 type Key = (String, String);

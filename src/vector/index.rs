@@ -169,19 +169,35 @@ pub(crate) fn f32_to_f16(value: f32) -> u16 {
     sign | ((e as u16) << 10) | m
 }
 
-/// binary16 位模式 → f32。保留 subnormal 解码（虽然编码器不会产出）。
+/// binary16 位模式 → f32。
+///
+/// 纯位运算、不调 `powi`：这条路径在每次查询里要跑 `rows × dim`（100 万 × 1024 =
+/// 10 亿次），用 `2f32.powi(exp)` 会让一次查询慢到十几秒（实测 f16 查询 17 s）。
+/// subnormal 走一个极短循环（编码器本身不产出 subnormal）。
 pub(crate) fn f16_to_f32(bits: u16) -> f32 {
-    let sign = (bits >> 15) & 1;
-    let exp = ((bits >> 10) & 0x1f) as i32;
-    let mant = (bits & 0x03ff) as f32;
+    let sign = ((bits as u32) & 0x8000) << 16;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x03ff) as u32;
     let out = if exp == 0 {
-        mant * 2f32.powi(-24)
+        if mant == 0 {
+            sign
+        } else {
+            // subnormal → f32 normal：规格化尾数，指数从 -14 往下走。
+            let mut m = mant;
+            let mut e: u32 = 127 - 15 + 1;
+            while m & 0x0400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | (e << 23) | ((m & 0x03ff) << 13)
+        }
     } else if exp == 0x1f {
-        if mant == 0.0 { f32::INFINITY } else { f32::NAN }
+        // inf / NaN
+        sign | 0x7f80_0000 | (mant << 13)
     } else {
-        (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+        sign | ((exp + 127 - 15) << 23) | (mant << 13)
     };
-    if sign == 1 { -out } else { out }
+    f32::from_bits(out)
 }
 
 /// 一份索引的估算字节数：向量数据 + 每行的 id/范数/槽位开销。
@@ -257,32 +273,46 @@ impl Data {
         }
     }
 
-    fn get(&self, i: usize) -> f32 {
-        match self {
-            Data::F32(d) => d[i],
-            Data::F16(d) => f16_to_f32(d[i]),
-        }
-    }
-
     /// 第 `slot` 行的点积（query 的长度必须等于 `dim`）。
+    ///
+    /// f32 分支直接对切片做 `zip` —— LLVM 能把它自动向量化；逐分量匹配枚举的写法
+    /// 会挡住向量化（1M×1024 的线性扫描差好几倍）。f16 只能逐分量解码。
     fn dot(&self, slot: usize, dim: usize, query: &[f32]) -> f32 {
         let base = slot * dim;
-        let mut dot = 0.0f32;
-        for (d, q) in query.iter().enumerate() {
-            dot += self.get(base + d) * q;
+        match self {
+            Data::F32(d) => d[base..base + dim]
+                .iter()
+                .zip(query)
+                .map(|(a, b)| a * b)
+                .sum(),
+            Data::F16(d) => {
+                let mut dot = 0.0f32;
+                for (x, q) in d[base..base + dim].iter().zip(query) {
+                    dot += f16_to_f32(*x) * q;
+                }
+                dot
+            }
         }
-        dot
     }
 
     /// 第 `slot` 行的范数（按**存下来的**分量算，f16 降精度后仍自洽）。
     fn norm(&self, slot: usize, dim: usize) -> f32 {
         let base = slot * dim;
-        let mut sq = 0.0f32;
-        for d in 0..dim {
-            let x = self.get(base + d);
-            sq += x * x;
+        match self {
+            Data::F32(d) => d[base..base + dim]
+                .iter()
+                .map(|x| x * x)
+                .sum::<f32>()
+                .sqrt(),
+            Data::F16(d) => {
+                let mut sq = 0.0f32;
+                for x in d[base..base + dim].iter() {
+                    let x = f16_to_f32(*x);
+                    sq += x * x;
+                }
+                sq.sqrt()
+            }
         }
-        sq.sqrt()
     }
 
     fn swap_row(&mut self, a: usize, b: usize, dim: usize) {
@@ -586,6 +616,9 @@ mod tests {
         // 下溢刷成 0（embeddings 里远小于 2^-14 的分量没有意义）。
         assert_eq!(f32_to_f16(1e-6), 0x0000);
         assert_eq!(f16_to_f32(0x0000), 0.0);
+        // 解码器仍然正确处理 subnormal：0x0001 = 2^-24。
+        assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
+        assert_eq!(f16_to_f32(0x03ff), 1023.0 * 2f32.powi(-24));
     }
 
     #[test]

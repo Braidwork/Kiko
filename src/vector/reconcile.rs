@@ -8,7 +8,8 @@
 //!
 //! 所以这里做两件事：
 //!
-//! - 每 `KIKO_VECTOR_RECONCILE_SECS`（默认 60，`0` 关闭）检查一次**已载入**的集合：
+//! - 每 `[vector] reconcile_secs`（默认 60，`0` 关闭；环境变量
+//!   `KIKO_VECTOR_RECONCILE_SECS` 优先）检查一次**已载入**的集合：
 //!   `内存条目数 != PG 里 active generation 的行数` 就作废缓存并标 dirty。下一次
 //!   检索会从 PG 重载，加载成功时把 dirty 清掉（见 `vector::ensure_loaded`）。
 //! - 暴露 [`needs_rebuild`]，让判断本身可以被单测钉住。
@@ -22,16 +23,14 @@ use super::{invalidate, loaded_count, loaded_keys};
 use crate::repo;
 use crate::result::Result;
 
-/// 默认对账周期。
+/// 默认对账周期（与 `config` 的兜底值保持一致；只给单测用）。
+#[cfg(test)]
 const DEFAULT_SECS: u64 = 60;
-const ENV: &str = "KIKO_VECTOR_RECONCILE_SECS";
 
-/// 对账周期；`KIKO_VECTOR_RECONCILE_SECS=0` 关闭（返回 `None`）。
+/// 对账周期：`[vector] reconcile_secs`（环境变量 `KIKO_VECTOR_RECONCILE_SECS`
+/// 优先），`0` = 关闭。
 pub(crate) fn interval() -> Option<Duration> {
-    let secs = std::env::var(ENV)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_SECS);
+    let secs = crate::config::vector_reconcile_secs();
     if secs == 0 {
         None
     } else {
@@ -42,7 +41,7 @@ pub(crate) fn interval() -> Option<Duration> {
 /// 启动后台对账任务（`start_app` 调一次）。
 pub(crate) fn spawn() {
     let Some(interval) = interval() else {
-        log::info!("Vector index reconciliation is disabled ({ENV}=0)");
+        log::info!("Vector index reconciliation is disabled (reconcile_secs = 0)");
         return;
     };
     tokio::spawn(async move {
