@@ -125,9 +125,8 @@ pub(crate) async fn create(
 
 /// 改正文：更新 `documents` 并**整篇替换**分块与向量（同一个事务）。
 ///
-/// `expected_version = Some(v)` 时做乐观锁（B-17）：版本不符返回
-/// [`crate::repo::version_conflict`]，不会覆盖别人的编辑。`None` 是旧客户端/
-/// 内部调用的"最后写入胜出"路径。
+/// `expected_version` 是必填（B-17 强制模式）：版本不符返回
+/// [`crate::repo::version_conflict`]，不会覆盖别人的编辑。
 ///
 /// 返回 `None` 表示文档已经不存在（调用方按"找不到文档"处理）。
 pub(crate) async fn update_content(
@@ -137,14 +136,13 @@ pub(crate) async fn update_content(
     doc_content: &str,
     chunks: &[ChunkInput],
     model: &ModelRef,
-    expected_version: Option<i64>,
+    expected_version: i64,
 ) -> Result<Option<Vec<i64>>> {
     let mut tx = pool.begin().await?;
     let updated = sqlx::query(
         "UPDATE documents
             SET doc_content = $3, updated_at = now(), version = version + 1
-          WHERE id = $1 AND robot_id = $2
-            AND ($4::BIGINT IS NULL OR version = $4)",
+          WHERE id = $1 AND robot_id = $2 AND version = $4",
     )
     .bind(doc_id)
     .bind(robot_id)
@@ -154,9 +152,6 @@ pub(crate) async fn update_content(
     .await?;
     if updated.rows_affected() == 0 {
         tx.rollback().await?;
-        if expected_version.is_none() {
-            return Ok(None);
-        }
         let exists: Option<i32> =
             sqlx::query_scalar("SELECT 1 FROM documents WHERE id = $1 AND robot_id = $2")
                 .bind(doc_id)

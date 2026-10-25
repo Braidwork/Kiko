@@ -56,7 +56,10 @@ pub(crate) async fn update_doc(
     Query(q): Query<RobotQuery>,
     Json(doc): Json<DocData>,
 ) -> impl IntoResponse {
-    let r = super::doc::update(&q.robot_id, &doc.id, &doc.doc_content, doc.version).await;
+    let Some(version) = doc.version else {
+        return to_res::<()>(Err(crate::repo::version_required("Document")));
+    };
+    let r = super::doc::update(&q.robot_id, &doc.id, &doc.doc_content, version).await;
     to_res(r)
 }
 

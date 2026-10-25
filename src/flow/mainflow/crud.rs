@@ -71,8 +71,16 @@ pub(crate) async fn save(
         if let Err(e) = demo::ensure_editable(&data.id) {
             return to_res::<()>(Err(e));
         }
+        let Some(version) = data.version else {
+            return to_res::<()>(Err(crate::repo::version_required("Main flow")));
+        };
         let r: Result<()> = async {
-            repo::mainflow::upsert(repo::pool(), robot_id, &data, data.version).await?;
+            if !repo::mainflow::update(repo::pool(), robot_id, &data, version).await? {
+                return Err(Error::WithMessage(format!(
+                    "Main flow {} does not exist any more.",
+                    data.id
+                )));
+            }
             Ok(())
         }
         .await;

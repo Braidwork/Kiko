@@ -55,6 +55,9 @@ pub(crate) async fn save(
     if let Err(e) = demo::ensure_editable(&q.main_flow_id) {
         return to_res::<Vec<SubFlowDetail>>(Err(e));
     }
+    let Some(version) = data.version else {
+        return to_res::<Vec<SubFlowDetail>>(Err(crate::repo::version_required("Sub-flow")));
+    };
     let r: Result<Vec<SubFlowDetail>> = async {
         repo::subflow::save_canvas(
             repo::pool(),
@@ -62,7 +65,7 @@ pub(crate) async fn save(
             &q.main_flow_id,
             &data.id,
             &data.canvas,
-            data.version,
+            version,
         )
         .await?;
         repo::subflow::list(repo::pool(), &q.robot_id, &q.main_flow_id).await

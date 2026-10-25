@@ -972,11 +972,7 @@ async fn mainflow_create_lists_and_cascades() {
     let mut renamed = first.clone();
     renamed.name = String::from("renamed");
     renamed.enabled = false;
-    assert!(
-        mainflow::upsert(&db.pool, "rF", &renamed, None)
-            .await
-            .unwrap()
-    );
+    assert!(mainflow::update(&db.pool, "rF", &renamed, 0).await.unwrap());
     let list = mainflow::list(&db.pool, "rF").await.unwrap();
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].name, "renamed");
@@ -1043,7 +1039,7 @@ async fn subflow_crud_by_id_and_position() {
     // 保存画布按 id（不再按下标）。
     let canvas = r#"{"cells":[{"id":"a","shape":"edge"}]}"#;
     assert!(
-        subflow::save_canvas(&db.pool, "rG", &mf.id, &two_id, canvas, None)
+        subflow::save_canvas(&db.pool, "rG", &mf.id, &two_id, canvas, 0)
             .await
             .unwrap()
     );
@@ -1052,7 +1048,7 @@ async fn subflow_crud_by_id_and_position() {
 
     // 空画布写库是合法 JSON（{}），读回仍是空串。
     assert!(
-        subflow::save_canvas(&db.pool, "rG", &mf.id, &two_id, "", None)
+        subflow::save_canvas(&db.pool, "rG", &mf.id, &two_id, "", 1)
             .await
             .unwrap()
     );
@@ -1067,7 +1063,7 @@ async fn subflow_crud_by_id_and_position() {
 
     // 另一个机器人不能通过别人的 mainflow id 改数据。
     assert!(
-        !subflow::save_canvas(&db.pool, "rOther", &mf.id, &two_id, "{}", None)
+        !subflow::save_canvas(&db.pool, "rOther", &mf.id, &two_id, "{}", 0)
             .await
             .unwrap()
     );
@@ -1910,11 +1906,12 @@ async fn qa_questions_and_vectors_are_replaced_together() {
     assert_eq!(found_qa_id, qa_id);
 
     // 编辑：整体替换成一条问题，旧的两条问题行与向量行都必须消失。
+    // B-17 强制模式：编辑必须带上当前 version。
     let (same_id, new_vecs) = qa::save(
         &db.pool,
         "rQa",
         Some(&qa_id),
-        None,
+        Some(0),
         "answer2",
         &[q("hello again", true, 0)],
         &model,
@@ -2152,33 +2149,17 @@ async fn optimistic_locking_rejects_stale_updates() {
     .await
     .unwrap();
     assert_eq!(doc::list(&db.pool, "rLock").await.unwrap()[0].version, 0);
-    doc::update_content(
-        &db.pool,
-        "rLock",
-        "doc1",
-        "alpha2",
-        &chunks,
-        &model,
-        Some(0),
-    )
-    .await
-    .unwrap();
+    doc::update_content(&db.pool, "rLock", "doc1", "alpha2", &chunks, &model, 0)
+        .await
+        .unwrap();
     assert_eq!(doc::list(&db.pool, "rLock").await.unwrap()[0].version, 1);
-    let e = doc::update_content(&db.pool, "rLock", "doc1", "stale", &chunks, &model, Some(0))
+    let e = doc::update_content(&db.pool, "rLock", "doc1", "stale", &chunks, &model, 0)
         .await
         .unwrap_err();
     conflict(e);
-    doc::update_content(
-        &db.pool,
-        "rLock",
-        "doc1",
-        "alpha3",
-        &chunks,
-        &model,
-        Some(1),
-    )
-    .await
-    .unwrap();
+    doc::update_content(&db.pool, "rLock", "doc1", "alpha3", &chunks, &model, 1)
+        .await
+        .unwrap();
 
     // --- 问答 ---
     let (qa_id, _) = qa::save(
@@ -2246,6 +2227,24 @@ async fn optimistic_locking_rejects_stale_updates() {
     .unwrap()
     .unwrap();
 
+    // 缺 version 的更新必须报错，不再退化成"最后写入胜出"（B-17 强制模式）。
+    let e = qa::save(
+        &db.pool,
+        "rLock",
+        Some(&qa_id),
+        None,
+        "no-version",
+        &[q("hello", true, 0)],
+        &model,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        e.message().contains("missing its version"),
+        "缺 version 的文案不对：{}",
+        e.message()
+    );
+
     // --- 子流程画布 ---
     let mf = mainflow::create(&db.pool, "rLock", "mf", "one")
         .await
@@ -2254,7 +2253,7 @@ async fn optimistic_locking_rejects_stale_updates() {
         .id
         .clone();
     assert!(
-        subflow::save_canvas(&db.pool, "rLock", &mf.id, &subflow_id, "{}", Some(0))
+        subflow::save_canvas(&db.pool, "rLock", &mf.id, &subflow_id, "{}", 0)
             .await
             .unwrap()
     );
@@ -2262,12 +2261,12 @@ async fn optimistic_locking_rejects_stale_updates() {
         subflow::list(&db.pool, "rLock", &mf.id).await.unwrap()[0].version,
         Some(1)
     );
-    let e = subflow::save_canvas(&db.pool, "rLock", &mf.id, &subflow_id, "{}", Some(0))
+    let e = subflow::save_canvas(&db.pool, "rLock", &mf.id, &subflow_id, "{}", 0)
         .await
         .unwrap_err();
     conflict(e);
     assert!(
-        subflow::save_canvas(&db.pool, "rLock", &mf.id, &subflow_id, "{}", Some(1))
+        subflow::save_canvas(&db.pool, "rLock", &mf.id, &subflow_id, "{}", 1)
             .await
             .unwrap()
     );
@@ -2279,24 +2278,24 @@ async fn optimistic_locking_rejects_stale_updates() {
     );
     let mut flow = mainflow::list(&db.pool, "rLock").await.unwrap()[0].clone();
     flow.name = String::from("renamed");
-    assert!(
-        mainflow::upsert(&db.pool, "rLock", &flow, Some(0))
-            .await
-            .unwrap()
-    );
+    assert!(mainflow::update(&db.pool, "rLock", &flow, 0).await.unwrap());
     assert_eq!(
         mainflow::list(&db.pool, "rLock").await.unwrap()[0].version,
         Some(1)
     );
-    let e = mainflow::upsert(&db.pool, "rLock", &flow, Some(0))
+    let e = mainflow::update(&db.pool, "rLock", &flow, 0)
         .await
         .unwrap_err();
     conflict(e);
-    assert!(
-        mainflow::upsert(&db.pool, "rLock", &flow, Some(1))
-            .await
-            .unwrap()
-    );
+    assert!(mainflow::update(&db.pool, "rLock", &flow, 1).await.unwrap());
+    // 保存一个不存在的主流程不会把它复活（`update` 只更新）。
+    let gone = crate::flow::mainflow::dto::MainFlowDetail {
+        id: String::from("no-such-flow"),
+        name: String::from("x"),
+        enabled: true,
+        version: None,
+    };
+    assert!(!mainflow::update(&db.pool, "rLock", &gone, 0).await.unwrap());
 
     db.cleanup().await;
 }

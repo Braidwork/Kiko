@@ -129,7 +129,7 @@ pub(crate) async fn update(
     robot_id: &str,
     doc_id: &str,
     doc_content: &str,
-    version: Option<i64>,
+    version: i64,
 ) -> Result<()> {
     let (chunks, model) = chunks_with_vectors(robot_id, doc_content, EmbedMode::Active).await?;
     let r = repo::doc::update_content(

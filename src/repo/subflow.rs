@@ -105,23 +105,21 @@ pub(crate) async fn create(
 
 /// 保存一条子流程的画布。
 ///
-/// `expected_version = Some(v)` 时做乐观锁（B-17）：版本不符返回冲突错误；`None`
-/// 是旧客户端/内部调用的"最后写入胜出"路径。返回是否真的更新了一行（不存在/
-/// 不属于该主流程时为 false）。
+/// `expected_version` **必填**（B-17 强制模式）：版本不符返回冲突错误；返回是否
+/// 真的更新了一行（不存在/不属于该主流程时为 false）。
 pub(crate) async fn save_canvas(
     pool: &PgPool,
     robot_id: &str,
     main_flow_id: &str,
     subflow_id: &str,
     canvas: &str,
-    expected_version: Option<i64>,
+    expected_version: i64,
 ) -> Result<bool> {
     let canvas = canvas_to_db(canvas)?;
     let r = sqlx::query(
         "UPDATE subflows
             SET canvas = $4, updated_at = now(), version = version + 1
-          WHERE id = $1 AND robot_id = $2 AND main_flow_id = $3
-            AND ($5::BIGINT IS NULL OR version = $5)",
+          WHERE id = $1 AND robot_id = $2 AND main_flow_id = $3 AND version = $5",
     )
     .bind(subflow_id)
     .bind(robot_id)
@@ -132,9 +130,6 @@ pub(crate) async fn save_canvas(
     .await?;
     if r.rows_affected() > 0 {
         return Ok(true);
-    }
-    if expected_version.is_none() {
-        return Ok(false);
     }
     let exists: Option<i32> = sqlx::query_scalar(
         "SELECT 1 FROM subflows WHERE id = $1 AND robot_id = $2 AND main_flow_id = $3",

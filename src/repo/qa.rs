@@ -117,11 +117,9 @@ pub(crate) async fn get(pool: &PgPool, robot_id: &str, qa_id: &str) -> Result<Op
 
 /// 新建或整体替换一条问答对。
 ///
-/// `qa_id = None` 表示新建（返回新 id）；`Some` 表示编辑，行不存在时返回 `None`
-/// （调用方按"问答对已被删掉"处理）。`expected_version` 是乐观锁（B-17）：版本不符
-/// 返回 [`crate::repo::version_conflict`]。
-///
-/// 返回 `(qa_id, 与 questions 同序的 vector id)`。
+/// `qa_id = None` 表示新建（返回新 id，不需要版本）；`Some` 表示编辑，
+/// `expected_version` **必填**（B-17 强制模式，缺失直接报错），版本不符返回
+/// [`crate::repo::version_conflict`]，行不存在时返回 `None`。
 pub(crate) async fn save(
     pool: &PgPool,
     robot_id: &str,
@@ -139,22 +137,22 @@ pub(crate) async fn save(
     let mut tx = pool.begin().await?;
     let id = match qa_id {
         Some(id) => {
+            let Some(expected) = expected_version else {
+                tx.rollback().await?;
+                return Err(crate::repo::version_required("Question–answer pair"));
+            };
             let r = sqlx::query(
                 "UPDATE qa SET answer = $3, updated_at = now(), version = version + 1
-                  WHERE id = $1 AND robot_id = $2
-                    AND ($4::BIGINT IS NULL OR version = $4)",
+                  WHERE id = $1 AND robot_id = $2 AND version = $4",
             )
             .bind(id)
             .bind(robot_id)
             .bind(answer)
-            .bind(expected_version)
+            .bind(expected)
             .execute(&mut *tx)
             .await?;
             if r.rows_affected() == 0 {
                 tx.rollback().await?;
-                if expected_version.is_none() {
-                    return Ok(None);
-                }
                 let exists: Option<i32> =
                     sqlx::query_scalar("SELECT 1 FROM qa WHERE id = $1 AND robot_id = $2")
                         .bind(id)

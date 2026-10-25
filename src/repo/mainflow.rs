@@ -75,51 +75,31 @@ pub(crate) async fn create(
     })
 }
 
-/// 保存（新建或更新）一条主流程。返回是否真的写入/更新了一行。
+/// 更新一条主流程（B-17 强制乐观锁）。返回是否更新了一行。
 ///
-/// 走 upsert 是因为 A 的 `write` 也是「没有就建」；但 `id` 属于另一个机器人时
-/// 不更新（`WHERE mainflows.robot_id = EXCLUDED.robot_id`），避免拿别人的 id 改数据。
-///
-/// `expected_version = Some(v)` 时做乐观锁（B-17）：版本不符返回
-/// [`crate::repo::version_conflict`]，不会覆盖别人的编辑。
-pub(crate) async fn upsert(
+/// 只做 UPDATE，不再 upsert：新建走 [`create`]，这样"保存一个已被删掉的主流程"
+/// 不会悄悄把它复活。`expected_version` 不符返回 [`crate::repo::version_conflict`]；
+/// 行不存在/不属于该机器人返回 `false`。
+pub(crate) async fn update(
     pool: &PgPool,
     robot_id: &str,
     d: &MainFlowDetail,
-    expected_version: Option<i64>,
+    expected_version: i64,
 ) -> Result<bool> {
-    let mut tx = pool.begin().await?;
-    let _ = sqlx::query_scalar::<_, String>("SELECT id FROM robots WHERE id = $1 FOR UPDATE")
-        .bind(robot_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
     let r = sqlx::query(
-        "INSERT INTO mainflows (id, robot_id, name, enabled, position)
-         VALUES ($1, $2, $3, $4,
-                 (SELECT COALESCE(MAX(position), -1) + 1
-                    FROM mainflows WHERE robot_id = $2))
-         ON CONFLICT (id) DO UPDATE
-            SET name       = EXCLUDED.name,
-                enabled    = EXCLUDED.enabled,
-                updated_at = now(),
-                version    = mainflows.version + 1
-          WHERE mainflows.robot_id = EXCLUDED.robot_id
-            AND ($5::BIGINT IS NULL OR mainflows.version = $5)",
+        "UPDATE mainflows
+            SET name = $3, enabled = $4, updated_at = now(), version = version + 1
+          WHERE id = $1 AND robot_id = $2 AND version = $5",
     )
     .bind(&d.id)
     .bind(robot_id)
     .bind(&d.name)
     .bind(d.enabled)
     .bind(expected_version)
-    .execute(&mut *tx)
+    .execute(pool)
     .await?;
-    tx.commit().await?;
     if r.rows_affected() > 0 {
         return Ok(true);
-    }
-    if expected_version.is_none() {
-        return Ok(false);
     }
     let exists: Option<i32> =
         sqlx::query_scalar("SELECT 1 FROM mainflows WHERE id = $1 AND robot_id = $2")

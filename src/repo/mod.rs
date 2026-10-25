@@ -46,6 +46,16 @@ pub(crate) fn version_conflict(entity: &str) -> Error {
     ))
 }
 
+/// 更新请求没带 `version`（B-17 强制模式）。
+///
+/// 新项目没有旧客户端包袱，所以**更新类接口一律要求**客户端把它读到的版本带回来；
+/// 缺了就直接报错，而不是悄悄退化成"最后写入胜出"。
+pub(crate) fn version_required(entity: &str) -> Error {
+    Error::WithMessage(format!(
+        "{entity} update is missing its version; reload it and try again"
+    ))
+}
+
 static POOL: OnceLock<PgPool> = OnceLock::new();
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/pg");
