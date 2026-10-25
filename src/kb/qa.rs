@@ -13,7 +13,6 @@
 use std::vec::Vec;
 
 use super::dto::{QuestionAnswerPair, QuestionData};
-use crate::ai::embedding;
 use crate::man::settings;
 use crate::repo;
 use crate::repo::qa::{QaDetail, QuestionInput};
@@ -61,24 +60,12 @@ pub(crate) async fn save(robot_id: &str, d: QuestionAnswerPair) -> Result<String
     }
 
     // 推理在事务外：一次 QA 保存要跑 1 + N 条推理，握着 PG 事务不松手没有意义。
-    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
-    let mut dim = 0usize;
-    for t in texts.iter() {
-        let e = embedding::embedding(robot_id, t).await?;
-        if e.0.is_empty() {
-            let err = format!("{t} embedding data is empty");
-            log::warn!("{err}");
-            return Err(Error::WithMessage(err));
-        }
-        if dim == 0 {
-            dim = e.0.len();
-        }
-        vecs.push(e.0);
-    }
-    if dim == 0 {
+    // 有 active model 时用它（新增数据必须留在库里那一代的向量空间），否则用当前
+    // 配置并把模型记进这一代（§6.4 / B-23）。
+    let (vecs, model) = vector::embed_for_write(robot_id, repo::vector::QA, &texts).await?;
+    if vecs.is_empty() {
         return Err(Error::WithMessage(String::from("Embedding data is empty.")));
     }
-    let model = vector::current_model(robot_id, dim).await?;
 
     let inputs: Vec<QuestionInput> = texts
         .into_iter()
@@ -134,13 +121,15 @@ pub(crate) async fn retrieve_answer(
     robot_id: &str,
     question: &str,
 ) -> Result<(Option<QuestionAnswerPair>, f32)> {
-    let q = embedding::embedding(robot_id, question).await?;
-    if q.0.is_empty() {
+    // 检索用的嵌入走 active model（§6.4 / B-23）：设置里换了模型但还没重建时，
+    // 仍用库里那一代的模型，否则查询向量和存储向量不在同一个空间（静默全错）。
+    let (q, _) = vector::embed_for_query(robot_id, repo::vector::QA, question).await?;
+    if q.is_empty() {
         let err = format!("{question} embedding data is empty");
         log::warn!("{err}");
         return Err(Error::WithMessage(err));
     }
-    let hits = vector::search(robot_id, repo::vector::QA, &q.0, 1).await?;
+    let hits = vector::search(robot_id, repo::vector::QA, &q, 1).await?;
     let Some(hit) = hits.first() else {
         return Ok((None, 0.0));
     };

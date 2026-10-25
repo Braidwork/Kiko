@@ -3,7 +3,6 @@ use unicase::UniCase;
 
 use super::dto::IntentDetail;
 use super::phrase;
-use crate::ai::embedding::embedding;
 use crate::repo;
 use crate::result::Result;
 
@@ -49,7 +48,9 @@ pub(crate) async fn detect(robot_id: &str, s: &str) -> Result<Option<String>> {
     if empty_phrase {
         return Ok(None);
     }
-    let embedding = embedding(robot_id, s).await;
+    // 意图短语的查询嵌入走 active model（§6.4 / B-23）：设置里换了模型但还没重建
+    // 时继续用库里那一代的模型。
+    let embedding = crate::vector::embed_for_query(robot_id, crate::repo::vector::PHRASE, s).await;
     let embedding = match embedding {
         Ok(embedding) => {
             if embedding.0.is_empty() {

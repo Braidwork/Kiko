@@ -14,17 +14,22 @@
 
 use std::vec::Vec;
 
-use crate::ai::embedding::embedding;
 use crate::repo;
 use crate::repo::vector::ModelRef;
 use crate::result::Result;
 use crate::vector;
 
-/// 给一段文本算向量 + 当前模型定义（写库时要用）。
+/// 写入用：给一段文本算向量 + 该记进 generation 的模型（有 active model 就沿用它）。
+///
+/// 重建（`man::reindex`）不走这里：重建的语义就是"换成当前配置的新模型"，它直接
+/// 调 `embedding::embedding`。
 pub(crate) async fn embed(robot_id: &str, text: &str) -> Result<(Vec<f32>, ModelRef)> {
-    let v = embedding(robot_id, text).await?;
-    let model = vector::current_model(robot_id, v.0.len()).await?;
-    Ok((v.0, model))
+    let (mut vecs, model) =
+        vector::embed_for_write(robot_id, repo::vector::PHRASE, &[String::from(text)]).await?;
+    let vec = vecs.pop().ok_or_else(|| {
+        crate::result::Error::WithMessage(String::from("Embedding returned no vector."))
+    })?;
+    Ok((vec, model))
 }
 
 /// 最近的一条短语向量命中：`(意图名, 相似度)`。最多返回一条（与 A 的 `LIMIT 1` 一致）。

@@ -1440,9 +1440,9 @@ async fn settings_service_roundtrip_through_global_pool() {
     // 6. 知识库端到端（S4）：假 embedding 端点 + 真实 PG + 进程内索引。
     //
     //    这一段覆盖三条检索：QA（相似度）、文档（分块 + 向量 + 原文件落盘）、
-    //    意图短语（阈值方向 D41）。模型推理被换成本地假端点，所以既不需要下载权重，
-    //    也不会出网。
-    let embed_url = crate::ai::test_support::serve_embeddings(16).await;
+    //    意图短语（阈值方向 D41），以及 active model 分离（B-23 / §6.4）。
+    //    模型推理被换成本地假端点，所以既不需要下载权重，也不会出网。
+    let (embed_url, mut models) = crate::ai::test_support::serve_embeddings_capturing(80).await;
     robot::upsert(&db.pool, &robot("rKb", "kb")).await.unwrap();
     crate::man::settings::init("rKb").await.unwrap();
     let mut s = Settings::default();
@@ -1563,7 +1563,76 @@ async fn settings_service_roundtrip_through_global_pool() {
         Some("only")
     );
 
-    // 6.5 B-28：写后同步失败 → 标 dirty；下一次检索从 PG 重载并清掉标记。
+    // 6.5 active model 分离（B-23 / §6.4）：设置页换成 b，但还没重建 ——
+    //     检索和新增数据都必须继续用 active model（fake-embed）。
+    let mut s2 = crate::man::settings::get_settings("rKb")
+        .await
+        .unwrap()
+        .unwrap();
+    s2.sentence_embedding_provider.provider =
+        crate::ai::embedding::SentenceEmbeddingProvider::OpenAICompatible(String::from(
+            "fake-embed-b",
+        ));
+    crate::man::settings::save_settings("rKb", s2)
+        .await
+        .unwrap();
+    drain_models(&mut models); // 丢掉之前的请求记录，从"换模型之后"开始断言
+
+    let (found, _) = crate::kb::qa::retrieve_answer("rKb", "hello")
+        .await
+        .unwrap();
+    assert_eq!(found.expect("换模型未重建时仍要命中").answer, "world");
+    assert_eq!(
+        drain_models(&mut models),
+        ["fake-embed".to_string()],
+        "检索必须用 active model（fake-embed），而不是刚配置的 fake-embed-b"
+    );
+
+    // 新增数据同样要留在 active model 的向量空间里（§18 第 76 条的缺口）。
+    crate::kb::qa::save(
+        "rKb",
+        crate::kb::dto::QuestionAnswerPair {
+            id: None,
+            question: crate::kb::dto::QuestionData {
+                question: String::from("fresh"),
+            },
+            similar_questions: Vec::new(),
+            answer: String::from("answer-b"),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        drain_models(&mut models),
+        ["fake-embed".to_string()],
+        "新增 QA 也必须用 active model"
+    );
+    assert_eq!(crate::kb::qa::list("rKb").await.unwrap().len(), 2);
+
+    // 只有重建才切到配置的新模型：generation 2、active_model 变成 b，之后检索也用它。
+    crate::man::reindex::run("rKb").await.unwrap();
+    let used = drain_models(&mut models);
+    assert!(!used.is_empty(), "重建要真的调用新模型");
+    assert!(
+        used.iter().all(|m| m == "fake-embed-b"),
+        "重建必须用配置的新模型：{used:?}"
+    );
+    let st = super::vector::state(&db.pool, "rKb", super::vector::QA)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(st.active_generation, 2, "第二次重建应该翻到第 2 代");
+    let (found, _) = crate::kb::qa::retrieve_answer("rKb", "fresh")
+        .await
+        .unwrap();
+    assert_eq!(found.expect("重建后新问答仍要命中").answer, "answer-b");
+    assert_eq!(
+        drain_models(&mut models),
+        ["fake-embed-b".to_string()],
+        "重建之后检索要用新模型"
+    );
+
+    // 6.6 B-28：写后同步失败 → 标 dirty；下一次检索从 PG 重载并清掉标记。
     assert!(
         !super::vector::state(&db.pool, "rKb", super::vector::QA)
             .await
@@ -1591,7 +1660,7 @@ async fn settings_service_roundtrip_through_global_pool() {
         "从 PG 重载成功后 dirty 必须清掉"
     );
 
-    // 6.6 对账：先让 doc 索引载入，再手工插一条"进程外写入"的向量，行数漂移必须
+    // 6.7 对账：先让 doc 索引载入，再手工插一条"进程外写入"的向量，行数漂移必须
     // 被发现 → 作废缓存 + 标 dirty；下一次检索重载后恢复。
     // 注意 generation 必须是 active 那一代（重建后是 1），否则不计入行数。
     let _ = vector::search("rKb", super::vector::DOC, &[1.0, 0.0, 0.0, 0.0], 1)
@@ -1645,6 +1714,15 @@ async fn settings_service_roundtrip_through_global_pool() {
 }
 
 const DOCX_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+/// 收集假 embedding 端点收到的 `model` 名字（断言 active model 用）。
+fn drain_models(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        out.push(m);
+    }
+    out
+}
 
 /// 内存里拼一个最小 docx（WordprocessingML），供上传路径测试用。
 fn minimal_docx(paragraphs: &[&str]) -> Vec<u8> {

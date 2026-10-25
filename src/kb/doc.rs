@@ -22,7 +22,6 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::vec::Vec;
 
-use futures_util::{StreamExt, TryStreamExt};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use sha2::{Digest, Sha256};
@@ -101,7 +100,7 @@ async fn save_with_chunks(
     bytes: &[u8],
     doc_content: &str,
 ) -> Result<()> {
-    let (chunks, model) = chunks_with_vectors(robot_id, doc_content).await?;
+    let (chunks, model) = chunks_with_vectors(robot_id, doc_content, EmbedMode::Active).await?;
     let doc = NewDocument {
         file_name: String::from(file_name),
         file_size,
@@ -126,7 +125,7 @@ async fn save_with_chunks(
 
 /// 改正文：整篇重新分块 + 重算向量（同一个事务）。
 pub(crate) async fn update(robot_id: &str, doc_id: &str, doc_content: &str) -> Result<()> {
-    let (chunks, model) = chunks_with_vectors(robot_id, doc_content).await?;
+    let (chunks, model) = chunks_with_vectors(robot_id, doc_content, EmbedMode::Active).await?;
     let r = repo::doc::update_content(repo::pool(), robot_id, doc_id, doc_content, &chunks, &model)
         .await?;
     if r.is_none() {
@@ -151,7 +150,8 @@ pub(crate) async fn reindex_at(robot_id: &str, doc_id: &str, generation: i64) ->
     let Some(doc) = repo::doc::get_payload(repo::pool(), robot_id, doc_id).await? else {
         return Ok(0);
     };
-    let (chunks, model) = chunks_with_vectors(robot_id, &doc.doc_content).await?;
+    let (chunks, model) =
+        chunks_with_vectors(robot_id, &doc.doc_content, EmbedMode::Configured).await?;
     repo::doc::reindex_document(repo::pool(), robot_id, doc_id, generation, &chunks, &model).await
 }
 
@@ -184,12 +184,13 @@ pub(crate) async fn search_doc(
     connect_timeout: u32,
     read_timeout: u32,
 ) -> Result<Option<String>> {
-    let q = embedding::embedding(robot_id, query).await?;
-    if q.0.is_empty() {
+    // 检索用的嵌入走 active model（§6.4 / B-23），与存储向量的那一代保持一致。
+    let (q, _) = vector::embed_for_query(robot_id, repo::vector::DOC, query).await?;
+    if q.is_empty() {
         return Ok(None);
     }
     // 向量召回：多取一些（8，与 A 的 LIMIT 8 对齐），再按阈值过滤。
-    let hits = vector::search(robot_id, repo::vector::DOC, &q.0, 8).await?;
+    let hits = vector::search(robot_id, repo::vector::DOC, &q, 8).await?;
     let ids: Vec<i64> = hits.iter().map(|h| h.id as i64).collect();
     let payload = repo::doc::chunks_for_vectors(repo::pool(), robot_id, &ids).await?;
     let by_vector: HashMap<i64, (String, String)> = payload
@@ -362,10 +363,20 @@ fn escape_like(s: &str) -> String {
 
 // --------------------------------------------------------------------------- 分块
 
+/// 分块时用哪套模型（§6.4 / B-23）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmbedMode {
+    /// 上传/编辑：跟随 active model（有就用它，没有就用当前配置并记进这一代）。
+    Active,
+    /// 重建：用当前配置 —— 重建的目的就是换模型。
+    Configured,
+}
+
 /// 分块 + 推理 + 模型元数据。**不开事务**：一份长文档要跑几百个 chunk 的推理。
 async fn chunks_with_vectors(
     robot_id: &str,
     doc_content: &str,
+    mode: EmbedMode,
 ) -> Result<(Vec<ChunkInput>, repo::vector::ModelRef)> {
     // 本地 HF BERT 模型上限 512 token，分块要小；长上下文远端模型可以大很多。
     let long_context = !matches!(
@@ -382,29 +393,19 @@ async fn chunks_with_vectors(
     if texts.is_empty() {
         // 空文档：没有分块也没有向量。模型定义在这里拿不到维度，用当前配置的期望
         // 维度（0 = 未知）占位——没有向量行时它不会被任何查询用到。
-        let model = vector::current_model(robot_id, 0).await?;
+        let model = match mode {
+            EmbedMode::Active => match vector::active_model(robot_id, repo::vector::DOC).await? {
+                Some(m) => m,
+                None => vector::current_model(robot_id, 0).await?,
+            },
+            EmbedMode::Configured => vector::current_model(robot_id, 0).await?,
+        };
         return Ok((Vec::new(), model));
     }
-    let rid = String::from(robot_id);
-    let embeddings: Vec<Vec<f32>> =
-        futures_util::stream::iter(texts.clone().into_iter().map(|c| {
-            let rid = rid.clone();
-            async move { embedding::embedding(&rid, &c).await.map(|(v, _)| v) }
-        }))
-        .buffered(4)
-        .try_collect()
-        .await?;
-    let dim = embeddings
-        .first()
-        .map(|v| v.len())
-        .ok_or_else(|| Error::WithMessage(String::from("Embedding data is empty.")))?;
-    if let Some(bad) = embeddings.iter().position(|v| v.len() != dim) {
-        return Err(Error::WithMessage(format!(
-            "Embedding dimension changed mid-document at chunk {bad}: {} vs {dim}",
-            embeddings[bad].len()
-        )));
-    }
-    let model = vector::current_model(robot_id, dim).await?;
+    let (embeddings, model) = match mode {
+        EmbedMode::Active => vector::embed_for_write(robot_id, repo::vector::DOC, &texts).await?,
+        EmbedMode::Configured => vector::embed_configured(robot_id, &texts).await?,
+    };
     let chunks = texts
         .into_iter()
         .zip(embeddings)

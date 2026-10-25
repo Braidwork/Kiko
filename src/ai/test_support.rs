@@ -124,12 +124,16 @@ pub(crate) fn sse_head() -> String {
 
 /// 本地假 embedding 端点：服务 `requests` 次，按请求里的 `input` 生成**确定性**
 /// 4 维向量（同样文本 → 同样向量，相似度 1）。知识库端到端测试用它替代真模型：
-/// 既不需要下载权重，也不会出网。
-pub(crate) async fn serve_embeddings(requests: usize) -> String {
+/// 既不需要下载权重，也不会出网。返回的 channel 会收到每次请求的 `model` 名字，
+/// 用来断言"检索/写入用的是 active model 还是配置里的模型"（B-23 / §6.4）。
+pub(crate) async fn serve_embeddings_capturing(
+    requests: usize,
+) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         for _ in 0..requests {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -149,6 +153,7 @@ pub(crate) async fn serve_embeddings(requests: usize) -> String {
                     break;
                 }
             }
+            let _ = tx.send(request_model(&raw));
             let body = format!(
                 "{{\"data\":[{{\"embedding\":{}}}]}}",
                 fake_embedding(&request_input(&raw))
@@ -164,7 +169,7 @@ pub(crate) async fn serve_embeddings(requests: usize) -> String {
             let _ = socket.shutdown().await;
         }
     });
-    format!("http://{addr}/v1/embeddings")
+    (format!("http://{addr}/v1/embeddings"), rx)
 }
 
 /// 从请求体里取 `"input":"…"`。测试用的文本不含引号/反斜杠，所以不需要完整 JSON 解析。
@@ -174,6 +179,22 @@ fn request_input(raw: &[u8]) -> String {
     };
     let body = String::from_utf8_lossy(&raw[end..]).into_owned();
     let Some(i) = body.find("\"input\":\"") else {
+        return String::new();
+    };
+    body[i + 9..]
+        .split('"')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 从请求体里取 `"model":"…"`（同样只做够用的字符串解析）。
+fn request_model(raw: &[u8]) -> String {
+    let Some(end) = head_end(raw) else {
+        return String::new();
+    };
+    let body = String::from_utf8_lossy(&raw[end..]).into_owned();
+    let Some(i) = body.find("\"model\":\"") else {
         return String::new();
     };
     body[i + 9..]

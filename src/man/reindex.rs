@@ -163,7 +163,8 @@ async fn rebuild_phrases(robot_id: &str, model: &ModelRef) -> Result<()> {
         });
         let pending = repo::intent::pending_phrases(repo::pool(), robot_id, generation).await?;
         for p in pending {
-            let (vec, _) = crate::intent::phrase::embed(robot_id, &p.phrase).await?;
+            // 重建用**当前配置**的模型（`phrase::embed` 是写入路径，会跟随 active）。
+            let (vec, _) = embedding::embedding(robot_id, &p.phrase).await?;
             repo::intent::put_phrase_vector(repo::pool(), robot_id, &p.id, generation, vec, model)
                 .await?;
             update_status(robot_id, |s| s.intents.done += 1);

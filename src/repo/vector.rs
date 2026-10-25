@@ -33,6 +33,7 @@ pub(crate) const DOC: &str = "doc";
 pub(crate) const COLLECTIONS: [&str; 3] = [PHRASE, QA, DOC];
 
 /// 一份模型定义。`dimension` 是**实际算出来的**维度，不是设置里写的期望值。
+#[derive(Clone, Debug)]
 pub(crate) struct ModelRef {
     pub(crate) provider: String,
     pub(crate) model: String,
@@ -145,6 +146,37 @@ pub(crate) async fn set_dirty(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// 一个集合**当前生效**的模型（B-23 / §6.4 的 active model）。
+///
+/// 从 `vector_collection_state.active_model_id` 读，而不是从用户设置里读：设置页
+/// 换了模型之后，旧向量仍是旧模型算的，检索/新增必须继续用旧模型，直到重建把
+/// `active_model_id` 翻到新代。
+pub(crate) async fn active_model_ref(
+    pool: &PgPool,
+    robot_id: &str,
+    collection: &str,
+) -> Result<Option<ModelRef>> {
+    let row: Option<(String, String, i32, bool, String)> = sqlx::query_as(
+        "SELECT m.provider, m.model, m.dimension, m.normalized, m.fingerprint
+           FROM vector_collection_state s
+           JOIN embedding_models m ON m.id = s.active_model_id
+          WHERE s.robot_id = $1 AND s.collection = $2",
+    )
+    .bind(robot_id)
+    .bind(collection)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(provider, model, dimension, normalized, fingerprint)| ModelRef {
+            provider,
+            model,
+            dimension,
+            normalized,
+            fingerprint,
+        },
+    ))
 }
 
 /// 记录（或复用）一份模型定义，返回 `embedding_models.id`。

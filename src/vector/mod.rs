@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
+use futures_util::{StreamExt, TryStreamExt};
+
 use crate::ai::embedding;
 use crate::man::settings;
 use crate::repo;
@@ -396,6 +398,135 @@ pub(crate) async fn current_model(
     })
 }
 
+/// 一个集合**当前生效**的模型（active model）；还没写过向量时为 `None`。
+///
+/// 这是 §6.4「查询嵌入必须使用 active model」的唯一入口：设置页换了模型但还没
+/// 重建时，`active_model_id` 仍指向旧模型，检索和新增数据都必须跟它走。
+pub(crate) async fn active_model(
+    robot_id: &str,
+    collection: &str,
+) -> Result<Option<repo::vector::ModelRef>> {
+    repo::vector::active_model_ref(repo::pool(), robot_id, collection).await
+}
+
+/// `ModelRef`（库里记的模型身份）→ 推理目标。
+///
+/// 本地模型的 `Display` 就是枚举 variant 名（`HuggingFaceModel` 同时 derive 了
+/// serde），所以能还原；不认识的 provider/模型名直接报错并提示重建 —— 静默退回
+/// 当前配置会把两个模型的向量混在一起。
+pub(crate) fn target_of(model: &repo::vector::ModelRef) -> Result<embedding::EmbeddingTarget> {
+    let provider = match model.provider.as_str() {
+        "huggingface" => {
+            let m: crate::ai::huggingface::HuggingFaceModel = serde_json::from_value(
+                serde_json::Value::String(model.model.clone()),
+            )
+            .map_err(|e| {
+                Error::WithMessage(format!(
+                    "Unknown local embedding model '{}' ({e}); rebuild the vector index.",
+                    model.model
+                ))
+            })?;
+            embedding::TargetProvider::HuggingFace(m)
+        }
+        "openai-compatible" => embedding::TargetProvider::OpenAICompatible(model.model.clone()),
+        other => {
+            return Err(Error::WithMessage(format!(
+                "Unsupported embedding provider '{other}' in embedding_models; rebuild the vector index."
+            )));
+        }
+    };
+    Ok(embedding::EmbeddingTarget {
+        provider,
+        dimension: model.dimension.max(0) as usize,
+    })
+}
+
+/// 检索用嵌入：有 active model 就用它，否则用当前配置。返回值带上当前设置的
+/// 相似度阈值（阈值是可调的业务参数，不属于模型身份）。
+pub(crate) async fn embed_for_query(
+    robot_id: &str,
+    collection: &str,
+    text: &str,
+) -> Result<(Vec<f32>, f32)> {
+    match active_model(robot_id, collection).await? {
+        Some(m) => embedding::embedding_with(robot_id, &target_of(&m)?, text).await,
+        None => embedding::embedding(robot_id, text).await,
+    }
+}
+
+/// 写入用：返回 `(每个文本的向量, 应该记进 generation 的模型定义)`。
+///
+/// 有 active model 时**必须**用它，新增数据才落在这一个向量空间里；没有 active
+/// model（新集合）时用当前配置，由 `put_many_active` 把模型记进这一代。
+pub(crate) async fn embed_for_write(
+    robot_id: &str,
+    collection: &str,
+    texts: &[String],
+) -> Result<(Vec<Vec<f32>>, repo::vector::ModelRef)> {
+    if let Some(model) = active_model(robot_id, collection).await? {
+        let target = target_of(&model)?;
+        let vectors = embed_texts(robot_id, Some(&target), texts).await?;
+        return Ok((vectors, model));
+    }
+    let vectors = embed_texts(robot_id, None, texts).await?;
+    let dim = vectors.first().map(|v| v.len()).unwrap_or(0);
+    let model = current_model(robot_id, dim).await?;
+    Ok((vectors, model))
+}
+
+/// 重建专用：**无论有没有 active model，都用当前配置**（重建的目的就是换模型）。
+pub(crate) async fn embed_configured(
+    robot_id: &str,
+    texts: &[String],
+) -> Result<(Vec<Vec<f32>>, repo::vector::ModelRef)> {
+    let vectors = embed_texts(robot_id, None, texts).await?;
+    let dim = vectors.first().map(|v| v.len()).unwrap_or(0);
+    let model = current_model(robot_id, dim).await?;
+    Ok((vectors, model))
+}
+
+/// 批量推理：`target = Some` 时用固定模型，否则用当前配置；最多 4 路并发。
+///
+/// 校验三件事：非空、维度一致且非 0。维度不一致说明模型在文档中途换了 —— 那会把
+/// 同一代向量拖成混合维度，必须在写入前拦住。
+async fn embed_texts(
+    robot_id: &str,
+    target: Option<&embedding::EmbeddingTarget>,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    let rid = String::from(robot_id);
+    let target = target.cloned();
+    let jobs = texts.iter().cloned().map(|text| {
+        let rid = rid.clone();
+        let target = target.clone();
+        async move {
+            match target {
+                Some(t) => embedding::embedding_with(&rid, &t, &text)
+                    .await
+                    .map(|(v, _)| v),
+                None => embedding::embedding(&rid, &text).await.map(|(v, _)| v),
+            }
+        }
+    });
+    let vectors: Vec<Vec<f32>> = futures_util::stream::iter(jobs)
+        .buffered(4)
+        .try_collect()
+        .await?;
+    let Some(dim) = vectors.first().map(|v| v.len()) else {
+        return Ok(vectors);
+    };
+    if dim == 0 {
+        return Err(Error::WithMessage(String::from("Embedding data is empty.")));
+    }
+    if let Some(bad) = vectors.iter().position(|v| v.len() != dim) {
+        return Err(Error::WithMessage(format!(
+            "Embedding dimension changed mid-batch at item {bad}: {} vs {dim}",
+            vectors[bad].len()
+        )));
+    }
+    Ok(vectors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +603,48 @@ mod tests {
     #[test]
     fn budget_defaults_to_a_positive_number_of_bytes() {
         assert!(budget_bytes() >= 8 * 1024 * 1024);
+    }
+
+    /// B-23 / §6.4：库里的模型身份必须能还原成推理目标。本地模型名就是枚举
+    /// variant 名（`Display` + serde 同名），所以 serde 往返即可。
+    #[test]
+    fn model_ref_round_trips_into_an_embedding_target() {
+        use crate::ai::embedding::TargetProvider;
+        use crate::ai::huggingface::HuggingFaceModel;
+
+        let local = repo::vector::ModelRef {
+            provider: String::from("huggingface"),
+            model: String::from("BgeM3"),
+            dimension: 1024,
+            normalized: true,
+            fingerprint: String::from("v1|huggingface|BgeM3|1024"),
+        };
+        let t = target_of(&local).unwrap();
+        assert_eq!(t.dimension, 1024);
+        assert!(matches!(
+            t.provider,
+            TargetProvider::HuggingFace(HuggingFaceModel::BgeM3)
+        ));
+
+        let remote = repo::vector::ModelRef {
+            provider: String::from("openai-compatible"),
+            model: String::from("bge-m3"),
+            dimension: 1024,
+            normalized: false,
+            fingerprint: String::from("v1|openai-compatible|bge-m3|1024"),
+        };
+        let t = target_of(&remote).unwrap();
+        assert!(matches!(
+            t.provider,
+            TargetProvider::OpenAICompatible(name) if name == "bge-m3"
+        ));
+
+        // 不认识的 provider / 模型名要报错并提示重建，不能静默退回当前配置。
+        let mut bad = local.clone();
+        bad.provider = String::from("mystery");
+        assert!(target_of(&bad).is_err());
+        let mut bad_name = local;
+        bad_name.model = String::from("NoSuchLocalModel");
+        assert!(target_of(&bad_name).is_err());
     }
 }

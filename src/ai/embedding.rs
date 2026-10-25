@@ -30,56 +30,118 @@ pub(crate) enum SentenceEmbeddingProvider {
     OpenAICompatible(String),
 }
 
-pub(crate) async fn embedding(robot_id: &str, s: &str) -> Result<(Vec<f32>, f32)> {
-    if let Some(settings) = settings::get_settings(robot_id).await? {
-        // 用户要求的目标维度。`Some(0)` 当成没设：0 维向量没有意义，让它走到
-        // "由模型决定"那条路上，而不是拼一个必然失败的请求。
-        let dimensions = settings
-            .sentence_embedding_provider
-            .dimensions
-            .filter(|d| *d > 0);
-        let dims_hint = dimensions.map(|d| d as usize);
-        let v = match settings.sentence_embedding_provider.provider {
-            SentenceEmbeddingProvider::HuggingFace(m) => hugging_face(robot_id, &m.get_info(), s),
-            SentenceEmbeddingProvider::OpenAICompatible(m) => {
-                open_ai_compatible(
-                    &m,
-                    s,
-                    &settings.sentence_embedding_provider.api_url,
-                    &settings.sentence_embedding_provider.api_key,
-                    settings.sentence_embedding_provider.connect_timeout_millis,
-                    settings.sentence_embedding_provider.read_timeout_millis,
-                    &settings.sentence_embedding_provider.proxy_url,
-                    dimensions,
-                )
-                .await
-            }
-        }?;
-        // 设了维度就必须真按这个维度回来。失败时**不能**放行：一旦把长度不对的
-        // 向量写进库，那张表就同时存在两种维度，而 turso 的
-        // `vector_distance_cos` 遇到维度不一致会直接报错 —— 表现是"检索整个挂掉"，
-        // 但那时用户已经不知道是哪次配置引起的了。宁可在写之前就把原因说清楚。
-        //
-        // 这条检查对本地模型也适用：它不认 `dimensions`，用户设了就一定会在这里
-        // 看到"没生效"，比默默写进另一个维度的向量要好。
-        if let Some(d) = dims_hint
-            && v.len() != d
-        {
-            return Err(Error::WithMessage(format!(
-                "Embedding model returned {} dimensions but {d} was requested. \
-                 Either this model does not support the dimensions parameter, \
-                 or the value is not valid for it; clear the setting to use the \
-                 model's default.",
-                v.len()
-            )));
+/// 一个明确的嵌入目标（B-23 / §6.4 的 active model）。
+///
+/// `dimension == 0` 表示"不强制"，走当前设置的 `dimensions` 语义；active model
+/// 一定有非零维度（那是它写进向量表时的真实长度），既作为请求参数也作为校验。
+pub(crate) struct EmbeddingTarget {
+    pub(crate) provider: TargetProvider,
+    pub(crate) dimension: usize,
+}
+
+#[derive(Clone)]
+pub(crate) enum TargetProvider {
+    HuggingFace(HuggingFaceModel),
+    /// 端点上的模型名（真正发给 endpoint 的字符串）。
+    OpenAICompatible(String),
+}
+
+impl Clone for EmbeddingTarget {
+    fn clone(&self) -> Self {
+        Self {
+            provider: self.provider.clone(),
+            dimension: self.dimension,
         }
-        Ok((v, settings.sentence_embedding_provider.similarity_threshold))
-    } else {
-        Err(Error::WithMessage(format!(
-            "Can not find settings of {}",
-            robot_id
-        )))
     }
+}
+
+/// 用**当前设置**里的模型算向量（默认路径：写入、重建、配置还没生效时）。
+pub(crate) async fn embedding(robot_id: &str, s: &str) -> Result<(Vec<f32>, f32)> {
+    let Some(settings) = settings::get_settings(robot_id).await? else {
+        return Err(Error::WithMessage(format!(
+            "Can not find settings of {robot_id}"
+        )));
+    };
+    let p = &settings.sentence_embedding_provider;
+    let target = match &p.provider {
+        SentenceEmbeddingProvider::HuggingFace(m) => EmbeddingTarget {
+            provider: TargetProvider::HuggingFace(m.clone()),
+            dimension: 0,
+        },
+        SentenceEmbeddingProvider::OpenAICompatible(name) => EmbeddingTarget {
+            provider: TargetProvider::OpenAICompatible(name.clone()),
+            dimension: 0,
+        },
+    };
+    embed(robot_id, &settings, &target, s).await
+}
+
+/// 用**指定的模型身份**算向量：只覆盖 provider / model / 维度，凭据、超时、代理
+/// 仍取当前设置。
+///
+/// 这是 active model 分离的核心：设置页换了模型但还没重建时，检索与新增数据都继续
+/// 用"库里那一代向量是用什么模型算的"，而不是用户刚填的新配置（§6.4）。
+pub(crate) async fn embedding_with(
+    robot_id: &str,
+    target: &EmbeddingTarget,
+    s: &str,
+) -> Result<(Vec<f32>, f32)> {
+    let Some(settings) = settings::get_settings(robot_id).await? else {
+        return Err(Error::WithMessage(format!(
+            "Can not find settings of {robot_id}"
+        )));
+    };
+    embed(robot_id, &settings, target, s).await
+}
+
+async fn embed(
+    robot_id: &str,
+    settings: &settings::Settings,
+    target: &EmbeddingTarget,
+    s: &str,
+) -> Result<(Vec<f32>, f32)> {
+    let p = &settings.sentence_embedding_provider;
+    // 用户要求的目标维度。`Some(0)` 当成没设：0 维向量没有意义。
+    let configured = p.dimensions.filter(|d| *d > 0);
+    let dims_hint: Option<u32> = if target.dimension > 0 {
+        Some(target.dimension as u32)
+    } else {
+        configured
+    };
+    let v = match &target.provider {
+        TargetProvider::HuggingFace(m) => hugging_face(robot_id, &m.get_info(), s),
+        TargetProvider::OpenAICompatible(model) => {
+            open_ai_compatible(
+                model,
+                s,
+                &p.api_url,
+                &p.api_key,
+                p.connect_timeout_millis,
+                p.read_timeout_millis,
+                &p.proxy_url,
+                dims_hint,
+            )
+            .await
+        }
+    }?;
+    // 设了维度就必须真按这个维度回来。失败时**不能**放行：一旦把长度不对的向量
+    // 写进库，同一代里就会混两种维度，索引直接不可用 —— 表现是"检索整个挂掉"，
+    // 但那时用户已经不知道是哪次配置引起的了。active model 的维度尤其不能变：
+    // 它是那一代向量的契约。
+    if let Some(d) = dims_hint
+        && v.len() != d as usize
+    {
+        return Err(Error::WithMessage(format!(
+            "Embedding model returned {} dimensions but {d} was expected. {}",
+            v.len(),
+            if target.dimension > 0 {
+                "The active vector index was built with this dimension; rebuild the index before changing it."
+            } else {
+                "Either this model does not support the dimensions parameter, or the value is not valid for it; clear the setting to use the model's default."
+            }
+        )));
+    }
+    Ok((v, p.similarity_threshold))
 }
 
 static EMBEDDING_MODEL: OnceLock<Mutex<HashMap<String, (BertModel, Tokenizer)>>> = OnceLock::new();
