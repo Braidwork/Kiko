@@ -1,0 +1,1 @@
+"C:\Program Files\7-Zip\7z.exe" a kiko.zip -x!.git -x!data -x!doc -x!examples -x!frontend -x!sdk -x!target -x!*.exe -w.

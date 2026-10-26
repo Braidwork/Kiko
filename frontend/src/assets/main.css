@@ -1,0 +1,112 @@
+@import './base.css';
+
+:root {
+    --app-primary: #6366f1;
+    --app-text: #1f2d3d;
+    --app-text-secondary: #6b7280;
+    --app-bg: #f6f8fb;
+    --app-card-border: #eef1f6;
+}
+
+body {
+    background-color: var(--app-bg);
+}
+
+a {
+    color: var(--app-primary);
+    text-decoration: none;
+    transition: color 0.2s;
+}
+
+a:hover {
+    opacity: 0.8;
+}
+
+/* ===== Shared page scaffolding for framework sub-pages ===== */
+.page-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 20px;
+}
+
+.page-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--app-text);
+    margin: 0;
+}
+
+.page-title .page-title-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+    background: #eef2ff;
+    color: var(--app-primary);
+    font-size: 20px;
+    flex-shrink: 0;
+}
+
+.page-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.page-card {
+    background: #fff;
+    border: 1px solid var(--app-card-border);
+    border-radius: 14px;
+    padding: 20px;
+    box-shadow: 0 1px 3px rgba(31, 45, 61, 0.04);
+}
+
+/* Modernize Element Plus tables inside pages */
+.el-table {
+    --el-table-border-color: var(--app-card-border);
+    --el-table-header-bg-color: #f9fafb;
+    --el-table-header-text-color: #6b7280;
+    --el-table-row-hover-bg-color: #f5f6ff;
+    border-radius: 10px;
+}
+
+.el-table th.el-table__cell {
+    font-weight: 600;
+}
+
+/* Nicer dialog / drawer headers */
+.el-dialog {
+    border-radius: 14px;
+}
+
+.el-drawer {
+    border-radius: 12px 0 0 12px;
+}
+
+/* Section titles used inside settings pages */
+.section-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--app-text);
+    margin: 28px 0 14px;
+}
+
+.section-title::before {
+    content: "";
+    display: inline-block;
+    width: 4px;
+    height: 18px;
+    border-radius: 2px;
+    background: linear-gradient(180deg, #6366f1, #8b5cf6);
+}

@@ -1,0 +1,24 @@
+[build]
+# rustflags = ["-C", "target-cpu=native"]
+# rustdocflags = ["-C", "target-cpu=native"]
+
+[target.wasm32-unknown-unknown]
+# rustflags = ["-C", "target-feature=+simd128"]
+
+[http]
+# proxy="ip:port"
+
+[target.wasm32-wasi]
+# rustflags = ["-C", "target-feature=+simd128"]
+
+# 下面是在Linux上编译musl静态链接的配置，先屏蔽掉
+# [target.x86_64-unknown-linux-musl]
+# # linker = "rust-lld"
+# linker = "./musl-zcxx"
+# # linker = "x86_64-linux-musl-gcc"
+# # rustflags = ["-Clinker=rust-lld"]
+# # rustflags = ["-C", "linker-flavor=ld.lld"]
+# rustflags = ["-C", "linker-flavor=gcc", "-C", "link-self-contained=no"]
+
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

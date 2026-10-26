@@ -1,0 +1,146 @@
+use regex::Regex;
+use unicase::UniCase;
+
+use super::dto::IntentDetail;
+use super::phrase;
+use crate::repo;
+use crate::result::Result;
+
+pub(crate) async fn detect(robot_id: &str, s: &str) -> Result<Option<String>> {
+    // let now = std::time::Instant::now();
+    // 意图载荷在 PG（S3.3）：一次取全（含 keywords/regexes/phrases），
+    // 与 A 的 `get_all` 语义一致。
+    let r: Result<Vec<IntentDetail>> = repo::intent::list(repo::pool(), robot_id).await;
+    let intents = match r {
+        Ok(v) => {
+            // log::info!("v.len {}", v.len());
+            if v.is_empty() {
+                return Ok(None);
+            }
+            v
+        }
+        Err(e) => {
+            log::warn!("Detecting intent failed: {:?}", e);
+            return Ok(None);
+        }
+    };
+    // log::info!("intents.len {}", intents.len());
+    let mut empty_phrase = true;
+    for detail in intents.iter() {
+        // log::info!("intent detail {} {}", detail.intent_id, serde_json::to_string(&detail).unwrap());
+        // log::info!("detail.keywords.len {}", detail.keywords.len());
+        let unicase_s = UniCase::new(s);
+        for k in detail.keywords.iter() {
+            // log::info!("intent compare {} {}", k.keyword, s);
+            if UniCase::new(&k.keyword) == unicase_s {
+                // println!("{} {} {}", s, k.keyword, &i.name);
+                return Ok(Some(detail.intent_name.clone()));
+            }
+        }
+        for r in detail.regexes.iter() {
+            let re = Regex::new(&r.regex)?;
+            if re.is_match(s) {
+                return Ok(Some(detail.intent_name.clone()));
+            }
+        }
+        empty_phrase = empty_phrase && detail.phrases.is_empty();
+    }
+    if empty_phrase {
+        return Ok(None);
+    }
+    // 意图短语的查询嵌入走 active model（§6.4 / B-23）：设置里换了模型但还没重建
+    // 时继续用库里那一代的模型。
+    let embedding = crate::vector::embed_for_query(robot_id, crate::repo::vector::PHRASE, s).await;
+    let embedding = match embedding {
+        Ok(embedding) => {
+            if embedding.0.is_empty() {
+                return Ok(None);
+            }
+            embedding
+        }
+        Err(e) => {
+            log::warn!("Detecting intent failed: {:?}", e);
+            return Ok(None);
+        }
+    };
+    // log::info!("Generate embedding cost {:?}", now.elapsed());
+    // let s = format!("{:?}", &embedding);
+    // let regex = regex::Regex::new(r"\s").unwrap();
+    // log::info!("detect embedding {}", regex.replace_all(&s, ""));
+    // let now = std::time::Instant::now();
+    let search_vector: Vec<f32> = embedding.0;
+    let similarity_threshold = embedding.1;
+    let result = phrase::search(robot_id, &search_vector).await?;
+    // D41 / B-31：短语检索返回的是**相似度**（越大越近），阈值也是相似度阈值。
+    // A 这里写的是 `1.0 - distance >= threshold`，数学上等价，但把方向写在了调用点，
+    // 和 QA / 文档那两处 `distance <= recall_distance` 正好相反；统一后三处都用
+    // `vector::is_hit`。
+    if let Some((name, similarity)) = result.first()
+        && crate::vector::is_hit(*similarity, similarity_threshold)
+    {
+        return Ok(Some(name.clone()));
+    }
+    Ok(None)
+}
+
+/*
+pub(crate) async fn save_intent_embedding(
+    robot_id: &str,
+    intent_id: &str,
+    intent_name: &str,
+    s: &str,
+) -> Result<i64> {
+    let embedding = embedding(robot_id, s).await?;
+    if embedding.0.is_empty() {
+        let err = format!("{s} embedding data is empty");
+        log::warn!("{}", &err);
+        return Err(Error::ErrorWithMessage(err));
+    }
+    log::info!("embedding.0.len() = {}", embedding.0.len());
+    let id = phrase::add(robot_id, intent_id, intent_name, &embedding.0).await?;
+    Ok(id)
+}
+
+pub(crate) async fn save_intent_embeddings(
+    robot_id: &str,
+    intent_id: &str,
+    intent_name: &str,
+    array: Vec<&str>,
+) -> Result<()> {
+    phrase::remove_by_intent_id(robot_id, intent_id).await?;
+    let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(array.len());
+    for &s in array.iter() {
+        let embedding = embedding(robot_id, s).await?;
+        if embedding.0.is_empty() {
+            let err = format!("{s} embedding data is empty");
+            log::warn!("{}", &err);
+        } else {
+            embeddings.push(embedding.0);
+        }
+    }
+    // if embeddings.is_empty() {
+    //     return Err(Error::ErrorWithMessage(String::from(
+    //         "No embeddings were generated.",
+    //     )));
+    // }
+    if !embeddings.is_empty() {
+        phrase::batch_add(robot_id, intent_id, intent_name, &embeddings).await?;
+    }
+    Ok(())
+}
+*/
+
+// pub(crate) async fn save_intent_embedding2(intent_id: &str, s: &str) -> Result<()> {
+// let embeddings = embedding(s)?;
+// if embeddings.is_none() {
+//     return Ok(());
+// }
+// let vectors: Vec<Vector> = embeddings.unwrap().iter().map(|v| v.into()).collect();
+// let records: Vec<Record> = vectors.iter().map(|v| Record::new(v, &"".into())).collect();
+// let mut config = Config::default();
+// config.distance = Distance::Cosine;
+// let collection = Collection::build(&config, &records)?;
+// let mut db = Database::open(&format!("{}{}",SAVING_PATH,robot_id))?;
+// db.save_collection(intent_id, &collection)?;
+// Ok(())
+// }
