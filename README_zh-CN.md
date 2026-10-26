@@ -14,7 +14,7 @@ Kiko 是一个**可私有化部署的对话机器人平台**。用拖拽式流�
 配置和主密钥。换来的是可运维性：备份、恢复、监控、审计、容量规划都沿用客户现成的
 PG 体系，而不是散落在 `data/` 里的二进制文件。
 
-<img src="https://img.shields.io/badge/version-1.24.0-blue" /> <img src="https://img.shields.io/badge/MSRV-1.94-green" /> <img src="https://img.shields.io/badge/PostgreSQL-14%2B-336791" /> <img src="https://img.shields.io/badge/license-Apache--2.0-lightgrey" />
+<img src="https://img.shields.io/badge/version-0.1.0-blue" /> <img src="https://img.shields.io/badge/MSRV-1.94-green" /> <img src="https://img.shields.io/badge/PostgreSQL-14%2B-336791" /> <img src="https://img.shields.io/badge/license-Apache--2.0-lightgrey" />
 
 ![All in ONE](./doc/assets/allinone.png)
 

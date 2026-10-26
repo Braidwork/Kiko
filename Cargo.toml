@@ -1,8 +1,8 @@
 [package]
 name = "kiko"
-version = "1.24.0"
+version = "0.1.0"
 edition = "2024"
-homepage = "https://braidwork.github.io/kiko"
+homepage = "https://braidwork.github.io/"
 authors = ["dialogflowchatbot <dialogflow@yeah.net>"]
 
 [lib]
