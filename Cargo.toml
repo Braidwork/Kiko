@@ -60,7 +60,7 @@ rkyv = {version = "0.8.18", features = ["aligned", "alloc", "bytecheck"]}
 scru128 = "4.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-scraper = "0.27.0"
+scraper = "0.29.0"
 # snmalloc-rs = "0.7.5" # 暂时不支持MUSL
 # simd-json = "0.10"
 # simsearch = "0.2"
