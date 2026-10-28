@@ -1,4 +1,4 @@
-简体中文 | [English](./README.md)
+[简体中文](./README_zh-CN.md) | English
 
 欢迎给本项目，或者给 [Github 上的项目](https://github.com/Braidwork/Kiko) ✨**Star**🎇!
 
