@@ -1,101 +1,161 @@
-[简体中文](./README_zh-CN.md) | English
+# Kiko — Self-hosted Chatbot Platform
 
-# Dialog flow AI
-**only ONE executable file**, you can use it directly, including intent detection, AI management, a visual process editor and a response system.  
-**ZERO installation**, no need to install any middleware such as Redis, Elastic Search, etc.  
-<img src="https://img.shields.io/badge/Latest_version-v1.23.0-blue" /> <img src="https://img.shields.io/badge/MSRV-1.88.0-green" /> [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Braidwork/Kiko)
+Welcome to give this project a star on [GitHub](https://github.com/Braidwork/Kiko) ✨**Star**🎇!
 
-![All in ONE](./doc/assets/allinone.png)
+Kiko is a **self-hosted chatbot platform**. Build conversational flows with a visual drag-and-drop builder, understand users via intents/keywords/regex, perform RAG-based knowledge base Q&A, and integrate with local models or any `OpenAI`-compatible API. It ships as a single binary with your business data stored in your own `PostgreSQL` — ideal for scenarios where "data cannot leave premise and you don't want to maintain a bunch of middleware."
 
-![Dialog flow editor](./doc/assets/screenshots/flow-editor-en.png)
+It is the **enterprise private deployment** fork of `dialogflow-rs` (Apache-2.0). The biggest difference from upstream is **storage**: knowledge base, intents, flows, sessions, and vectors all go into the customer's own `PostgreSQL`; `data/` only holds model weights, uploaded original files, configuration, and the master key. The key benefit is operational manageability: backup, restore, monitoring, audit, and capacity planning all leverage the customer's existing PG infrastructure rather than scattered binary files in `data/`.
 
-![Dialog flow editor](./doc/assets/screenshots/chat_demo_eng.gif)
+[![title=,alt=]()](<image-ocr:a60d276440336bf2ac6ef7b389ae2eed>) [![title=,alt=]()](<image-ocr:b8cfdc4bb93514c5ba0b9e476f5824f3>) [![title=,alt=]()](<image-ocr:a3a88c884fcb38b0179808e90ad5fdf8>) [![title=,alt=]()](<image-ocr:b2869bfc6221900650f57cd10f304f58>)
 
-# ✨ Features
-* 🛒 **Light** Only ONE executable file, it can run smoothly on laptops without GPUs (data files will be created at runtime automatically).
-* 🐱‍🏍 **AI powered** Integrated `Huggingface local models (Llama, Phi-3, Gemma, Multilingual E5, MiniLM L6v2, NomicEmbedTextV1_5, etc.)`, and **any OpenAI-compatible endpoint** — `OpenAI`, `DeepSeek`, `Zhipu GLM`, `Qwen`, `Moonshot Kimi`, `SiliconFlow`, `Groq`, `OpenRouter`, `Ollama`, `vLLM`, `LM Studio`, or your own gateway. Just fill in the URL and API key. This can be used for `Chat`, `Text generation` and `Intent detection`.
-* 🚀 **Fast** Built on Rust and Vue3.
-* 😀 **Simple** Use the mouse to drag and drop with our intuitive node-based editor.
-* 🔐 **Safe** 100% open source, all runtime data is saved locally (Using `OpenAI API` may expose some data).
+[![title=,alt=All in ONE]()](<image-ocr:1d6d71eb91050359bbf28bcd9b07aed1>)
 
-# Give it a try!
-* 🐋 **Docker** We provided an image on Docker Hub at [Braidwork/Kiko](https://hub.docker.com/r/Braidwork/Kiko/)
-* 💻 **Binary releases**, please check [here](https://github.com/Braidwork/Kiko/releases)
+[![title=,alt=]()](<image-ocr:3ae30537596a7dca2ea1bb2eb2294a13>)
 
-> By default application will listen to `127.0.0.1:12715`, you can use `-ip` and `-port` specify new value, e.g.: `kiko -ip 0.0.0.0 -port 8888`
+## Differences from dialogflow-rs
 
-### Streaming answers
+| Dimension | dialogflow-rs (upstream) | **Kiko (this repo)** |
+| --- | --- | --- |
+| Positioning | Out-of-the-box single machine | Enterprise private deployment, targeting "customer provides database" delivery scenarios |
+| Business Data | Embedded redb (later turso) | **External PostgreSQL**, fixed schema `kiko`, does not use `public` |
+| Knowledge Base / Vectors | Same embedded storage as metadata | `documents` / `doc_chunks` / `qa` + `vector_items` etc. all go into PG |
+| Installation Dependencies | Zero | Requires PostgreSQL (18 for dev verification, 14+ recommended) |
+| Schema Management | None (data files travel with the program) | `sqlx::migrate!` embedded migrations, auto-migrate on startup (`auto_migrate`) |
+| Concurrency Correctness | Single write queue, read-modify-write has stale update window | Transactions + row locks + **optimistic locking on all editable entities** (`version`), explicit conflict errors |
+| Sensitive Config | Local plaintext | `secrets` table + `enc:`/`env:`/`file:` reference strings, AES-GCM encryption, master key can be externalized |
+| Switching Embedding Models | Change config to take effect (may mix old/new vectors) | **Active model separation**: queries/incremental writes follow the "indexed model", only full rebuild switches |
+| Vector Index | turso internal search | PG as source of truth + in-process brute-force index (memory budget, f16 quantization, dirty marking, background reconciliation) |
+| Restart & Resume | Depends on redb/turso file consistency | Runtime also in PG; rebuild scans are idempotent, interruptible resume (no jobs table) |
+| Configuration | Environment variables / built-in | `data/kiko.toml` + `KIKO_*` overrides (priority: env vars > file > defaults) |
+| API Contract | Includes internal row IDs | External-facing only uses scru128 primary keys, internal row IDs not exposed |
 
-`POST /flow/answer` returns the answer in one document unless the request body asks
-for `"stream": true`. Then the response is `application/x-ndjson`: one JSON frame per
-line, each carrying a piece of an answer (`{"contentSeq": 0, "content": "..."}`), and
-the last line is always a terminal frame (`contentSeq: null`) whose `content` is the
-whole `{status, data, err}` response, so the final `nextAction` and `collectData`
-arrive with it.
+## Highlights
 
-```bash
+* 🗄️ **Database as source of truth**: No embedded DB, no turso/redb file locks. Backup = PG backup.
+    * `data/uploads/` (plus `data/master.key`), restore, master-replica, monitoring all handed off to the customer's existing PG infrastructure.
+* 📦 **Still a single binary**: Rust backend + Vue3 frontend compiled into one executable; `data/` only holds model weights, uploaded original files, `kiko.toml`, and master key — business data all stays local.
+* 🔎 **Auditable knowledge base**: DOCX upload → chunking (original `chunk_text` + normalized `chunk_text_norm`) → vectors, original text queryable and traceable; keyword recall and vector recall fused via RRF.
+* 🧠 **Operable vector index**: `[vector]` configures memory budget (default 512 MB), over budget first quantize to f16, then evict entire collections by LRU; background reconcile by row count against PG, mark `dirty` on drift; rebuild resumes idempotently by generation.
+* 🔁 **Safe model switching**: Queries and incremental writes use the model pointed to by `active_model_id`, only switch overall after rebuild completes; no silent "new query vectors vs old store vectors" errors.
+* 🔐 **Sensitive config not in plaintext**: API keys / passwords stored as reference strings, master key externalizable via `KIKO_MASTER_KEY`; never written to logs, never echoed.
+* 🧩 **Concurrency safe**: Edits to documents, Q&A, canvas, main flow, bots, variables, external HTTP all carry `version` checks; missing version rejected outright, stale versions return conflict, no more silent overwrites of others' changes.
+* ⚙️ **Transparent configuration**: `data/kiko.toml` template with full comments, every `KIKO_*` override has a one-to-one correspondence.
+* 🧪 **Testable**: PG integration tests use `tmp_<uuid>` schema, dropped after each run, no pollution of shared databases.
+* 🧬 **Inherits upstream**: Flow engine, 9 node types, intents/keywords/regex/phrases, streaming responses, OpenAI-compatible API and local `HuggingFace` models all preserved, frontend is the same Vue3 UI.
+
+## Key Features (Inherited from Upstream)
+
+* 🐱‍🏍 **AI-driven**: Local `Huggingface` models (Llama, Phi-3, Gemma, Multilingual E5, MiniLM L6v2, NomicEmbedTextV1_5 etc.) and any OpenAI-compatible API (OpenAI, DeepSeek, Zhipu GLM, Tongyi Qianwen, Kimi, SiliconFlow, Groq, OpenRouter, Ollama, vLLM, LM Studio or self-hosted gateway), usable for flow chat, answer generation, and intent recognition.
+* 😀 **Visual orchestration**: Build bots by dragging nodes, supporting conditional branches, information collection, jumps, external HTTP, email, knowledge base answers, etc.
+* 🚀 **Rust + Vue**: Single process, multi-threaded runtime, no Node/Python runtime dependencies.
+* 🔐 **Data stays in-domain**: Business data in customer PG, models and uploaded files in customer `data/`; only exits network when external model API is explicitly configured.
+
+## Functional Nodes
+
+| Node | Name |
+| --- | --- |
+|  | Conversation Answer Node |
+|  | LLM Chat Node |
+|  | Knowledge Base Answer Node |
+|  | Condition Node |
+|  | Jump Node |
+|  | Information Collection Node |
+|  | External API Request Node |
+|  | Email Send Node |
+|  | Flow End Node |
+
+## Streaming Responses
+
+`POST /flow/answer` returns a JSON document by default; when the request body includes `"stream": true`, it switches to frame-by-frame push with `application/x-ndjson` response — one JSON per line, `{"contentSeq": 0, "content": "..."}` is an answer fragment, and the last line is always the terminal frame (`contentSeq: null`) whose `content` is the complete `{status, data, err}` response. Full protocol in [`doc/streaming.md`](doc/streaming.md).
+
+```shell
 curl -N -H 'Content-Type: application/json' \
-  -d '{"robotId":"...","mainFlowId":"...","userInput":"hi","stream":true}' \
+  -d '{"robotId":"...","mainFlowId":"...","userInput":"你好","stream":true}' \
   http://127.0.0.1:12715/flow/answer
 ```
 
-A client that does not send `stream` gets exactly the JSON it got before 1.23. See
-[doc/streaming.md](doc/streaming.md) for the full protocol, the Java/JavaScript client
-contracts and the known limitations.
+## Getting Started
 
-<!-- # Releases and source code
-* 💾 If you're looking for **binary releases**, please check [here](https://github.com/dialogflowai/dialogflow/releases)
-* 🎈 The **back end** of this application is [here](https://github.com/dialogflowchatbot/dialogflow-backend)
-* 🎨 The **front end** of this application is [here](https://github.com/dialogflowchatbot/dialogflow-frontend) -->
+### 1. Prepare PostgreSQL
 
-# Check out introduction page
-[https://braidwork.github.io/kiko/](https://braidwork.github.io/kiko/)
+Kiko requires a writable PostgreSQL database (18 for dev verification, 14+ recommended). No Redis, ElasticSearch, or vector database needed.
 
-# Function nodes
-|Node|Name|
-|----|----|
-|![DialogNode](./doc/assets/screenshots/dialogNode.png)|Dialog Node|
-|![LLM chat node](./doc/assets/screenshots/llmChatNode.png)|Large language model chat node|
-|![](./doc/assets/screenshots/knowledgeBaseAnswerNode.png)|Knowledge base answer node|
-|![](./doc/assets/screenshots/conditionNode.png)|Conditions node|
-|![](./doc/assets/screenshots/gotoNode.png)|Goto node|
-|![](./doc/assets/screenshots/collectNode.png)|Collect node|
-|![](./doc/assets/screenshots/externalApiNode.png)|External HTTP node|
-|![](./doc/assets/screenshots/sendEmailNode.png)|Send email node|
-|![](./doc/assets/screenshots/theEndNode.png)|The end node|
+```sql
+CREATE DATABASE kiko;
+CREATE USER kiko WITH PASSWORD 'change-me';
+GRANT ALL PRIVILEGES ON DATABASE kiko TO kiko;
+```
 
-Using the different nodes above, to arrange and combine, you can get a conversational bot that can handle problems in different scenarios.
+### 2. Write Configuration
 
-# Screenshots
-![Homepage](./doc/assets/screenshots/homepage.png)
+Defaults to reading `data/kiko.toml` (use `KIKO_CONFIG` to specify another path). **On first startup, if the file doesn't exist, the program generates a commented template and exits** — fill in the connection string and restart:
 
-![Robot detail](./doc/assets/screenshots/robotDetail.png)
+```toml
+[database]
+# You can also set KIKO_DATABASE_URL (higher priority than this file), but the config file itself must exist
+url = "postgres://kiko:change-me@127.0.0.1:5432/kiko"
+# Auto-run embedded migrations on startup (--migrate-only planned for S5)
+auto_migrate = true
 
-### Trying a demo dialog flow
-![Demo](./doc/assets/screenshots/demo1.gif)
+[security]
+# Leave blank to auto-generate data/master.key on first startup (Unix permissions 0600).
+# Can also be injected via KIKO_MASTER_KEY.
+master_key = ""
 
-### Setup a condition branch
-![Setup a condition branch](./doc/assets/screenshots/condition1.gif)
+[vector]
+# Total memory budget (MB) for all loaded indices, 0 = use default 512
+index_budget_mb = 512
+# Background reconciliation interval (seconds), 0 = disabled
+reconcile_secs = 60
+```
 
-### Text generation
+### 3. Run
 
-![Text generation](./doc/assets/screenshots/textGeneration.gif "Text generation")
+```shell
+kiko                          # default 127.0.0.1:12715
+kiko -ip 0.0.0.0 -port 8888   # specify listen address/port
+```
 
-### Testing a dialog flow
-![Flow testing tool](./doc/assets/screenshots/testing.png "Flow testing tool")
+First startup will: connect to PG → run migrations → generate `data/master.key` (if not configured) → start HTTP service. Open `http://127.0.0.1:12715/` in your browser.
 
+> Pre-compiled packages and Docker image release flows are S5 and not yet solidified. Currently build from source: first produce frontend assets in `frontend/`, place them in `src/resources/assets/`, then `cargo build --release` (this pipeline is an S5 packaging item, not yet automated).
 
-# Get started
+## Configuration Options and Overrides
 
-### Docker image
-1. docker pull braidwork/kiko
-2. docker run -dp 127.0.0.1:12715:12715 --name kiko braidwork/kiko
-3. Open your browser and visit: http://127.0.0.1:12715/
+Priority: **Environment Variables > `data/kiko.toml` > Built-in Defaults**.
 
-### Binary release
-1. From [Github release page](https://github.com/Braidwork/Kiko/releases), depending on the operating system, download the application.
-1. Run it directly, or use the `-ip` and `-port` parameters to perform the listening IP address and port, e.g.: `kiko -ip 0.0.0.0 -port 8888`.
-1. Open your browser and visit http://localhost:12715 (by default) or http://`new IP`:`new port` to see the application in action
-1. Add a main flow and click its name into it
-1. Create dialog flow by dragging and drop nodes onto canvas
-1. Test it
+| Config | File Key | Environment Variable | Description |
+| --- | --- | --- | --- |
+| Config file path | — | `KIKO_CONFIG` | Default `data/kiko.toml` |
+| Database connection string | `[database] url` | `KIKO_DATABASE_URL` | Required (or provided by env) |
+| Auto migrate | `[database] auto_migrate` | — | Default `true` |
+| Master key | `[security] master_key` | `KIKO_MASTER_KEY` | Auto-generate `data/master.key` if blank |
+| Vector index budget | `[vector] index_budget_mb` | `KIKO_VECTOR_INDEX_BUDGET_MB` | MB, 0 = 512 |
+| Background reconcile interval | `[vector] reconcile_secs` | `KIKO_VECTOR_RECONCILE_SECS` | Seconds, 0 = disabled |
+
+## Development
+
+```shell
+cargo check                     # fast
+cargo test                      # unit tests
+KIKO_TEST_DATABASE_URL=postgres://postgres:password@127.0.0.1:5432/kiko_dev cargo test
+cargo clippy --all-targets
+cargo fmt --check
+```
+
+Frontend source in `frontend/`:
+
+```shell
+cd frontend && pnpm install && pnpm dev   # http://localhost:5173, API points to 127.0.0.1:12715
+```
+
+> When only changing frontend source, don't manually edit `src/resources/assets/` or `src/web/asset.rs` — they are build artifacts. Frontend assets embedded into the binary is an S5 packaging item, not yet automated.
+
+## Documentation
+
+* [`doc/streaming.md`](doc/streaming.md) — `/flow/answer` streaming protocol.
+* [`README.md`](README.md) — Upstream English README (not yet synced with Kiko, refer to this page as source of truth).
+
+## License
+
+Apache-2.0, see [`LICENSE`](LICENSE).
