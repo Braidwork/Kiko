@@ -1,4 +1,4 @@
-简体中文 | [English](./README.md)
+[简体中文](./README_zh-CN.md) | English
 
 Welcome to give this project a star on [GitHub](https://github.com/Braidwork/Kiko) ✨**Star**🎇!
 
@@ -161,3 +161,33 @@ cd frontend && pnpm install && pnpm dev   # http://localhost:5173, API points to
 ## License
 
 Apache-2.0, see [`LICENSE`](LICENSE).
+
+
+## We also provide Community and Government & Enterprise Editions
+
+| Feature | Community Edition | Enterprise Edition | Government & Enterprise Edition |
+|---|---|---|---|
+| Visual node editor | Supported | Supported | Supported |
+| Dialogue nodes | Supported | Supported | Supported |
+| LLM chat nodes | Supported | Supported | Supported |
+| Knowledge base answer nodes | Supported | Supported | Supported |
+| Condition nodes | Supported | Supported | Supported |
+| Collection nodes | Supported | Supported | Supported |
+| Jump nodes | Supported | Supported | Supported |
+| External HTTP request nodes | Supported | Supported | Supported |
+| Email sending nodes | Supported | Supported | Supported |
+| End nodes | Supported | Supported | Supported |
+| Intent recognition | Supported | Supported | Supported |
+| Knowledge base | Supported | Supported | Supported |
+| Variable support | Supported | Supported | Supported |
+| Create dialogue flows via API | Not supported | Supported | Supported |
+| Data export/import | Not supported | Supported | Supported |
+| SQL Server | Not supported | WIP | Supported |
+| SQLite | Not supported | WIP | Supported |
+| PostgreSQL | Not supported | Supported | Supported |
+| MySQL | Not supported | WIP | Supported |
+| Audit | Not supported | Not supported | Supported |
+| Xinchuang / localized ecosystem | Not supported | Not supported | Supported |
+| License | Apache License 2.0 | Apache License 2.0 | Apache License 2.0 |
+| Technical support | GitHub issues | Email | Email |
+| Project link | https://github.com/dialogflowai/dialogflow | https://github.com/Braidwork/Kiko | Under development |
