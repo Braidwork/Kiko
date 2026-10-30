@@ -1,4 +1,4 @@
-[简体中文](./README_zh-CN.md) | English
+简体中文 | [English](./README.md)
 
 欢迎给本项目，或者给 [Github 上的项目](https://github.com/Braidwork/Kiko) ✨**Star**🎇!
 
@@ -188,3 +188,32 @@ cd frontend && pnpm install && pnpm dev   # http://localhost:5173，接口指向
 ## 许可证
 
 Apache-2.0，见 [`LICENSE`](LICENSE)。
+
+## 我们还提供企业、政企版
+
+| 功能 | 社区版 | 企业版 | 政企版 |
+|------|--------|--------|--------|
+| 直观的节点编辑器 | 支持 | 支持 | 支持 |
+| 话术节点 | 支持 | 支持 | 支持 |
+| 大模型聊天节点 | 支持 | 支持 | 支持 |
+| 知识库答案节点 | 支持 | 支持 | 支持 |
+| 条件节点 | 支持 | 支持 | 支持 |
+| 采集节点 | 支持 | 支持 | 支持 |
+| 跳转节点 | 支持 | 支持 | 支持 |
+| 外部HTTP请求节点 | 支持 | 支持 | 支持 |
+| 邮件发送节点 | 支持 | 支持 | 支持 |
+| 结束节点 | 支持 | 支持 | 支持 |
+| 意图识别 | 支持 | 支持 | 支持 |
+| 知识库 | 支持 | 支持 | 支持 |
+| 变量支持 | 支持 | 支持 | 支持 |
+| 通过API创建对话流程 | 不支持 | 支持 | 支持 |
+| 数据导出/导入 | 不支持 | 支持 | 支持 |
+| SQL Server | 不支持 | 正在适配 | 支持 |
+| SQLite | 不支持 | 正在适配 | 支持 |
+| PostgreSQL | 不支持 | 支持 | 支持 |
+| MySQL | 不支持 | 正在适配 | 支持 |
+| 审计/Audit | 不支持 | 不支持 | 支持 |
+| 信创/国产化生态 | 不支持 | 不支持 | 支持 |
+| 许可证 | Apache license 2.0 | Apache license 2.0 | Apache license 2.0 |
+| 技术支持 | Github issues | Email | Email |
+| 项目链接 | https://github.com/dialogflowai/dialogflow | https://github.com/Braidwork/Kiko | 开发中 |
