@@ -29,6 +29,18 @@ function manualChunks(id) {
 // https://vitejs.dev/config/
 export default ({ command, mode }) => {
   return defineConfig({
+    // 开发服务器代理：浏览器始终访问同源的 `/api/*`，由 Vite 转给 Rust 后端。
+    // 这样 HttpOnly cookie 不需要 CORS，也不会再出现登录 POST 的 OPTIONS 预检 405。
+    // 生产构建仍然走同源 `/`（见 .env.production），不经过这个代理。
+    server: {
+      proxy: {
+        '/api': {
+          target: 'http://127.0.0.1:12715',
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/api/, ''),
+        },
+      },
+    },
     // resolve: {
     //   alias: {
     //     '@': pathSrc,
