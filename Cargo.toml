@@ -48,7 +48,7 @@ colored = "3.1.1"
 #fastembed = "3.6"
 futures = "0.3.34"
 futures-util = "0.3.34"
-getrandom = "0.2.17"
+getrandom = "0.4.3"
 # hf-hub = { path = "./rslibs/hf-hub", default-features = false, features = ["tokio"] }
 itoa = "1.0.18"
 # jieba-rs = "0.6.7"
@@ -62,7 +62,7 @@ rkyv = {version = "0.8.18", features = ["aligned", "alloc", "bytecheck"]}
 scru128 = "4.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-scraper = "0.27.0"
+scraper = "0.29.0"
 # snmalloc-rs = "0.7.5" # 暂时不支持MUSL
 # simd-json = "0.10"
 # simsearch = "0.2"
@@ -91,12 +91,12 @@ sqlx = { version = "0.9", default-features = false, features = [
     "macros",
     "derive",
 ] }
-lopdf = "0.45.0"
+lopdf = "0.46.0"
 # docx-rs = "0.4.17"
 # lancedb = "0.13.0"
 # libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 validator = "0.21.0"
-zip = "8.6.0"
+zip = "9.0.5"
 quick-xml = "0.42.0"
 # usearch = "2.17"
 # cxx = "1.0"
@@ -107,7 +107,7 @@ quick-xml = "0.42.0"
 text-splitter = "0.33"
 # num_cpus = "1.17.0"
 # SHA-256：知识库原文件的 content_hash（§5.6 / D30）。sqlx 等依赖已经带了这个 crate。
-sha2 = "0.10.9"
+sha2 = "0.11.1"
 unicode-casefold = "0.2.0"
 # sqlite-vec = { path = "/mnt/d/work/sqlite-vec/bindings/rust/" }
 
