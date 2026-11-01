@@ -143,6 +143,14 @@ rpath = false
 [profile.test]
 debug = 1
 
+# 调试构建里 Argon2 的 pure-Rust 实现会被 opt-level=0 拖到接近 1 秒/次；
+# 登录/改密在开发时会明显卡顿。只优化这两个包，避免整体 dev 重编译变慢。
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.bench]
 debug = 1
 
