@@ -106,11 +106,8 @@ pub(super) fn gen_text(
     let mut rng = Rand::new();
     let mut model = model.clone();
     model.clear_kv_cache();
-    let mut logits_processor = LogitsProcessor::new(
-        rng.r#gen::<u64>(),
-        Some(super::chat::TEMPERATURE),
-        top_p,
-    );
+    let mut logits_processor =
+        LogitsProcessor::new(rng.r#gen::<u64>(), Some(super::chat::TEMPERATURE), top_p);
     for index in 0..sample_len {
         let context_size = if index > 0 { 1 } else { tokens.len() };
         let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
@@ -120,9 +117,7 @@ pub(super) fn gen_text(
         let logits = if super::chat::REPEAT_PENALTY == 1. {
             logits
         } else {
-            let start_at = tokens
-                .len()
-                .saturating_sub(super::chat::REPEAT_LAST_N);
+            let start_at = tokens.len().saturating_sub(super::chat::REPEAT_LAST_N);
             candle_transformers::utils::apply_repeat_penalty(
                 &logits,
                 super::chat::REPEAT_PENALTY,

@@ -241,7 +241,12 @@ pub(crate) async fn req(
     read_timeout_milliseconds: u64,
     vars: &HashMap<String, VariableValue>,
 ) -> reqwest::Result<ResponseData> {
-    let req = build_req(&info, connect_timeout_milliseconds, read_timeout_milliseconds, vars)?;
+    let req = build_req(
+        &info,
+        connect_timeout_milliseconds,
+        read_timeout_milliseconds,
+        vars,
+    )?;
     let res = req.send().await?;
     // println!("http status code {}", res.status().as_str());
     if res.status() != reqwest::StatusCode::OK {
@@ -613,11 +618,8 @@ mod tests {
                 CONNECTIONS.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     // A GET carries no body, so the blank line ends it.
-                    let head_end = |buf: &[u8]| {
-                        buf.windows(4)
-                            .position(|w| w == b"\r\n\r\n")
-                            .map(|i| i + 4)
-                    };
+                    let head_end =
+                        |buf: &[u8]| buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
                     let mut unread = Vec::new();
                     let mut chunk = [0u8; 512];
                     loop {
@@ -646,8 +648,14 @@ mod tests {
         // this test's way.
         let a = get_client(1_000, 7_777, "").unwrap();
         let b = get_client(1_000, 7_777, "").unwrap();
-        assert_eq!(a.get(&url).send().await.unwrap().text().await.unwrap(), "ok");
-        assert_eq!(b.get(&url).send().await.unwrap().text().await.unwrap(), "ok");
+        assert_eq!(
+            a.get(&url).send().await.unwrap().text().await.unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            b.get(&url).send().await.unwrap().text().await.unwrap(),
+            "ok"
+        );
         assert_eq!(
             CONNECTIONS.load(Ordering::SeqCst),
             1,

@@ -9,8 +9,8 @@ use candle::{DType, Device};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use candle_transformers::models::gemma::{Config as GemmaConfig, Model as GemmaModel};
-use candle_transformers::models::gemma4::config::Gemma4Config;
 use candle_transformers::models::gemma4::Model as Gemma4Model;
+use candle_transformers::models::gemma4::config::Gemma4Config;
 use candle_transformers::models::llama::{Cache as LlamaCache, Llama, LlamaConfig, LlamaEosToks};
 use candle_transformers::models::moondream::{Config as MoondreamConfig, Model as MoondreamModel};
 use candle_transformers::models::parler_tts::{Config as ParlerTtsConfig, Model as ParlerTtsModel};
@@ -510,7 +510,7 @@ impl HuggingFaceModelInfo {
                 }
                 Ok(p)
             }
-            HuggingFaceModelType::Moondream => todo!()
+            HuggingFaceModelType::Moondream => todo!(),
         }
     }
 }
@@ -1588,7 +1588,10 @@ fn download_file_list(info: &HuggingFaceModelInfo) -> Vec<(&'static str, String)
         .map(|&name| (file_repository(info, name), String::from(name)))
         .collect();
     if !info.gguf_model_filename.is_empty() {
-        files.push((file_repository(info, info.gguf_model_filename), String::from(info.gguf_model_filename)));
+        files.push((
+            file_repository(info, info.gguf_model_filename),
+            String::from(info.gguf_model_filename),
+        ));
     }
     files
 }
@@ -1665,10 +1668,8 @@ pub(crate) fn load_gemma_model_files(
 /// `Gemma4Config` 就是照这个结构反序列化的。缺 `vision_config` 时给出**针对性的**
 /// 提示，而不是让 serde 只报一句 "missing field"：那种检查点没有视觉塔，我们跑不了。
 fn read_gemma4_config(config_filename: &str) -> Result<Gemma4Config> {
-    let raw: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(config_filename)?).map_err(|e| {
-            Error::WithMessage(format!("{config_filename} is not valid JSON: {e}"))
-        })?;
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(config_filename)?)
+        .map_err(|e| Error::WithMessage(format!("{config_filename} is not valid JSON: {e}")))?;
     if raw.get("text_config").is_none() {
         return Err(Error::WithMessage(format!(
             "{config_filename} has no text_config: this does not look like a Gemma 4 config"
@@ -1736,7 +1737,10 @@ pub(crate) fn load_gemma4_model_files(
     // `raw_config["audio_config"]` 置成 `null` 再构造（`forward_multimodal` 本来就把
     // 音频塔当可选的，`None` 会直接跳过音频注入）。
     let model = super::gemma::Gemma4Loaded(Gemma4Model::new(&config, vb)?);
-    log::info!("Gemma4: weights loaded in {:.2}s", start.elapsed().as_secs_f32());
+    log::info!(
+        "Gemma4: weights loaded in {:.2}s",
+        start.elapsed().as_secs_f32()
+    );
     Ok((device, model, tokenizer))
 }
 
@@ -1910,10 +1914,7 @@ mod tests {
             repos["Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"],
             "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF"
         );
-        assert_eq!(
-            repos["tokenizer.json"],
-            "Qwen/Qwen3-30B-A3B-Instruct-2507"
-        );
+        assert_eq!(repos["tokenizer.json"], "Qwen/Qwen3-30B-A3B-Instruct-2507");
     }
 
     /// The load path must match where the files are actually saved.
@@ -1954,7 +1955,10 @@ mod tests {
             );
         }
         assert_eq!(
-            HuggingFaceModel::Qwen3_0_6B.get_info().gguf_model_path().unwrap(),
+            HuggingFaceModel::Qwen3_0_6B
+                .get_info()
+                .gguf_model_path()
+                .unwrap(),
             "./data/models/Qwen/Qwen3-0.6B/Qwen3-0.6B-Q4_K_M.gguf"
         );
     }
@@ -2005,22 +2009,19 @@ mod tests {
             gguf_model_filename: "",
             tokenizer_repository: "",
         };
-        let expected = format!("{HUGGING_FACE_MODEL_ROOT}__no_such_repository__/nope/tokenizer.json");
+        let expected =
+            format!("{HUGGING_FACE_MODEL_ROOT}__no_such_repository__/nope/tokenizer.json");
 
         let cases: [(&str, Result<()>); 4] = [
             ("llama", load_llama_model_files(&info).map(|_| ())),
             ("gemma", load_gemma_model_files(&info).map(|_| ())),
-            (
-                "moondream",
-                load_moondream_model_files(&info).map(|_| ()),
-            ),
-            (
-                "parler_tts",
-                load_parler_tts_model_files(&info).map(|_| ()),
-            ),
+            ("moondream", load_moondream_model_files(&info).map(|_| ())),
+            ("parler_tts", load_parler_tts_model_files(&info).map(|_| ())),
         ];
         for (name, r) in cases {
-            let err = r.expect_err("a repository that does not exist must fail").to_string();
+            let err = r
+                .expect_err("a repository that does not exist must fail")
+                .to_string();
             assert!(
                 err.contains(&expected),
                 "{name} looked for the tokenizer somewhere else: {err}"

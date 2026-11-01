@@ -122,25 +122,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         &mut service_asset_file,
         r##"pub(crate) static ASSETS_MAP: LazyLock<HashMap<&str, usize>> = LazyLock::new(|| {{"##,
     )?;
-    writeln!(&mut service_asset_file, r##"HashMap::from(["##,)?;
+    writeln!(&mut service_asset_file, r##"    HashMap::from(["##,)?;
     let mut i = 0u8;
     for f in file_list.iter() {
         if f.eq("index.html") {
             writeln!(
                 &mut service_asset_file,
-                r##"("/", {counter}),"##,
+                r##"        ("/", {counter}),"##,
                 counter = i,
             )?;
         }
         writeln!(
             &mut service_asset_file,
-            r##"(r"/{name}", {counter}),"##,
+            r##"        (r"/{name}", {counter}),"##,
             name = f.replace("\\", "/"),
             counter = i,
         )?;
         i += 1;
     }
-    writeln!(&mut service_asset_file, r##"])}});"##,)?;
+    writeln!(&mut service_asset_file, r##"    ])"##,)?;
+    writeln!(&mut service_asset_file, r##"}});"##,)?;
 
     Ok(())
 }

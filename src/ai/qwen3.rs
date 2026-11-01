@@ -162,11 +162,8 @@ fn generate<M: NextLogits>(
     let eos_token = eos_token_of(&tokenizer)?;
 
     let mut rng = Rand::new();
-    let mut logits_processor = LogitsProcessor::new(
-        rng.r#gen::<u64>(),
-        Some(super::chat::TEMPERATURE),
-        top_p,
-    );
+    let mut logits_processor =
+        LogitsProcessor::new(rng.r#gen::<u64>(), Some(super::chat::TEMPERATURE), top_p);
 
     let start_gen = std::time::Instant::now();
     let mut generated = 0usize;

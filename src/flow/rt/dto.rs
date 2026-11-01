@@ -82,7 +82,9 @@ impl ResponseChannelWrapper {
         self.sender.is_some()
     }
     /// The raw channel, for handing to a generator that pushes its own deltas.
-    pub(crate) fn sender(&self) -> Option<&tokio::sync::mpsc::UnboundedSender<StreamingResponseData>> {
+    pub(crate) fn sender(
+        &self,
+    ) -> Option<&tokio::sync::mpsc::UnboundedSender<StreamingResponseData>> {
         self.sender.as_ref()
     }
     /// Pushes one answer delta, tagged with the answer it belongs to.
@@ -113,7 +115,7 @@ impl ResponseChannelWrapper {
                 } else {
                     true
                 }
-            },
+            }
             None => false,
         }
     }

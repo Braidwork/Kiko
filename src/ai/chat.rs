@@ -73,11 +73,12 @@ fn evict_one_idle<T>(
     models: &mut HashMap<String, Arc<Mutex<T>>>,
     lru: &mut std::collections::VecDeque<String>,
 ) -> Option<String> {
-    if let Some(free) = lru
-        .iter()
-        .rev()
-        .find(|k| models.get(*k).map(|e| e.try_lock().is_ok()).unwrap_or(false))
-    {
+    if let Some(free) = lru.iter().rev().find(|k| {
+        models
+            .get(*k)
+            .map(|e| e.try_lock().is_ok())
+            .unwrap_or(false)
+    }) {
         let key = free.clone();
         models.remove(&key);
         if let Some(i) = lru.iter().position(|k| *k == key) {
@@ -357,7 +358,8 @@ mod lock_tests {
         });
 
         assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
             "a second generation on the same model must wait for the first"
         );
         drop(guard);
@@ -393,8 +395,14 @@ mod lock_tests {
         touch_lru(&mut lru, "t7");
         evict_one_idle(&mut models, &mut lru);
         assert!(models.contains_key("t2"), "t2 was touched, so it stays");
-        assert!(!models.contains_key("t3"), "t3 became the least recently used");
-        assert!(models.contains_key("t7"), "the newest entry must never be evicted");
+        assert!(
+            !models.contains_key("t3"),
+            "t3 became the least recently used"
+        );
+        assert!(
+            models.contains_key("t7"),
+            "the newest entry must never be evicted"
+        );
     }
 
     /// 正在生成的模型优先不被淘汰：`try_lock` 拿不到锁说明有人占着。
@@ -678,17 +686,15 @@ fn huggingface(
             Some(0.5),
             &mut result_sender,
         ),
-        LoadedHuggingFaceModel::Qwen3Moe((device, model, tokenizer)) => {
-            super::qwen3::gen_text_moe(
-                device,
-                model,
-                tokenizer,
-                &new_prompt,
-                sample_len,
-                Some(0.5),
-                &mut result_sender,
-            )
-        }
+        LoadedHuggingFaceModel::Qwen3Moe((device, model, tokenizer)) => super::qwen3::gen_text_moe(
+            device,
+            model,
+            tokenizer,
+            &new_prompt,
+            sample_len,
+            Some(0.5),
+            &mut result_sender,
+        ),
         LoadedHuggingFaceModel::Bert(_m) => Err(Error::WithMessage(format!(
             "Unsuported model type {:?}.",
             &info.model_type
@@ -729,7 +735,8 @@ async fn open_ai_compatible(
     // The system message is pushed rather than written into a pre-sized slot:
     // indexing a `Vec::with_capacity(1)` that was never pushed to panics, which
     // is what an empty or absent history used to do.
-    let mut messages: Vec<Value> = Vec::with_capacity(1 + chat_history.as_ref().map_or(0, Vec::len));
+    let mut messages: Vec<Value> =
+        Vec::with_capacity(1 + chat_history.as_ref().map_or(0, Vec::len));
     messages.push(Value::Object(sys_message));
     if let Some(h) = chat_history {
         for p in h.into_iter() {
@@ -747,9 +754,9 @@ async fn open_ai_compatible(
     // an array of typed parts (text + image_url) when images are present.
     // Works with OpenAI, vLLM and other OpenAI-compatible servers.
     if !media.is_empty() {
-        let last_user_idx = messages.iter().rposition(|m| {
-            m.get("role").and_then(|r| r.as_str()) == Some("user")
-        });
+        let last_user_idx = messages
+            .iter()
+            .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"));
         if let Some(idx) = last_user_idx {
             let msg = messages[idx].as_object().unwrap();
             let text = msg
@@ -926,7 +933,9 @@ mod tests {
         );
         // Header names arrive lowercased over HTTP/1.1.
         assert!(
-            request.to_lowercase().contains("authorization: bearer test-key"),
+            request
+                .to_lowercase()
+                .contains("authorization: bearer test-key"),
             "the configured key must be sent: {request}"
         );
         let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();

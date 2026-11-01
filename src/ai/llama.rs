@@ -107,9 +107,7 @@ pub(super) fn gen_text(
         let logits = if super::chat::REPEAT_PENALTY == 1. {
             logits
         } else {
-            let start_at = tokens
-                .len()
-                .saturating_sub(super::chat::REPEAT_LAST_N);
+            let start_at = tokens.len().saturating_sub(super::chat::REPEAT_LAST_N);
             candle_transformers::utils::apply_repeat_penalty(
                 &logits,
                 super::chat::REPEAT_PENALTY,
