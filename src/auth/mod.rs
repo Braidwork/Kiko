@@ -18,8 +18,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use argon2::Argon2;
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -281,10 +280,12 @@ pub(crate) fn clear_session_cookie(secure: bool) -> String {
 }
 
 /// argon2id 哈希（RustCrypto 默认参数：m=19456 KiB, t=2, p=1）。
+///
+/// argon2 0.6 的 `hash_password` 自己生成随机 salt（`getrandom` 默认特性），
+/// 不再需要手工构造 `SaltString`。
 pub(crate) fn hash_password(password: &str) -> Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|h| h.to_string())
         .map_err(|e| Error::WithMessage(format!("Hashing password failed: {e}")))
 }
@@ -637,13 +638,12 @@ mod tests {
 
         // 非 argon2id（这里用 argon2i 生成一个合法 PHC 串）必须被拒绝。
         // 必须在 users 为空时验证：引导函数对非空表直接返回 false。
-        let salt = SaltString::generate(&mut OsRng);
         let bad = Argon2::new(
             argon2::Algorithm::Argon2i,
             argon2::Version::V0x13,
             argon2::Params::default(),
         )
-        .hash_password(b"x", &salt)
+        .hash_password(b"x")
         .unwrap()
         .to_string();
         let err = bootstrap_admin(&db.pool, "admin2", None, Some(&bad), &file)
