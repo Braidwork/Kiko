@@ -147,6 +147,7 @@ async function signOut() {
 
 .auth-submit {
     width: 100%;
+    height: 40px;
     border: none;
     font-weight: 600;
     border-radius: 10px;
@@ -154,7 +155,13 @@ async function signOut() {
 
 .auth-signout {
     width: 100%;
-    margin-top: 14px;
+    height: 40px;
+    /* Element Plus 会给相邻的 el-button 加 margin-left: 12px；两个按钮都是
+       100% 宽时会把第二个按钮整体推歪，文字看起来没有对齐。 */
+    margin: 14px 0 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     color: #86909c;
 }
 </style>
