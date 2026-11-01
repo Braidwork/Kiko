@@ -712,7 +712,7 @@ async function release() {
         await saveSubFlow();
     }
     const r = await httpReq(
-        "GET",
+        "POST",
         "mainflow/release",
         { robotId: robotId, mainFlowId: mainFlowId, data: "" },
         null,

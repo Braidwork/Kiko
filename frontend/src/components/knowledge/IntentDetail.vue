@@ -253,7 +253,7 @@ const regenerateAll = async () => {
 
 const doRegenerateAll = async () => {
     regeneratingAllEmbeddings.value = true
-    httpReq('GET', 'intent/phrase/regenerate-all', { robotId: robotId, id: formData.id, data: '' }, null, null).then(v => regeneratingAllEmbeddings.value = false);
+    httpReq('POST', 'intent/phrase/regenerate-all', { robotId: robotId, id: formData.id, data: '' }, null, null).then(v => regeneratingAllEmbeddings.value = false);
 }
 
 const goBack = () => {

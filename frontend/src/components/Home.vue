@@ -3,6 +3,7 @@ import { ref, reactive, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
 import { copyProperties, httpReq } from "../assets/tools.js";
+import { authState, logout } from "../assets/auth.js";
 import EpArrowRightBold from "~icons/ep/arrow-right-bold";
 import EpSetting from "~icons/ep/setting";
 import SolarDocumentTextLinear from "~icons/solar/document-text-linear";
@@ -44,6 +45,10 @@ const checkUpdate = async () => {
 };
 const toSettings = () => {
     router.push("/settings");
+};
+const signOut = async () => {
+    await logout();
+    router.replace("/login");
 };
 
 const robots = reactive([]);
@@ -170,6 +175,20 @@ const compareDifferentRobotTypeData = [
     display: flex;
     align-items: center;
     gap: 10px;
+}
+
+.user-name {
+    font-size: 13px;
+    color: #4e5969;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.signout-btn {
+    color: #86909c;
+    font-size: 13px;
 }
 
 .icon-btn {
@@ -536,6 +555,10 @@ const compareDifferentRobotTypeData = [
                         <el-icon><EpSetting /></el-icon>
                     </button>
                 </el-tooltip>
+                <span class="user-name">{{ authState.user?.username }}</span>
+                <el-button class="signout-btn" link @click="signOut">{{
+                    t("auth.logout")
+                }}</el-button>
                 <LanguageSwitcher />
             </div>
         </header>

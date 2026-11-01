@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "compress": "terser src/assets/KikoSDK.js -o public/assets/KikoSDK.min.js -c -m",
-    "build": "npm run compress && vite build",
+    "compress": "terser src/assets/BraidworkKikoSDK.js -o public/assets/BraidworkKikoSDK.min.js -c -m",
+    "build": "vite build",
     "preview": "vite preview"
   },
   "//": {
