@@ -114,6 +114,19 @@ async fn migration_creates_all_v1_tables() {
     db.cleanup().await;
 }
 
+/// B-04/B-52：跑完 migration 后，库里的最大版本必须等于编译期 `MIGRATOR` 的最大版本。
+#[tokio::test]
+async fn schema_version_matches_the_program_migration_set() {
+    let Some(db) = TestDb::new().await else {
+        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let db_version = super::schema_version(&db.pool).await.unwrap();
+    assert_eq!(db_version, super::program_schema_version());
+    assert!(db_version > 0);
+    db.cleanup().await;
+}
+
 #[tokio::test]
 async fn robot_crud_roundtrip_and_order() {
     let Some(db) = TestDb::new().await else {

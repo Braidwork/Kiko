@@ -1593,7 +1593,76 @@ mod tests {
         )));
     }
 
-    /// 引用串的解析：env / file / 明文透传都不该碰数据库。
+    /// B-39：逐字段确认 Chat / Embedding / ASR / TTS / SMTP / HF 的敏感值
+    /// 都不会以明文进入设置 JSON（落库前必须换成 `enc:` 引用）。
+    #[test]
+    fn all_sensitive_settings_are_encrypted_before_storage() {
+        crate::security::init_with_key([11u8; 32]);
+
+        let mut s = Settings::default();
+        s.chat_provider.api_key = String::from("chat-plain");
+        s.sentence_embedding_provider.api_key = String::from("embedding-plain");
+        s.asr_provider.api_key = String::from("asr-plain");
+        s.tts_provider.api_key = String::from("tts-plain");
+        s.smtp_password = String::from("smtp-plain");
+        let (stored, changes) = split_settings(&s).unwrap();
+
+        for (field, reference) in [
+            (&stored.chat_provider.api_key, "enc:chat_api_key"),
+            (
+                &stored.sentence_embedding_provider.api_key,
+                "enc:embedding_api_key",
+            ),
+            (&stored.asr_provider.api_key, "enc:asr_api_key"),
+            (&stored.tts_provider.api_key, "enc:tts_api_key"),
+            (&stored.smtp_password, "enc:smtp_password"),
+        ] {
+            assert_eq!(field, reference);
+        }
+        let json = serde_json::to_string(&stored).unwrap();
+        for plaintext in [
+            "chat-plain",
+            "embedding-plain",
+            "asr-plain",
+            "tts-plain",
+            "smtp-plain",
+        ] {
+            assert!(
+                !json.contains(plaintext),
+                "设置 JSON 里仍有明文 {plaintext}"
+            );
+        }
+        for name in [
+            "chat_api_key",
+            "embedding_api_key",
+            "asr_api_key",
+            "tts_api_key",
+            "smtp_password",
+        ] {
+            assert!(
+                changes.iter().any(|c| matches!(
+                    c,
+                    SecretChange::Upsert { name: n, kind, .. } if n == name && kind == "enc"
+                )),
+                "缺少 {name} 的加密写入"
+            );
+        }
+
+        let mut g = GlobalSettings::default();
+        g.hf_model_download.access_token = String::from("hf-plain");
+        let (g_stored, g_changes) = split_global(&g).unwrap();
+        assert_eq!(g_stored.hf_model_download.access_token, "enc:hf_token");
+        assert!(
+            !serde_json::to_string(&g_stored)
+                .unwrap()
+                .contains("hf-plain")
+        );
+        assert!(g_changes.iter().any(|c| matches!(
+            c,
+            SecretChange::Upsert { name, kind, .. } if name == "hf_token" && kind == "enc"
+        )));
+    }
+
     #[tokio::test]
     async fn env_and_file_references_are_resolved_without_the_database() {
         // 环境变量名带测试前缀，避免和现场环境撞车。

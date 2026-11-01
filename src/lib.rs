@@ -2,6 +2,8 @@
 // static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 pub(crate) mod ai;
+pub(crate) mod auth;
+pub mod cli;
 pub(crate) mod config;
 pub(crate) mod external;
 pub(crate) mod flow;
