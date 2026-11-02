@@ -56,7 +56,8 @@ pub(crate) async fn gen_text(bytes: Bytes) -> Sse<impl Stream<Item = Result<Even
         tokio::spawn(async move {
             // 走 chat 那条路径，用对话模型那一份配置（`chat::gen_text` 里
             // 说明了为什么）。路由本身保持不变，前端仍在调 `/ai/text/generation`。
-            if let Err(e) = chat::gen_text(&q.robot_id, &q.prompt, q.enable_thinking, sender).await {
+            if let Err(e) = chat::gen_text(&q.robot_id, &q.prompt, q.enable_thinking, sender).await
+            {
                 log::error!("{:?}", &e);
             }
         });

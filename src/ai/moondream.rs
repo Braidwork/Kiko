@@ -24,7 +24,8 @@ pub(super) fn load_image_from_base64(data_uri_or_b64: &str, device: &Device) -> 
         Some((prefix, rest)) if prefix.starts_with("data:") => rest,
         _ => data_uri_or_b64,
     };
-    let bytes = base64::engine::general_purpose::STANDARD.decode(b64)
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
         .map_err(|e| Error::WithMessage(format!("Failed to decode image base64, err: {e}")))?;
     let img = image::load_from_memory(&bytes)
         .map_err(|e| Error::WithMessage(format!("Failed to decode image, err: {e}")))?;
@@ -35,8 +36,12 @@ pub(super) fn load_image_from_base64(data_uri_or_b64: &str, device: &Device) -> 
     );
     let img = img.to_rgb8();
     let data = img.into_raw();
-    let data = Tensor::from_vec(data, (IMAGE_SIZE as usize, IMAGE_SIZE as usize, 3), &Device::Cpu)?
-        .permute((2, 0, 1))?;
+    let data = Tensor::from_vec(
+        data,
+        (IMAGE_SIZE as usize, IMAGE_SIZE as usize, 3),
+        &Device::Cpu,
+    )?
+    .permute((2, 0, 1))?;
     let mean = Tensor::new(&[0.5f32, 0.5, 0.5], &Device::Cpu)?.reshape((3, 1, 1))?;
     let std = Tensor::new(&[0.5f32, 0.5, 0.5], &Device::Cpu)?.reshape((3, 1, 1))?;
     let t = (data.to_dtype(DType::F32)? / 255.)?
@@ -69,17 +74,14 @@ pub(super) fn gen_text(
         None => {
             return Err(Error::WithMessage(format!(
                 "cannot find the special token {BOS_EOS_TOKEN}"
-            )))
+            )));
         }
     };
     let (bos_token, eos_token) = (special_token, special_token);
     let mut tokenizer_stream = TokenOutputStream::new(tokenizer.clone());
     let mut rng = Rand::new();
-    let mut logits_processor = LogitsProcessor::new(
-        rng.r#gen::<u64>(),
-        Some(super::chat::TEMPERATURE),
-        top_p,
-    );
+    let mut logits_processor =
+        LogitsProcessor::new(rng.r#gen::<u64>(), Some(super::chat::TEMPERATURE), top_p);
     let mut generated_tokens = 0usize;
     let start_gen = std::time::Instant::now();
     for index in 0..sample_len {
@@ -97,15 +99,15 @@ pub(super) fn gen_text(
             let image = load_image_from_base64(&input.images_base64[0], device)?.to_dtype(dtype)?;
             let image_embeds = image.unsqueeze(0)?.apply(model.vision_encoder())?;
             let bos_token = Tensor::new(&[bos_token], device)?.unsqueeze(0)?;
-            model.text_model.forward_with_img(&bos_token, &input_ids, &image_embeds)?
+            model
+                .text_model
+                .forward_with_img(&bos_token, &input_ids, &image_embeds)?
         };
         let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
         let logits = if super::chat::REPEAT_PENALTY == 1. {
             logits
         } else {
-            let start_at = tokens
-                .len()
-                .saturating_sub(super::chat::REPEAT_LAST_N);
+            let start_at = tokens.len().saturating_sub(super::chat::REPEAT_LAST_N);
             candle_transformers::utils::apply_repeat_penalty(
                 &logits,
                 super::chat::REPEAT_PENALTY,

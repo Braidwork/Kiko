@@ -23,6 +23,9 @@ pub(crate) const MASTER_KEY_ENV: &str = "KIKO_MASTER_KEY";
 pub(crate) const VECTOR_BUDGET_ENV: &str = "KIKO_VECTOR_INDEX_BUDGET_MB";
 /// 向量索引后台对账周期的环境变量覆盖，优先于 `[vector] reconcile_secs`。
 pub(crate) const VECTOR_RECONCILE_ENV: &str = "KIKO_VECTOR_RECONCILE_SECS";
+/// 首次引导管理员的明文口令（B-07）。优先级高于 `[bootstrap] admin_password_hash`；
+/// 只在 `users` 为空时使用一次，启动时哈希，不落盘、不写日志。
+pub(crate) const BOOTSTRAP_PASSWORD_ENV: &str = "KIKO_BOOTSTRAP_ADMIN_PASSWORD";
 /// 默认配置文件。仓库根的 `config.toml` 是 rustc 构建配置，两者不许重名（D34）。
 pub(crate) const DEFAULT_CONFIG_PATH: &str = "data/kiko.toml";
 
@@ -30,6 +33,8 @@ pub(crate) const DEFAULT_CONFIG_PATH: &str = "data/kiko.toml";
 const DEFAULT_VECTOR_BUDGET_MB: u64 = 512;
 /// 后台对账默认周期（秒）。
 const DEFAULT_VECTOR_RECONCILE_SECS: u64 = 60;
+/// 引导管理员的默认用户名。
+const DEFAULT_ADMIN_USERNAME: &str = "admin";
 
 const TEMPLATE: &str = r#"# Kiko 应用配置（D34）。
 #
@@ -43,6 +48,7 @@ const TEMPLATE: &str = r#"# Kiko 应用配置（D34）。
 #   KIKO_CONFIG                    换一份配置文件（本变量本身只能来自环境变量）
 #   KIKO_DATABASE_URL              [database] url
 #   KIKO_MASTER_KEY                [security] master_key
+#   KIKO_BOOTSTRAP_ADMIN_PASSWORD  [bootstrap] 的引导口令（明文；优先级最高）
 #   KIKO_VECTOR_INDEX_BUDGET_MB    [vector] index_budget_mb
 #   KIKO_VECTOR_RECONCILE_SECS     [vector] reconcile_secs
 
@@ -53,6 +59,30 @@ url = ""
 
 # 启动时自动执行 migration；由 DBA 统一跑 DDL 的部署改成 false（D45）。
 auto_migrate = true
+
+[server]
+# 浏览器跨源白名单（B-40）。默认空 = 只允许同源；前后端分开部署时才需要填，
+# 例如 ["https://kiko.example.com"]。不接受 "*"。
+cors_origins = []
+
+# 会话 cookie 是否加 Secure 标记（B-34）。默认 false，适合内网 HTTP；
+# 通过 HTTPS 反代暴露时改成 true。
+cookie_secure = false
+
+# 版本检查默认关闭（D38）：私有化/内网环境不主动出网。改成 true 后
+# GET /check-new-version.json 才会访问 braidwork.github.io。
+check_new_version = false
+
+[bootstrap]
+# 首次启动且 users 表为空时创建的本地管理员（B-07 / D24）。
+admin_username = "admin"
+# 口令三选一，优先级从高到低：
+#   1. 环境变量 KIKO_BOOTSTRAP_ADMIN_PASSWORD（明文，启动时 argon2id 哈希）
+#   2. 下面的 admin_password_hash（由 `kiko hash-password` 生成）
+#   3. 都不配置 -> 首次启动生成随机口令，写入 data/initial_admin_password.txt
+# 无论哪种方式，首次登录都必须改密；改密成功后删除初始化文件。
+# 禁止空口令/常见弱口令（明文路径会校验；哈希路径只校验格式）。
+admin_password_hash = ""
 
 [security]
 # 主密钥（base64 的 32 字节），用于加密 settings 里的敏感字段（D20/D36）。
@@ -78,6 +108,18 @@ pub(crate) struct Config {
     pub(crate) auto_migrate: bool,
     /// 配置文件里的 `[security] master_key`；空/缺失时由 `security` 自动生成。
     pub(crate) master_key: Option<String>,
+    /// 引导管理员用户名（B-07）。
+    pub(crate) bootstrap_admin_username: String,
+    /// `[bootstrap] admin_password_hash`（argon2id PHC 串）。
+    pub(crate) bootstrap_admin_password_hash: Option<String>,
+    /// `KIKO_BOOTSTRAP_ADMIN_PASSWORD` 的明文口令，只来自环境变量（D24）。
+    pub(crate) bootstrap_admin_password: Option<String>,
+    /// CORS 白名单（B-40）；空 = 只允许同源。
+    pub(crate) cors_origins: Vec<String>,
+    /// 会话 cookie 是否加 `Secure`（B-34）；HTTPS 反代后应置 true。
+    pub(crate) cookie_secure: bool,
+    /// 是否允许 `check-new-version.json` 主动访问公网（D38，默认 false）。
+    pub(crate) check_new_version: bool,
     /// 向量索引内存预算（MB，已合并环境变量覆盖，保证 > 0）。
     pub(crate) vector_index_budget_mb: u64,
     /// 向量索引后台对账周期（秒，已合并环境变量覆盖；0 = 关闭）。
@@ -111,10 +153,19 @@ pub(crate) fn vector_reconcile_secs() -> u64 {
         .unwrap_or(DEFAULT_VECTOR_RECONCILE_SECS)
 }
 
+/// 是否允许版本检查外联（D38）。未加载配置时按关闭处理。
+pub(crate) fn check_new_version_enabled() -> bool {
+    current().map(|c| c.check_new_version).unwrap_or(false)
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     #[serde(default)]
     database: DatabaseSection,
+    #[serde(default)]
+    server: ServerSection,
+    #[serde(default)]
+    bootstrap: BootstrapSection,
     #[serde(default)]
     security: SecuritySection,
     #[serde(default)]
@@ -125,6 +176,22 @@ struct FileConfig {
 struct DatabaseSection {
     url: Option<String>,
     auto_migrate: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ServerSection {
+    /// 浏览器跨源白名单；空 = 同源（B-40）。
+    cors_origins: Option<Vec<String>>,
+    /// 会话 cookie 的 `Secure` 标记。
+    cookie_secure: Option<bool>,
+    /// 是否允许版本检查外联（D38）。
+    check_new_version: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BootstrapSection {
+    admin_username: Option<String>,
+    admin_password_hash: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -176,6 +243,37 @@ pub(crate) fn load() -> Result<Config, String> {
         })?
         .to_string();
 
+    let bootstrap_admin_username = file
+        .bootstrap
+        .admin_username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_ADMIN_USERNAME)
+        .to_string();
+    if bootstrap_admin_username.is_empty() {
+        return Err(String::from(
+            "[bootstrap] admin_username 不能为空（默认 admin）",
+        ));
+    }
+    let bootstrap_admin_password_hash = file
+        .bootstrap
+        .admin_password_hash
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let bootstrap_admin_password = std::env::var(BOOTSTRAP_PASSWORD_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let cors_origins = file
+        .server
+        .cors_origins
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "*")
+        .collect();
+
     let config = Config {
         database_url,
         auto_migrate: file.database.auto_migrate.unwrap_or(true),
@@ -189,6 +287,12 @@ pub(crate) fn load() -> Result<Config, String> {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
             }),
+        bootstrap_admin_username,
+        bootstrap_admin_password_hash,
+        bootstrap_admin_password,
+        cors_origins,
+        cookie_secure: file.server.cookie_secure.unwrap_or(false),
+        check_new_version: file.server.check_new_version.unwrap_or(false),
         // 环境变量 > 文件 > 默认（D34）。预算 0/非法值当"没填"，回落到默认 512；
         // 对账周期 0 是**有意义的**（关闭），不能当没填。
         vector_index_budget_mb: env_u64(VECTOR_BUDGET_ENV)
@@ -251,11 +355,25 @@ mod tests {
             CONFIG_PATH_ENV,
             DATABASE_URL_ENV,
             MASTER_KEY_ENV,
+            BOOTSTRAP_PASSWORD_ENV,
             VECTOR_BUDGET_ENV,
             VECTOR_RECONCILE_ENV,
         ] {
             assert!(TEMPLATE.contains(env), "模板必须写明环境变量 {env}");
         }
+    }
+
+    /// B-07/B-40：模板必须带可解析的引导管理员与同源/CORS 配置，且默认安全
+    /// （默认空白名单 = 同源；cookie 默认不强制 Secure，适合内网 HTTP）。
+    #[test]
+    fn template_has_bootstrap_and_same_origin_defaults() {
+        let file: FileConfig = toml::from_str(TEMPLATE).expect("模板必须是合法 TOML");
+        assert_eq!(file.bootstrap.admin_username.as_deref(), Some("admin"));
+        assert_eq!(file.bootstrap.admin_password_hash.as_deref(), Some(""));
+        assert_eq!(file.server.cors_origins, Some(Vec::new()));
+        assert_eq!(file.server.cookie_secure, Some(false));
+        // D38：默认不主动出网。
+        assert_eq!(file.server.check_new_version, Some(false));
     }
 
     /// 没有配置文件（纯库/测试）时，运行期 getter 必须用内置默认，而不是 0。

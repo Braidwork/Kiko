@@ -19,6 +19,10 @@ use kiko::web::server::start_app;
 // static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), std::io::Error> {
+    // B-07：`kiko hash-password` 不启动服务、不初始化日志/运行时。
+    if let Some(code) = kiko::cli::run() {
+        std::process::exit(code);
+    }
     // dialogflow::web::t1();
     unsafe {
         env::set_var("RUST_LOG", "INFO");

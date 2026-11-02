@@ -21,6 +21,8 @@ name = "kiko"
 # artful = "0.1.1"
 anyhow = "1.0.104"
 aes-gcm = "0.11.1"
+# 本地管理员口令哈希（B-07/B-34，D24）：RustCrypto argon2id。
+argon2 = "0.6.0"
 axum = {version = "0.8.9", features = ["query", "tokio", "macros", "multipart"]}
 base64 = "0.23.1"
 bigdecimal = "0.4.11"
@@ -113,6 +115,10 @@ unicode-casefold = "0.2.0"
 flate2 = "1.1.10"
 # cc = "1.2.8"
 
+# 路由认证测试用 `ServiceExt::oneshot`（B-41）。
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = {version = "0.62.2", features = ["Win32_Globalization", "Win32_System_SystemServices"]}
 
@@ -136,6 +142,14 @@ rpath = false
 
 [profile.test]
 debug = 1
+
+# 调试构建里 Argon2 的 pure-Rust 实现会被 opt-level=0 拖到接近 1 秒/次；
+# 登录/改密在开发时会明显卡顿。只优化这两个包，避免整体 dev 重编译变慢。
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.bench]
 debug = 1

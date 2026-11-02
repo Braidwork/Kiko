@@ -53,7 +53,7 @@ pub(crate) async fn answer_multipart(mut multipart: Multipart) -> impl IntoRespo
                         Ok(b) => match serde_json::from_slice::<Request>(b.as_ref()) {
                             Ok(req) => op_req = Some(req),
                             Err(e) => {
-                                break Err(crate::result::Error::InvalidJsonStructure(Box::new(e)))
+                                break Err(crate::result::Error::InvalidJsonStructure(Box::new(e)));
                             }
                         },
                         Err(e) => break Err(e.into()),
@@ -66,8 +66,7 @@ pub(crate) async fn answer_multipart(mut multipart: Multipart) -> impl IntoRespo
                         .unwrap_or(String::from("image/jpeg"));
                     match field.bytes().await {
                         Ok(b) => {
-                            let data =
-                                base64::engine::general_purpose::STANDARD.encode(b.as_ref());
+                            let data = base64::engine::general_purpose::STANDARD.encode(b.as_ref());
                             attachments.push(Attachment { mime_type, data });
                         }
                         Err(e) => break Err(e.into()),

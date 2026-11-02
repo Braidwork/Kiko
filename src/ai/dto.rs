@@ -41,9 +41,7 @@ impl UserMediaData {
             }
         }
         if images.len() > MAX_IMAGES_PER_REQUEST {
-            return Err(format!(
-                "Too many images, max {MAX_IMAGES_PER_REQUEST}."
-            ));
+            return Err(format!("Too many images, max {MAX_IMAGES_PER_REQUEST}."));
         }
         Ok(Self { images })
     }

@@ -18,8 +18,10 @@ pub(crate) mod qa;
 pub(crate) mod robot;
 pub(crate) mod runtime_node;
 pub(crate) mod secret;
+pub(crate) mod session;
 pub(crate) mod settings;
 pub(crate) mod subflow;
+pub(crate) mod user;
 pub(crate) mod variable;
 pub(crate) mod vector;
 
@@ -79,24 +81,7 @@ pub(crate) async fn init(database_url: &str, auto_migrate: bool) -> Result<()> {
         return Ok(());
     }
 
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(Duration::from_secs(10))
-        // 每条连接都固定 search_path：migration 文件里不写 schema 前缀，
-        // 靠它落到 kiko（生产）或 tmp_<uuid>（集成测试）。
-        .after_connect(|conn, _| {
-            Box::pin(async move {
-                // schema 名是编译期常量，不存在注入面；sqlx 0.9 要求显式断言。
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "SET search_path TO {SCHEMA}, public"
-                )))
-                .execute(conn)
-                .await?;
-                Ok(())
-            })
-        })
-        .connect(database_url)
-        .await?;
+    let pool = connect_pool(database_url).await?;
 
     // `_sqlx_migrations` 也跟着 search_path 走，所以必须先建 schema 再跑 migration，
     // 否则迁移记录本身会落进 public。
@@ -117,10 +102,42 @@ pub(crate) async fn init(database_url: &str, auto_migrate: bool) -> Result<()> {
     Ok(())
 }
 
-/// `auto_migrate = false`（D45）：只校验版本，不跑 DDL。
-async fn ensure_migrated(pool: &PgPool) -> Result<()> {
-    let expected = MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0);
-    let latest: Option<i64> = sqlx::query_scalar(
+/// 只连池、不建 schema、不跑 migration。`--check-schema` 用它做只读预检。
+async fn connect_pool(database_url: &str) -> Result<PgPool> {
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(Duration::from_secs(10))
+        // 每条连接都固定 search_path：migration 文件里不写 schema 前缀，
+        // 靠它落到 kiko（生产）或 tmp_<uuid>（集成测试）。
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                // schema 名是编译期常量，不存在注入面；sqlx 0.9 要求显式断言。
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SET search_path TO {SCHEMA}, public"
+                )))
+                .execute(conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .connect(database_url)
+        .await?;
+    Ok(pool)
+}
+
+/// 程序内置 migration 的最大版本（编译期事实）。
+pub(crate) fn program_schema_version() -> i64 {
+    MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0)
+}
+
+/// 已应用到某个库的最大 migration 版本。没迁移过（表不存在）返回错误，调用方决定
+/// 是“提示先迁移”还是“健康检查 503”。
+pub(crate) async fn schema_version(pool: &PgPool) -> Result<i64> {
+    Ok(latest_applied(pool).await?.unwrap_or(0))
+}
+
+async fn latest_applied(pool: &PgPool) -> Result<Option<i64>> {
+    sqlx::query_scalar(
         "SELECT version FROM _sqlx_migrations WHERE success = TRUE ORDER BY version DESC LIMIT 1",
     )
     .fetch_optional(pool)
@@ -133,9 +150,21 @@ async fn ensure_migrated(pool: &PgPool) -> Result<()> {
             ))
         }
         e => Error::from(e),
-    })?;
+    })
+}
 
-    match latest {
+/// `--check-schema`：只读比对数据库与程序内置的 migration 最大版本，不建表、不迁移。
+pub(crate) async fn check_schema(database_url: &str) -> Result<(i64, i64)> {
+    let pool = connect_pool(database_url).await?;
+    let db = schema_version(&pool).await;
+    pool.close().await;
+    Ok((db?, program_schema_version()))
+}
+
+/// `auto_migrate = false`（D45）：只校验版本，不跑 DDL。
+async fn ensure_migrated(pool: &PgPool) -> Result<()> {
+    let expected = program_schema_version();
+    match latest_applied(pool).await? {
         Some(v) if v >= expected => Ok(()),
         Some(v) => Err(Error::WithMessage(format!(
             "数据库 schema 版本是 {v}，低于程序要求的 {expected}；请先执行 kiko --migrate-only"
@@ -147,7 +176,7 @@ async fn ensure_migrated(pool: &PgPool) -> Result<()> {
 }
 
 #[cfg(test)]
-mod test_support {
+pub(crate) mod test_support {
     //! 集成测试的公共脚手架：每个用例一个 `tmp_<uuid>` schema，结束时 drop。
 
     use sqlx::postgres::{PgPool, PgPoolOptions};

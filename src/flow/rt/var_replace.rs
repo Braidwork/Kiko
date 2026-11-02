@@ -88,11 +88,7 @@ where
                                         out.push_str(&text[after_open..close_begin]);
                                     }
                                     Err(e) => {
-                                        return_log_and_keep(
-                                            out,
-                                            &text[after_open..close_begin],
-                                            e,
-                                        );
+                                        return_log_and_keep(out, &text[after_open..close_begin], e);
                                     }
                                 }
                             }
@@ -437,10 +433,7 @@ mod tests {
     #[test]
     fn mixed_notations() {
         let t = "`known` and <var data-var-name=\"known\">known</var>";
-        assert_eq!(
-            replace_vars_with(t, resolver).unwrap(),
-            "VALUE and VALUE"
-        );
+        assert_eq!(replace_vars_with(t, resolver).unwrap(), "VALUE and VALUE");
     }
 
     #[test]

@@ -26,6 +26,9 @@ import RobotFrame from './components/robot/RobotFrame.vue'
 import DocList from './components/knowledge/DocList.vue'
 import QnAList from './components/knowledge/QnAList.vue'
 import NotFound from './components/404.vue'
+import Login from './components/auth/Login.vue'
+import ChangePassword from './components/auth/ChangePassword.vue'
+import { authState, loadMe } from './assets/auth.js'
 
 // import 'element-plus/dist/index.css'
 // import ElementTiptapPlugin from 'element-tiptap-vue3-fixed';
@@ -54,6 +57,8 @@ const routes = [
 */
 
 const routes = [
+  { path: '/login', name: 'login', component: Login },
+  { path: '/change-password', name: 'changePassword', component: ChangePassword },
   { path: '/', component: Home },
   // { path: '/introduction', component: Intro },
   // { path: '/docs', component: Doc },
@@ -84,6 +89,26 @@ const router = createRouter({
   scrollBehavior(to, from, savedPosition) {
     return { top: 0 }
   }
+})
+
+// 认证守卫（B-34）：除登录页外，所有页面先确认会话；首次登录强制进改密页。
+// 会话在 HttpOnly cookie 里，前端只缓存 /auth/me 的结果。
+router.beforeEach(async (to) => {
+  if (to.path === '/login') {
+    if (authState.checked && authState.user) return '/'
+    return true
+  }
+  const user = await loadMe()
+  if (!user) {
+    return { path: '/login', query: { redirect: to.fullPath } }
+  }
+  if (user.mustChangePassword && to.path !== '/change-password') {
+    return { path: '/change-password' }
+  }
+  if (!user.mustChangePassword && to.path === '/change-password') {
+    return '/'
+  }
+  return true
 })
 
 import './assets/main.css'

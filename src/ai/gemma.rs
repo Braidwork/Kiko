@@ -329,9 +329,7 @@ pub(super) fn gen_text(
         let logits = if super::chat::REPEAT_PENALTY == 1. {
             logits
         } else {
-            let start_at = tokens
-                .len()
-                .saturating_sub(super::chat::REPEAT_LAST_N);
+            let start_at = tokens.len().saturating_sub(super::chat::REPEAT_LAST_N);
             candle_transformers::utils::apply_repeat_penalty(
                 &logits,
                 super::chat::REPEAT_PENALTY,
@@ -340,11 +338,8 @@ pub(super) fn gen_text(
         };
 
         let mut rng = Rand::new();
-        let mut logits_processor = LogitsProcessor::new(
-            rng.r#gen::<u64>(),
-            Some(super::chat::TEMPERATURE),
-            top_p,
-        );
+        let mut logits_processor =
+            LogitsProcessor::new(rng.r#gen::<u64>(), Some(super::chat::TEMPERATURE), top_p);
         let next_token = logits_processor.sample(&logits)?;
         tokens.push(next_token);
         generated_tokens += 1;
@@ -437,11 +432,8 @@ pub(super) fn gen_text_gemma4(
     // 既不是 `<|turn>` 也不是 gemma2 的 `</s>`。
     let eos_token = gemma4_eos_token_of(&tokenizer)?;
     let mut rng = Rand::new();
-    let mut logits_processor = LogitsProcessor::new(
-        rng.r#gen::<u64>(),
-        Some(super::chat::TEMPERATURE),
-        top_p,
-    );
+    let mut logits_processor =
+        LogitsProcessor::new(rng.r#gen::<u64>(), Some(super::chat::TEMPERATURE), top_p);
     let mut thoughts = ThoughtChannelFilter::default();
     let start_gen = std::time::Instant::now();
     let mut generated_tokens = 0usize;
@@ -647,7 +639,8 @@ mod tests {
     fn gemma4_thought_channel_is_stripped() {
         let mut f = ThoughtChannelFilter::default();
         let mut out = String::new();
-        for piece in f.feed("<|channel>thought\n我在想用户是不是要退货<channel|>答案在这里") {
+        for piece in f.feed("<|channel>thought\n我在想用户是不是要退货<channel|>答案在这里")
+        {
             out.push_str(&piece);
         }
         if let Some(rest) = f.finish() {
@@ -769,11 +762,7 @@ mod tests {
                 "{marker} must be in the Gemma 4 vocabulary: the prompt format \
                  and the thinking filter both depend on it"
             );
-            let ids = tokenizer
-                .encode(marker, false)
-                .unwrap()
-                .get_ids()
-                .to_vec();
+            let ids = tokenizer.encode(marker, false).unwrap().get_ids().to_vec();
             assert_eq!(
                 ids,
                 vec![id.unwrap()],

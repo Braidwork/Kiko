@@ -14,7 +14,9 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use super::asset::ASSETS_MAP;
+use super::auth as auth_api;
 use crate::ai::crud as ai;
+use crate::auth;
 use crate::external::http::crud as http;
 use crate::flow::mainflow::crud as mainflow;
 use crate::flow::rt::facade as rt;
@@ -26,6 +28,7 @@ use crate::repo;
 use crate::result::Error;
 use crate::robot::crud as robot;
 use crate::variable::crud as variable;
+use crate::web::AppState;
 
 //https://stackoverflow.com/questions/27840394/how-can-a-rust-program-access-metadata-from-its-cargo-package
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -71,6 +74,19 @@ pub async fn start_app() {
         }
     };
     log::info!("Using config file: {}", config.source.display());
+
+    // B-04/B-05：离线迁移与 schema 预检。执行完直接退出，不起监听、不初始化主密钥
+    // 与管理员；沿用 `-ip` / `-port` 一样的手写 argv 解析。
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--migrate-only") {
+        migrate_only(&config).await;
+        return;
+    }
+    if args.iter().any(|a| a == "--check-schema") {
+        check_schema(&config).await;
+        return;
+    }
+
     if let Err(e) = crate::security::init(config.master_key.as_deref()) {
         log::error!("Failed to initialize master key: {e}");
         std::process::exit(1);
@@ -84,6 +100,29 @@ pub async fn start_app() {
         );
         std::process::exit(1);
     }
+
+    // B-07：users 为空时创建本地管理员。必须在起监听之前完成，失败即退出。
+    // 优先级：KIKO_BOOTSTRAP_ADMIN_PASSWORD > admin_password_hash > 随机文件。
+    let initial_password_file = std::path::PathBuf::from(auth::INITIAL_PASSWORD_FILE);
+    if let Err(e) = auth::bootstrap_admin(
+        repo::pool(),
+        &config.bootstrap_admin_username,
+        config.bootstrap_admin_password.as_deref(),
+        config.bootstrap_admin_password_hash.as_deref(),
+        &initial_password_file,
+    )
+    .await
+    {
+        log::error!("Failed to bootstrap the local administrator: {e}");
+        std::process::exit(1);
+    }
+
+    let app_state = AppState {
+        pool: repo::pool().clone(),
+        cookie_secure: config.cookie_secure,
+        cors_origins: config.cors_origins.clone(),
+        initial_password_file: initial_password_file.clone(),
+    };
 
     // 知识库与向量的存储全部在 PG（S4）；进程内索引按 `(robot, collection)` 懒加载，
     // 启动时不需要初始化任何嵌入式数据库。
@@ -171,8 +210,8 @@ pub async fn start_app() {
     let (sender, recv) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(crate::flow::rt::context::clean_expired_session(recv));
 
-    let r: Router = gen_router();
-    let app = r.fallback(fallback);
+    let r: Router = gen_router(app_state);
+    let app = into_app(r);
     // let socket_addr: SocketAddr = addr.parse().expect(&invalid_ip_msg(&addr));
     let mut bind_res;
     // let mut port = settings.port;
@@ -250,8 +289,64 @@ pub async fn start_app() {
         .unwrap();
 }
 
-fn gen_router() -> Router {
-    Router::new()
+/// `--migrate-only`：跑完 migration 就退出。成功 0，失败 1；不绑定端口。
+async fn migrate_only(config: &crate::config::Config) {
+    log::info!("Running migrations only (no listener will be started)");
+    if let Err(e) = repo::init(&config.database_url, true).await {
+        log::error!("Migration failed: {e}");
+        std::process::exit(1);
+    }
+    match repo::schema_version(repo::pool()).await {
+        Ok(version) => {
+            println!("database_schema_version={version}");
+            println!("program_schema_version={}", repo::program_schema_version());
+            std::process::exit(0);
+        }
+        Err(e) => {
+            log::error!("Reading schema version after migration failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `--check-schema`：只读比对数据库与程序内置的 migration 最大版本。
+/// 只有两者相等才返回 0；落后（需要迁移）或超前（二进制太旧）都返回 1。
+async fn check_schema(config: &crate::config::Config) {
+    match repo::check_schema(&config.database_url).await {
+        Ok((db, program)) => {
+            println!("database_schema_version={db}");
+            println!("program_schema_version={program}");
+            if db == program {
+                std::process::exit(0);
+            }
+            if db < program {
+                eprintln!(
+                    "Database schema is behind this binary; run `kiko --migrate-only` \
+                     before starting the service."
+                );
+            } else {
+                eprintln!(
+                    "Database schema is newer than this binary; use a newer Kiko binary \
+                     instead of starting this one."
+                );
+            }
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Schema check failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn gen_router(state: AppState) -> Router {
+    let cors = cors_layer(&state.cors_origins);
+    let router = Router::new()
+        // ---- 认证（B-34）----
+        .route("/auth/login", post(auth_api::login))
+        .route("/auth/logout", post(auth_api::logout))
+        .route("/auth/me", get(auth_api::me))
+        .route("/auth/change-password", post(auth_api::change_password))
         .route(
             "/robot",
             get(robot::list).post(robot::save).delete(robot::delete),
@@ -277,7 +372,7 @@ fn gen_router() -> Router {
         )
         .route(
             "/intent/phrase/regenerate-all",
-            get(intent::regenerate_embeddings),
+            post(intent::regenerate_embeddings),
         )
         .route(
             "/variable",
@@ -292,7 +387,7 @@ fn gen_router() -> Router {
                 .put(mainflow::save)
                 .delete(mainflow::delete),
         )
-        .route("/mainflow/release", get(subflow::release))
+        .route("/mainflow/release", post(subflow::release))
         .route(
             "/subflow",
             get(subflow::list)
@@ -375,9 +470,11 @@ fn gen_router() -> Router {
         .route("/kb/doc/upload", post(kb::upload_doc))
         .route("/kb/qa/dryrun", get(kb::qa_dryrun))
         .route("/management/settings/smtp/test", post(settings::smtp_test))
+        // v1 运行时接口保持公开（B-33 白名单；见 auth::PUBLIC_PATHS）。
         .route("/flow/answer", post(rt::answer))
         .route("/flow/answer/multipart", post(rt::answer_multipart))
         .route("/ai/text/generation", post(ai::gen_text))
+        .route("/healthz", get(healthz))
         .route("/version.json", get(version))
         .route("/check-new-version.json", get(check_new_version))
         // .route("/o", get(subflow::output))
@@ -385,18 +482,63 @@ fn gen_router() -> Router {
         .layer(RequestBodyLimitLayer::new(
             250 * 1024 * 1024, /* 250mb */
         ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::predicate(
-                    |_origin: &HeaderValue, _request_parts| {
-                        // println!("{}", String::from_utf8_lossy(origin.as_bytes()));
-                        // origin.as_bytes().ends_with(b"localhost")
-                        true
-                    },
-                ))
-                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
-                .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::PUT]),
-        )
+        // 认证层：只校验会话，不关心登录方式（D14/D27/D42）。
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ))
+        .with_state(state);
+    match cors {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
+}
+
+/// 组装最终应用：先补静态资源 fallback（**不加认证**），再统一加安全头。
+///
+/// fallback 必须在认证层之后挂，否则 `index.html`/JS/CSS 也会被 401；安全头则
+/// 要覆盖包括静态资源在内的所有响应。
+pub(crate) fn into_app(router: Router) -> Router {
+    router
+        .fallback(fallback)
+        .layer(axum::middleware::from_fn(auth::security_headers))
+}
+
+/// CORS 默认同源：只有 `[server] cors_origins` 非空时才放行指定源。
+///
+/// `allow_credentials(true)` 与 cookie 会话配套；`AllowOrigin::list` 不接受 `*`，
+/// 因此不会出现“任意站点携带 cookie”的配置。白名单为空时完全不挂 CORS 层，
+/// 浏览器会按同源策略拒绝跨源读取。
+fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    if origins.is_empty() {
+        return None;
+    }
+    let values: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|origin| match origin.parse::<HeaderValue>() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::warn!("Ignoring invalid CORS origin {origin:?}: {e}");
+                None
+            }
+        })
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(values))
+            .allow_credentials(true)
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ]),
+    )
 }
 
 // https://docs.rs/axum/0.6.18/axum/response/index.html
@@ -443,7 +585,48 @@ async fn version() -> impl IntoResponse {
     v
 }
 
+/// B-52：运维用的健康检查。公开（白名单），不查业务数据，只确认进程和
+/// `_sqlx_migrations` 可读；schema 版本对不上时运维能立刻看出升级没做完。
+async fn healthz(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
+    match repo::schema_version(&state.pool).await {
+        Ok(schema_version) => {
+            let body = serde_json::json!({
+                "status": StatusCode::OK.as_u16(),
+                "data": {
+                    "status": "ok",
+                    "appVersion": VERSION,
+                    "schemaVersion": schema_version,
+                    "programSchemaVersion": repo::program_schema_version(),
+                },
+                "err": serde_json::Value::Null,
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        }
+        Err(e) => {
+            log::error!("Health check failed: {e}");
+            auth::auth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database schema is unavailable.",
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct VersionInfo {
+    version: String,
+    changelog: Vec<String>,
+}
+
 async fn check_new_version() -> impl IntoResponse {
+    // D38：私有化/内网部署默认不主动出网；[server] check_new_version = true 才检查。
+    if !crate::config::check_new_version_enabled() {
+        return to_res(Ok(None::<VersionInfo>));
+    }
     let r = reqwest::get("https://braidwork.github.io/kiko/check-new-version.json").await;
     if let Err(e) = r {
         return to_res(Err(Error::NetworkConnectTimeout(Box::new(e))));
@@ -451,11 +634,6 @@ async fn check_new_version() -> impl IntoResponse {
     r.unwrap().text().await.map_or_else(
         |e| to_res(Err(Error::NetworkReadTimeout(Box::new(e)))),
         |s| {
-            #[derive(Debug, Deserialize, Serialize)]
-            struct VersionInfo {
-                version: String,
-                changelog: Vec<String>,
-            }
             let obj: core::result::Result<VersionInfo, _> = serde_json::from_str(&s);
             if let Err(e) = obj {
                 return to_res(Err(Error::InvalidJsonStructure(Box::new(e))));
@@ -837,5 +1015,505 @@ mod tests {
         assert_eq!(envelope["status"], 500);
         assert_eq!(envelope["err"]["message"], "boom");
         assert!(envelope["data"].is_null());
+    }
+
+    // ================= B-41：认证 / 会话 / 路由白名单 =================
+
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt;
+
+    const ALL_ROUTE_PATHS: &[&str] = &[
+        "/auth/login",
+        "/auth/logout",
+        "/auth/me",
+        "/auth/change-password",
+        "/robot",
+        "/robot/detail",
+        "/intent",
+        "/intent/detect",
+        "/intent/detail",
+        "/intent/keyword",
+        "/intent/regex",
+        "/intent/phrase",
+        "/intent/phrase/regenerate-all",
+        "/variable",
+        "/mainflow",
+        "/mainflow/release",
+        "/subflow",
+        "/subflow/simple",
+        "/subflow/new",
+        "/external/http",
+        "/external/http/x",
+        "/management/global-settings",
+        "/management/settings",
+        "/management/settings/model/download",
+        "/management/settings/model/download/progress",
+        "/management/settings/model/check/files",
+        "/management/settings/model/local/path",
+        "/management/settings/model/load/progress",
+        "/management/settings/model/load",
+        "/management/settings/model/check/embedding",
+        "/management/settings/embedding/vector-dimensions",
+        "/management/settings/embedding/reindex",
+        "/management/settings/embedding/reindex/progress",
+        "/management/settings/embedding/reindex/hint",
+        "/management/settings/model/openai/list",
+        "/kb/qa",
+        "/kb/doc",
+        "/kb/doc/upload",
+        "/kb/qa/dryrun",
+        "/management/settings/smtp/test",
+        "/flow/answer",
+        "/flow/answer/multipart",
+        "/ai/text/generation",
+        "/healthz",
+        "/version.json",
+        "/check-new-version.json",
+    ];
+
+    fn test_state(db: &crate::repo::test_support::TestDb) -> AppState {
+        AppState {
+            pool: db.pool.clone(),
+            cookie_secure: false,
+            cors_origins: Vec::new(),
+            initial_password_file: std::env::temp_dir()
+                .join(format!("kiko-initial-{}.txt", scru128::new_string())),
+        }
+    }
+
+    fn test_app(db: &crate::repo::test_support::TestDb) -> Router {
+        into_app(gen_router(test_state(db)))
+    }
+
+    fn get_req(uri: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn get_req_with_cookie(uri: &str, cookie: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("GET")
+            .uri(uri)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn post_json(uri: &str, body: serde_json::Value) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn json_body(res: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// 每条路由都必须被归类：要么在白名单里（有意识的公开），要么未认证返回 401。
+    /// 新增路由时先把路径加进 `ALL_ROUTE_PATHS`，测试会替你做这个判断。
+    #[tokio::test]
+    async fn every_route_is_either_public_or_rejects_unauthenticated_requests() {
+        let Some(db) = crate::repo::test_support::TestDb::new().await else {
+            eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        assert_eq!(ALL_ROUTE_PATHS.len(), 46, "路由数量变了：请同步本测试");
+        let app = test_app(&db);
+        for path in ALL_ROUTE_PATHS {
+            if auth::is_public(path) {
+                continue;
+            }
+            let res = app.clone().oneshot(get_req(path)).await.unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "protected route {path} did not return 401"
+            );
+            let body = json_body(res).await;
+            assert_eq!(body["status"], 401, "{path}: {body}");
+            assert!(body["data"].is_null(), "{path}: {body}");
+            assert!(
+                body["err"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Authentication required"),
+                "{path}: {body}"
+            );
+        }
+        db.cleanup().await;
+    }
+
+    /// 白名单路由不能被认证层拦下；静态资源 fallback 也不经过认证。
+    #[tokio::test]
+    async fn public_routes_and_static_assets_are_not_401() {
+        let Some(db) = crate::repo::test_support::TestDb::new().await else {
+            eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let app = test_app(&db);
+        // 运行时接口：空请求体不是认证问题（handler 内部会报业务错误）。
+        for path in ["/flow/answer", "/flow/answer/multipart"] {
+            let res = app
+                .clone()
+                .oneshot(post_json(path, serde_json::json!({})))
+                .await
+                .unwrap();
+            assert_ne!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        // 静态资源：GET / 由 fallback 返回 index.html，不经过认证。
+        let res = app.clone().oneshot(get_req("/")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().contains_key("x-content-type-options"));
+        // version.json 公开。
+        let res = app.clone().oneshot(get_req("/version.json")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        // B-52：健康检查公开，返回 app/schema 版本。
+        let res = app.clone().oneshot(get_req("/healthz")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json_body(res).await;
+        assert_eq!(body["data"]["status"], "ok");
+        assert_eq!(body["data"]["appVersion"], VERSION);
+        assert!(body["data"]["schemaVersion"].as_i64().unwrap_or(0) > 0);
+        assert_eq!(
+            body["data"]["schemaVersion"],
+            body["data"]["programSchemaVersion"]
+        );
+        // D38：默认不检查更新，也不出网。
+        let res = app
+            .clone()
+            .oneshot(get_req("/check-new-version.json"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json_body(res).await;
+        assert_eq!(body["status"], 200);
+        assert!(body["data"].is_null());
+        db.cleanup().await;
+    }
+
+    async fn insert_user(
+        db: &crate::repo::test_support::TestDb,
+        must_change_password: bool,
+    ) -> String {
+        let id = scru128::new_string();
+        let hash = auth::hash_password("a long enough password").unwrap();
+        repo::user::insert(&db.pool, &id, "admin", &hash, must_change_password)
+            .await
+            .unwrap();
+        id
+    }
+
+    fn set_cookie_token(res: &Response) -> String {
+        let value = res.headers().get(header::SET_COOKIE).unwrap();
+        let text = value.to_str().unwrap();
+        text.split(';').next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn login_me_logout_round_trip_uses_httponly_cookie() {
+        let Some(db) = crate::repo::test_support::TestDb::new().await else {
+            eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        insert_user(&db, false).await;
+        let app = test_app(&db);
+
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/auth/login",
+                serde_json::json!({"username":"admin","password":"a long enough password"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let cookie = res
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        let cookie = set_cookie_token(&res);
+        let body = json_body(res).await;
+        assert_eq!(body["data"]["username"], "admin");
+        assert_eq!(body["data"]["mustChangePassword"], false);
+
+        let res = app
+            .clone()
+            .oneshot(get_req_with_cookie("/auth/me", &cookie))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json_body(res).await;
+        assert_eq!(body["data"]["username"], "admin");
+        assert_eq!(body["data"]["isAdmin"], true);
+
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/auth/logout")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(get_req_with_cookie("/auth/me", &cookie))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn forged_expired_and_revoked_tokens_are_rejected() {
+        let Some(db) = crate::repo::test_support::TestDb::new().await else {
+            eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let user_id = insert_user(&db, false).await;
+        let app = test_app(&db);
+
+        let forged = HttpRequest::builder()
+            .method("GET")
+            .uri("/auth/me")
+            .header(header::AUTHORIZATION, "Bearer forged-token-value")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(forged).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let (token, session_id) = auth::issue_session(&db.pool, &user_id, None, None)
+            .await
+            .unwrap();
+        let cookie = format!("kiko_session={token}");
+        assert_eq!(
+            app.clone()
+                .oneshot(get_req_with_cookie("/auth/me", &cookie))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        sqlx::query("UPDATE sessions SET expires_at = now() - interval '1 second' WHERE id = $1")
+            .bind(&session_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(get_req_with_cookie("/auth/me", &cookie))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let (token2, _) = auth::issue_session(&db.pool, &user_id, None, None)
+            .await
+            .unwrap();
+        repo::session::revoke_by_hash(&db.pool, &auth::token_hash(&token2))
+            .await
+            .unwrap();
+        let cookie2 = format!("kiko_session={token2}");
+        assert_eq!(
+            app.clone()
+                .oneshot(get_req_with_cookie("/auth/me", &cookie2))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn must_change_password_blocks_business_routes_until_changed() {
+        let Some(db) = crate::repo::test_support::TestDb::new().await else {
+            eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let password_file =
+            std::env::temp_dir().join(format!("kiko-initial-{}.txt", scru128::new_string()));
+        std::fs::write(&password_file, "old password\n").unwrap();
+        let state = AppState {
+            pool: db.pool.clone(),
+            cookie_secure: false,
+            cors_origins: Vec::new(),
+            initial_password_file: password_file.clone(),
+        };
+        let app = into_app(gen_router(state));
+        insert_user(&db, true).await;
+
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/auth/login",
+                serde_json::json!({"username":"admin","password":"a long enough password"}),
+            ))
+            .await
+            .unwrap();
+        let cookie = set_cookie_token(&res);
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .clone()
+            .oneshot(get_req_with_cookie("/robot", &cookie))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body = json_body(res).await;
+        assert_eq!(body["status"], 403);
+        assert!(
+            body["err"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Password change")
+        );
+
+        // 改密前 /auth/me 仍可用。
+        assert_eq!(
+            app.clone()
+                .oneshot(get_req_with_cookie("/auth/me", &cookie))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/auth/change-password")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "oldPassword": "a long enough password",
+                            "newPassword": "a brand new passphrase"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{:?}", json_body(res).await);
+        assert!(!password_file.exists(), "改密后必须删除引导口令文件");
+
+        let user = repo::user::find_by_username(&db.pool, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!user.must_change_password);
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_revokes_other_sessions_but_keeps_the_current_one() {
+        let Some(db) = crate::repo::test_support::TestDb::new().await else {
+            eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let user_id = insert_user(&db, false).await;
+        let app = test_app(&db);
+        let (current, _) = auth::issue_session(&db.pool, &user_id, None, None)
+            .await
+            .unwrap();
+        let (other, _) = auth::issue_session(&db.pool, &user_id, None, None)
+            .await
+            .unwrap();
+        let current = format!("kiko_session={current}");
+        let other = format!("kiko_session={other}");
+
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/auth/change-password")
+                    .header(header::COOKIE, &current)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "oldPassword": "a long enough password",
+                            "newPassword": "a brand new passphrase"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            app.clone()
+                .oneshot(get_req_with_cookie("/auth/me", &current))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(get_req_with_cookie("/auth/me", &other))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        db.cleanup().await;
+    }
+
+    /// D12：有副作用的接口必须 POST；已登录的 GET 应该被路由层拒绝（405），
+    /// 而不是落到 handler 里执行。
+    #[tokio::test]
+    async fn side_effectful_routes_are_post_only() {
+        let Some(db) = crate::repo::test_support::TestDb::new().await else {
+            eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let user_id = insert_user(&db, false).await;
+        let (token, _) = auth::issue_session(&db.pool, &user_id, None, None)
+            .await
+            .unwrap();
+        let cookie = format!("kiko_session={token}");
+        let app = test_app(&db);
+        for path in [
+            "/mainflow/release?robotId=x&mainFlowId=y&data=",
+            "/intent/phrase/regenerate-all?robotId=x&id=y&data=",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(get_req_with_cookie(path, &cookie))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED, "{path}");
+        }
+        db.cleanup().await;
     }
 }

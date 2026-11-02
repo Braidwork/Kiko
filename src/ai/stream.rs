@@ -288,10 +288,7 @@ mod tests {
     fn multibyte_character_split_across_chunks() {
         for text in ["好", "𝄞", "a好b"] {
             let bytes = open_ai_event(text).into_bytes();
-            assert_eq!(
-                assert_chunking_is_irrelevant(&bytes),
-                vec![text],
-            );
+            assert_eq!(assert_chunking_is_irrelevant(&bytes), vec![text],);
         }
     }
 
@@ -337,10 +334,7 @@ mod tests {
     #[test]
     fn bare_ndjson_objects_are_accepted() {
         let bytes = b"{\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n{\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n";
-        assert_eq!(
-            assert_chunking_is_irrelevant(bytes),
-            vec!["a", "b"],
-        );
+        assert_eq!(assert_chunking_is_irrelevant(bytes), vec!["a", "b"],);
     }
 
     /// The old code returned an error here and lost the entire answer.
@@ -391,7 +385,11 @@ mod tests {
     #[test]
     fn finish_tolerates_a_truncated_final_line() {
         let mut s = DeltaStream::new();
-        assert!(s.push(b"data: {\"choices\":[{\"delta\":{\"conte").unwrap().is_empty());
+        assert!(
+            s.push(b"data: {\"choices\":[{\"delta\":{\"conte")
+                .unwrap()
+                .is_empty()
+        );
         assert!(s.finish().unwrap().is_empty());
         assert!(s.finish().unwrap().is_empty());
     }

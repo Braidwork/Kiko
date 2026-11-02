@@ -5,6 +5,8 @@ export function cloneObj(o) {
 export function httpReq(method, uri, query, form, body) {
     const options = {
         method: method,
+        // 会话在 HttpOnly cookie 里（B-34）；同源与跨源开发都带上凭据。
+        credentials: 'include',
         headers: {
             'Accept': 'application/json',
             'Content-Type': 'application/json'
@@ -26,7 +28,22 @@ export function httpReq(method, uri, query, form, body) {
         options.body = JSON.stringify(body);
         console.log(options.body);
     }
-    return fetch(url, options).then(response => response.json()).catch(error => error);
+    return fetch(url, options).then(async response => {
+        const data = await response.json().catch(() => null);
+        // 会话失效：跳登录页并记住当前地址。登录/改密接口自身不跳，避免循环。
+        if (response.status === 401 && !uri.startsWith('auth/')
+            && !window.location.hash.startsWith('#/login')) {
+            const redirect = encodeURIComponent(window.location.hash || '#/');
+            window.location.hash = '#/login?redirect=' + redirect;
+        }
+        // 强制改密窗口：后端对业务接口返回 403，前端同步跳改密页。
+        if (response.status === 403
+            && (data?.err?.message || '').includes('Password change')
+            && !window.location.hash.startsWith('#/change-password')) {
+            window.location.hash = '#/change-password';
+        }
+        return data;
+    }).catch(error => error);
 }
 
 /*
