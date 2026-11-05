@@ -14,15 +14,16 @@ const varData = reactive({
     // 乐观锁版本（B-17）：列表/详情返回，保存时原样带回。
     version: null,
     varName: '',
+    varUnifiedName: '',
     varType: '',
     varValueSource: '',
-    varConstantValue: '',
     varAssociateData: '',
     obtainValueExpressionType: 'None',
     obtainValueExpression: '',
     connectTimeoutMilliseconds: 100,
     readTimeoutMilliseconds: 1500,
-    cacheEnabled: true,
+    // 0=no cache, 1=per request, 2=per session
+    valCacheType: 2,
 });
 const varTypes = [
     { label: tm('var.types')[0], value: 'Str' },
@@ -37,7 +38,6 @@ const varValueSources = [
     { label: tm('var.sources')[0], value: 'Import', disabled: false },
     { label: tm('var.sources')[1], value: 'Collect', disabled: false },
     { label: 'User input', value: 'UserInput', disabled: false },
-    { label: 'Constant value', value: 'Constant', disabled: false },
     { label: tm('var.sources')[2], value: 'ExternalHttp', disabled: false },
 ];
 const varValueSourcesMap = new Map()
@@ -56,7 +56,7 @@ const tableData = ref([])
 const httpApiList = ref([])
 
 async function list() {
-    const t = await httpReq('GET', 'variable', { robotId: robotId }, null, null);
+    const t = await httpReq('GET', 'variable', null, null, null);
     console.log(t);
     showVars(t);
 }
@@ -87,13 +87,13 @@ const goBack = () => {
 const newVar = () => {
     varData.version = null
     varData.varName = ''
+    varData.varUnifiedName = ''
     varData.varType = ''
     varData.varValueSource = ''
-    varData.constantValue = ''
     varData.externalAssociateId = ''
     varData.obtainValueExpressionType = 'None'
     varData.obtainValueExpression = ''
-    varData.cacheEnabled = false
+    varData.valCacheType = 2
     showForm()
 }
 
@@ -105,7 +105,6 @@ const editVar = (idx, d) => {
     // varData.externalAssociateId = d.externalAssociateId
     // varData.obtainValueExpressionType = d.obtainValueExpressionType
     // varData.obtainValueExpression = d.obtainValueExpression
-    // varData.cacheEnabled = d.cacheEnabled
     showForm()
 }
 
@@ -124,7 +123,7 @@ const deleteVar = async (idx, d) => {
             // varData.varName = idx.toString();
             // varData.varType = d.varType
             // varData.varValueSource = d.varValueSource
-            const t = await httpReq('DELETE', 'variable', { robotId: robotId }, null, varData);
+            const t = await httpReq('DELETE', 'variable', null, null, varData);
             console.log(t);
             if (t.status == 200) {
                 await list();
@@ -152,7 +151,7 @@ function hideForm() {
 }
 
 async function saveForm() {
-    const t = await httpReq('POST', 'variable', { robotId: robotId }, null, varData);
+    const t = await httpReq('POST', 'variable', null, null, varData);
     console.log(t);
     await list();
     hideForm();
@@ -231,10 +230,6 @@ async function saveForm() {
                         :value="item.value" />
                 </el-select>
             </el-form-item>
-            <el-form-item v-if="varData.varValueSource == 'Constant'" label="Constant value"
-                :label-width="formLabelWidth">
-                <el-input v-model="varData.varConstantValue" autocomplete="on" />
-            </el-form-item>
             <el-form-item v-if="varData.varValueSource == 'ExternalHttp'" label="HTTP API"
                 :label-width="formLabelWidth">
                 <el-select v-model="varData.varAssociateData" placeholder="Choose a HTTP API" style="width: 100%">
@@ -266,17 +261,21 @@ async function saveForm() {
             <el-form-item v-if="varData.varValueSource == 'ExternalHttp'" label="Read timeout" :label-width="formLabelWidth">
                 <el-input-number v-model="varData.readTimeoutMilliseconds" :min="100" :max="600000" /> milliseconds
             </el-form-item>
-            <el-form-item v-if="varData.varValueSource == 'ExternalHttp'" label="Cache value"
+            <el-form-item v-if="varData.varValueSource == 'ExternalHttp'" label="Value cache"
                 :label-width="formLabelWidth">
-                <el-switch v-model="varData.cacheEnabled" active-text="Enable" />
+                <el-select v-model="varData.valCacheType" style="width: 100%">
+                    <el-option label="No cache" :value="0" />
+                    <el-option label="Cache per request" :value="1" />
+                    <el-option label="Cache per session" :value="2" />
+                </el-select>
             </el-form-item>
             <el-form-item v-if="varData.varValueSource == 'ExternalHttp'" label="" :label-width="formLabelWidth">
-                <span v-if="varData.cacheEnabled" style="color: #86909c; font-size: 13px;">After requesting once, the
-                    variable value will be stored in the cache
-                    and
-                    subsequently read from the cache.</span>
-                <span v-if="!varData.cacheEnabled" style="color: #86909c; font-size: 13px;">HTTP API will be requested
-                    every time</span>
+                <span v-if="varData.valCacheType == 0" style="color: #86909c; font-size: 13px;">HTTP API will be
+                    requested every time</span>
+                <span v-else-if="varData.valCacheType == 1" style="color: #86909c; font-size: 13px;">The value is
+                    cached for the current request only</span>
+                <span v-else style="color: #86909c; font-size: 13px;">After the first request, the value is stored
+                    in the session cache and reused in later turns</span>
             </el-form-item>
         </el-form>
         <div class="demo-drawer__footer">

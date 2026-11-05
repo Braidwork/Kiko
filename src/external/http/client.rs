@@ -277,7 +277,8 @@ pub(crate) async fn req(
 fn resolve_body(body: &str, vars: &HashMap<String, VariableValue>) -> String {
     let plain = crate::flow::rt::var_replace::rich_text_body_to_plain(body);
     match crate::flow::rt::var_replace::replace_vars_with(&plain, |name| {
-        Ok(vars.get(name).map(|v| v.val_to_string()))
+        let key = crate::variable::unify_var_name(name);
+        Ok(vars.get(&key).map(|v| v.val_to_string()))
     }) {
         Ok(s) => s,
         // The resolver above never fails; keep the plain text either way.
@@ -292,7 +293,7 @@ fn param_value(param: &HttpReqParam, vars: &HashMap<String, VariableValue>) -> S
     match param.value_source {
         ValueSource::Val => param.value.clone(),
         ValueSource::Var => vars
-            .get(&param.value)
+            .get(&crate::variable::unify_var_name(&param.value))
             .map_or(String::new(), |v| v.val_to_string()),
     }
 }
