@@ -181,6 +181,14 @@ impl Context {
         .await
     }
 
+    /// 外部 HTTP 请求做变量替换时可见的值：会话缓存（`val_cache_type = 2`）加上
+    /// 本轮请求的临时变量（`val_cache_type = 1` 或 0）。后者不随会话持久化。
+    pub(crate) fn substitution_vars(&self) -> HashMap<String, VariableValue> {
+        let mut vars = self.vars.clone();
+        vars.extend(self.none_persistent_vars.clone());
+        vars
+    }
+
     // pub(crate) async fn clear(&mut self) -> Result<()> {
     //     self.nodes.clear();
     //     self.vars.clear();
