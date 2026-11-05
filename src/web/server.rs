@@ -1317,9 +1317,7 @@ mod tests {
             StatusCode::OK
         );
 
-        sqlx::query("UPDATE sessions SET expires_at = now() - interval '1 second' WHERE id = $1")
-            .bind(&session_id)
-            .execute(&db.pool)
+        repo::session::expire_for_test(&db.pool, &session_id)
             .await
             .unwrap();
         assert_eq!(

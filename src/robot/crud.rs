@@ -75,7 +75,7 @@ async fn new(d: &RobotData, is_en: bool) -> Result<()> {
     // 意图
     intent::init(&d.robot_id, is_en).await?;
     // 变量（已在 PG）
-    variable::init(&d.robot_id, is_en).await?;
+    variable::init(is_en).await?;
     // 主流程
     mainflow::init(&d.robot_id).await?;
     Ok(())
@@ -103,6 +103,8 @@ pub(crate) async fn delete(Query(q): Query<RobotQuery>) -> impl IntoResponse {
 ///
 /// 1. `secrets.scope` 没有外键，不跟着级联 —— 必须显式删；
 /// 2. `data/uploads/<robot_id>/` 是本地文件（D30 / §5.6，A 里这段被注释掉了）。
+///
+/// `variables` 是跨机器人共享的，故意不随机器人删除。
 ///
 /// 顺序：先清文件、再删机器人行、最后清 secrets。反过来失败会留下"机器人还在、
 /// 文件没了"；按这个顺序失败，残留的是可重试的孤儿目录或孤儿 secret。每一步都

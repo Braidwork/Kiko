@@ -1,3 +1,6 @@
+> [!WARNING]
+> 本项目还在开发中（heavy deployment），代码 API 和数据库字段会经常变动，不建议在生产上使用。
+
 简体中文 | [English](./README.md)
 
 欢迎给本项目，或者给 [Github 上的项目](https://github.com/Braidwork/Kiko) ✨**Star**🎇!

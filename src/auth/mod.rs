@@ -247,7 +247,7 @@ pub(crate) async fn issue_session(
 /// 32 字节随机 token，base64url（无 padding），可直接放进 cookie。
 fn new_session_token() -> Result<String> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|e| Error::WithMessage(format!("Generating session token failed: {e}")))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
@@ -401,14 +401,27 @@ pub(crate) async fn bootstrap_admin(
     Ok(true)
 }
 
+/// 运维恢复：重置一个已存在用户的密码，并吊销其全部会话（CLI `kiko reset-password`）。
+///
+/// 与 [`bootstrap_admin`] 的区别：这里不检查 `users` 是否为空，也不改 `status`；
+/// 明文口令先过强度校验，再哈希。`must_change_password` 置 false，调用方（运维）
+/// 已经选定了一个合规的新口令。
+pub(crate) async fn reset_password(pool: &PgPool, user: &User, new_password: &str) -> Result<()> {
+    validate_password_strength(&user.username, new_password)?;
+    let hash = hash_password(new_password)?;
+    repo::user::set_password(pool, &user.id, &hash, false).await?;
+    repo::session::revoke_all_for_user(pool, &user.id).await?;
+    Ok(())
+}
+
 /// 32 字符随机口令，去掉容易混淆的 `0/O/1/l/I`。
 fn generate_password() -> String {
     const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
     let mut bytes = [0u8; 32];
     // getrandom 失败概率极低；退化成固定串会违反 D24，所以先重试一次再放弃。
-    if getrandom::getrandom(&mut bytes).is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         let mut retry = [0u8; 32];
-        getrandom::getrandom(&mut retry).expect("OS random source is unavailable");
+        getrandom::fill(&mut retry).expect("OS random source is unavailable");
         bytes = retry;
     }
     let mut password = String::with_capacity(bytes.len());
@@ -697,6 +710,56 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         let _ = std::fs::remove_file(&file);
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn reset_password_updates_hash_and_revokes_sessions() {
+        let Some(db) = TestDb::new().await else {
+            eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let user_id = scru128::new_string();
+        let old_hash = hash_password("old-password-12345").unwrap();
+        repo::user::insert(&db.pool, &user_id, "admin", &old_hash, false)
+            .await
+            .unwrap();
+        let user = repo::user::find_by_username(&db.pool, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (token, _session_id) = issue_session(&db.pool, &user.id, None, None).await.unwrap();
+        let token_hash = token_hash(&token);
+        assert!(
+            repo::session::find_valid(&db.pool, &token_hash)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // 弱口令必须被拒绝，且旧密码仍然有效。
+        let err = reset_password(&db.pool, &user, "short").await.unwrap_err();
+        assert!(err.message().contains("too short"), "{err}");
+        assert!(verify_password(&old_hash, "old-password-12345"));
+
+        reset_password(&db.pool, &user, "a new long password")
+            .await
+            .unwrap();
+        let user = repo::user::find_by_username(&db.pool, "admin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!user.must_change_password);
+        assert!(verify_password(&user.password_hash, "a new long password"));
+        // 重置后旧会话必须立即失效。
+        assert!(
+            repo::session::find_valid(&db.pool, &token_hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
         db.cleanup().await;
     }
 }

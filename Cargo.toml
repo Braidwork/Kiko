@@ -28,13 +28,13 @@ base64 = "0.23.1"
 bigdecimal = "0.4.11"
 # bytes = "1.9"
 # candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.5.1" }
-candle = { version = "0.11.0", package = "candle-core", default-features = false }
+candle = { version = "0.11.1", package = "candle-core", default-features = false }
 # candle = { git = "https://github.com/huggingface/candle.git", package = "candle-core", default-features = false }
-candle-nn = "0.11.0"
+candle-nn = "0.11.1"
 # candle-nn = { git = "https://github.com/huggingface/candle.git" }
 # candle-onnx = "0.8"
 # candle-transformers = { git = "https://github.com/huggingface/candle.git" }
-candle-transformers = { version = "0.11.0" }
+candle-transformers = { version = "0.11.1" }
 # candle-transformers = { version = "0.9.1", features = ["flash-attn"] }
 # crossbeam-channel = "0.5"
 frand = "0.10.1"
@@ -61,7 +61,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls", 
 rkyv = {version = "0.8.18", features = ["aligned", "alloc", "bytecheck"]}
 scru128 = "4.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 scraper = "0.29.0"
 # snmalloc-rs = "0.7.5" # 暂时不支持MUSL
 # simd-json = "0.10"
@@ -69,17 +69,17 @@ scraper = "0.29.0"
 # strsim = "0.10.0"
 # textdistance = "1.0.2"
 time = { version = "0.3.55", features = ["formatting"] }
-toml = "1.1"
+toml = "1.2.0+spec-1.1.0"
 tower-http = { version = "0.7.1", features = ["cors", "limit"] }
 # typetag = "0.2"
-tokio = { version = "1.53.2", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "time", "tracing"] }
+tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "time", "tracing"] }
 tokio-stream = "0.1.19"
 # tracing-subscriber = "0.3"
-log = "0.4.34"
+log = "0.4.35"
 env_logger = "0.11.11"
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "tokio1", "tokio1-rustls", "rustls", "rustls-platform-verifier", "ring", "smtp-transport", "pool"]}
 unicase = "2.10.0"
-unicode-normalization = "0.1.25"
+unicode-normalization = "0.1.26"
 # D40：sqlx 0.9，default-features 必须关掉（默认带 `any`）；TLS 特性名是 `tls-rustls`。
 # redb / turso 都已移除（B-20 / S4）：关系型数据、知识库载荷与向量全部在 PG。
 sqlx = { version = "0.9", default-features = false, features = [
@@ -91,12 +91,12 @@ sqlx = { version = "0.9", default-features = false, features = [
     "macros",
     "derive",
 ] }
-lopdf = "0.46.0"
+lopdf = "0.47.0"
 # docx-rs = "0.4.17"
 # lancedb = "0.13.0"
 # libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 validator = "0.21.0"
-zip = "9.0.5"
+zip = "9.4.0"
 quick-xml = "0.42.0"
 # usearch = "2.17"
 # cxx = "1.0"

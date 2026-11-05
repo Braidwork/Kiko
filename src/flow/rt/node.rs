@@ -98,7 +98,7 @@ async fn replace_vars(text: &str, req: &Request, ctx: &mut Context) -> Result<St
         if values.contains_key(&name) {
             continue;
         }
-        let value = match variable::get(&req.robot_id, &name).await? {
+        let value = match variable::get(&name).await? {
             Some(v) => v
                 .get_value2(req, ctx)
                 .await
@@ -433,12 +433,10 @@ impl RuntimeNode for CollectNode {
         if let Some(r) = collector::collect(&req.user_input, &self.collect_type) {
             // println!("{} {}", &self.var_name, r);
             let v = VariableValue::new(r, &VariableType::Str);
-            // Same canonical form the variable table uses, so a flow configured
-            // with an older spelling still finds the collected value.
-            let var_name = variable::sanitize_var_name(&self.var_name);
-            ctx.vars.insert(var_name.clone(), v);
+            // Same canonical key and cache policy the variable table uses.
+            variable::set_value(&self.var_name, v, ctx).await;
             let collect_data = CollectData {
-                var_name,
+                var_name: self.var_name.clone(),
                 value: String::from(r),
             };
             response.collect_data.push(collect_data);
@@ -536,14 +534,14 @@ impl RuntimeNode for ExternalHttpCallNode {
                     api,
                     self.connect_timeout_milliseconds,
                     self.read_timeout_milliseconds,
-                    ctx.vars.clone(),
+                    ctx.substitution_vars(),
                 ));
             } else {
                 match http::status_code(
                     api,
                     self.connect_timeout_milliseconds,
                     self.read_timeout_milliseconds,
-                    ctx.vars.clone(),
+                    ctx.substitution_vars(),
                 )
                 .await
                 {

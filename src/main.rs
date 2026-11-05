@@ -19,7 +19,7 @@ use kiko::web::server::start_app;
 // static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<(), std::io::Error> {
-    // B-07：`kiko hash-password` 不启动服务、不初始化日志/运行时。
+    // B-07 / 运维恢复：CLI 子命令不启动服务，也不初始化日志与主运行时。
     if let Some(code) = kiko::cli::run() {
         std::process::exit(code);
     }

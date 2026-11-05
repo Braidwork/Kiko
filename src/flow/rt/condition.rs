@@ -53,7 +53,7 @@ pub(crate) enum TargetDataVariant {
 // #[macro_export]
 macro_rules! compare_numbers {
     ($req: expr, $ctx: expr, $ref_data: expr, $comparsion: tt, $self: ident) => ({
-        let r = variable::get(&$req.robot_id, $ref_data).await;
+        let r = variable::get($ref_data).await;
         if r.is_err() {
             log::error!("err");
             return false;
@@ -165,21 +165,21 @@ impl ConditionData {
             }
             ConditionType::FlowVariable => match self.compare_type {
                 CompareType::HasValue => {
-                    if let Ok(Some(v)) = variable::get(&req.robot_id, &self.ref_data).await {
+                    if let Ok(Some(v)) = variable::get(&self.ref_data).await {
                         v.get_value2(req, ctx).await.is_some()
                     } else {
                         false
                     }
                 }
                 CompareType::DoesNotHaveValue => {
-                    if let Ok(Some(v)) = variable::get(&req.robot_id, &self.ref_data).await {
+                    if let Ok(Some(v)) = variable::get(&self.ref_data).await {
                         v.get_value2(req, ctx).await.is_none()
                     } else {
                         true
                     }
                 }
                 CompareType::EmptyString => {
-                    if let Ok(Some(v)) = variable::get(&req.robot_id, &self.ref_data).await {
+                    if let Ok(Some(v)) = variable::get(&self.ref_data).await {
                         if v.var_type == VariableType::Num {
                             false
                         } else {
@@ -191,7 +191,7 @@ impl ConditionData {
                     }
                 }
                 CompareType::Eq => {
-                    if let Ok(Some(v)) = variable::get(&req.robot_id, &self.ref_data).await {
+                    if let Ok(Some(v)) = variable::get(&self.ref_data).await {
                         if let Some(val) = v.get_value2(req, ctx).await {
                             if self.case_sensitive_comparison {
                                 val.val_to_string()
@@ -210,7 +210,7 @@ impl ConditionData {
                     }
                 }
                 CompareType::NotEq => {
-                    if let Ok(Some(v)) = variable::get(&req.robot_id, &self.ref_data).await {
+                    if let Ok(Some(v)) = variable::get(&self.ref_data).await {
                         if let Some(val) = v.get_value2(req, ctx).await {
                             if self.case_sensitive_comparison {
                                 !val.val_to_string()
@@ -229,7 +229,7 @@ impl ConditionData {
                     }
                 }
                 CompareType::Contains => {
-                    if let Ok(Some(v)) = variable::get(&req.robot_id, &self.ref_data).await {
+                    if let Ok(Some(v)) = variable::get(&self.ref_data).await {
                         if v.var_type == VariableType::Num {
                             false
                         } else if let Some(val) = v.get_value2(req, ctx).await {
@@ -252,7 +252,7 @@ impl ConditionData {
                     }
                 }
                 CompareType::NotContains => {
-                    if let Ok(Some(v)) = variable::get(&req.robot_id, &self.ref_data).await {
+                    if let Ok(Some(v)) = variable::get(&self.ref_data).await {
                         if v.var_type == VariableType::Num {
                             false
                         } else if let Some(val) = v.get_value2(req, ctx).await {
@@ -267,7 +267,7 @@ impl ConditionData {
                 }
                 CompareType::NGT => {
                     compare_numbers!(req, ctx, &self.ref_data, >, self)
-                    // if let Ok(op) = variable::get(&req.robot_id, &self.ref_data).await {
+                    // if let Ok(op) = variable::get(&self.ref_data).await {
                     //     if let Some(v) = op {
                     //         if v.var_type == VariableType::Str {
                     //             false
@@ -299,7 +299,7 @@ impl ConditionData {
                 }
                 CompareType::NGTE => {
                     compare_numbers!(req, ctx, &self.ref_data, >=, self)
-                    // if let Ok(op) = variable::get(&req.robot_id, &self.ref_data).await {
+                    // if let Ok(op) = variable::get(&self.ref_data).await {
                     //     if let Some(v) = op {
                     //         if v.var_type == VariableType::Str {
                     //             false
@@ -329,7 +329,7 @@ impl ConditionData {
                 }
                 CompareType::NLT => {
                     compare_numbers!(req, ctx, &self.ref_data, <, self)
-                    // if let Ok(op) = variable::get(&req.robot_id, &self.ref_data).await {
+                    // if let Ok(op) = variable::get(&self.ref_data).await {
                     //     if let Some(v) = op {
                     //         if v.var_type == VariableType::Str {
                     //             false
@@ -359,7 +359,7 @@ impl ConditionData {
                 }
                 CompareType::NLTE => {
                     compare_numbers!(req, ctx, &self.ref_data, <=, self)
-                    // if let Ok(op) = variable::get(&req.robot_id, &self.ref_data).await {
+                    // if let Ok(op) = variable::get(&self.ref_data).await {
                     //     if let Some(v) = op {
                     //         if v.var_type == VariableType::Str {
                     //             false

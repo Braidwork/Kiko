@@ -124,6 +124,16 @@ pub(crate) async fn revoke_by_hash(pool: &PgPool, token_hash: &[u8]) -> Result<(
     Ok(())
 }
 
+/// 测试用：把会话强制过期。SQL 仍然只在 repo 层（AGENTS 硬约束 1）。
+#[cfg(test)]
+pub(crate) async fn expire_for_test(pool: &PgPool, session_id: &str) -> Result<()> {
+    sqlx::query("UPDATE sessions SET expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// 改密后吊销该用户其他会话，保留当前会话（B-34）。
 pub(crate) async fn revoke_others(
     pool: &PgPool,
@@ -136,6 +146,18 @@ pub(crate) async fn revoke_others(
     )
     .bind(user_id)
     .bind(keep_session_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// 运维重置密码后吊销该用户的全部会话（没有“保留当前会话”的概念）。
+pub(crate) async fn revoke_all_for_user(pool: &PgPool, user_id: &str) -> Result<u64> {
+    let r = sqlx::query(
+        "UPDATE sessions SET revoked_at = now()
+          WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
