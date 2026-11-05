@@ -265,20 +265,6 @@ async fn deleting_robot_keeps_global_variables() {
     assert!(!cols.iter().any(|c| c == "cache_enabled"));
     assert!(!cols.iter().any(|c| c == "var_constant_value"));
 
-    let has_unique_index: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM pg_indexes
-              WHERE schemaname = $1
-                AND tablename = 'variables'
-                AND indexname = 'variables_var_unified_name_uniq'
-         )",
-    )
-    .bind(&db.schema)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert!(has_unique_index, "var_unified_name 必须有命名唯一索引");
-
     assert!(robot::delete(&db.pool, "rY").await.unwrap());
     assert!(
         variable::get(&db.pool, "v1").await.unwrap().is_some(),

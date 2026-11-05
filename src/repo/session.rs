@@ -151,6 +151,18 @@ pub(crate) async fn revoke_others(
     Ok(r.rows_affected())
 }
 
+/// 运维重置密码后吊销该用户的全部会话（没有“保留当前会话”的概念）。
+pub(crate) async fn revoke_all_for_user(pool: &PgPool, user_id: &str) -> Result<u64> {
+    let r = sqlx::query(
+        "UPDATE sessions SET revoked_at = now()
+          WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
 /// 清理已经过期/已吊销的会话行（登录时顺手做，避免表无限长）。
 pub(crate) async fn delete_expired(pool: &PgPool) -> Result<u64> {
     let r = sqlx::query(
