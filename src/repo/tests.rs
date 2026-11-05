@@ -13,7 +13,8 @@ use crate::external::http::dto::{
 use crate::man::settings::{GlobalSettings, Settings, split_global, split_settings};
 use crate::robot::dto::{RobotData, RobotType};
 use crate::variable::dto::{
-    Variable, VariableObtainValueExpressionType, VariableType, VariableValueSource,
+    Variable, VariableObtainValueExpressionType, VariableType, VariableValueCacheType,
+    VariableValueSource,
 };
 use crate::vector;
 
@@ -46,16 +47,16 @@ fn unit_vec(dim: usize, i: usize) -> Vec<f32> {
 
 fn variable(name: &str) -> Variable {
     Variable {
+        var_unified_name: crate::variable::unify_var_name(name),
         var_name: String::from(name),
         var_type: VariableType::Str,
         var_val_source: VariableValueSource::Collect,
-        var_constant_value: String::new(),
         var_associate_data: String::new(),
         obtain_value_expression_type: VariableObtainValueExpressionType::None,
         obtain_value_expression: String::new(),
         connect_timeout_milliseconds: 1000,
         read_timeout_milliseconds: 1500,
-        cache_enabled: true,
+        val_cache_type: VariableValueCacheType::Session,
         version: None,
     }
 }
@@ -186,72 +187,103 @@ async fn variable_crud_roundtrip_and_order() {
     };
     robot::upsert(&db.pool, &robot("rX", "kb")).await.unwrap();
 
-    variable::upsert(&db.pool, "rX", &variable("b"))
-        .await
-        .unwrap();
-    variable::upsert(&db.pool, "rX", &variable("A"))
-        .await
-        .unwrap();
-    variable::upsert(&db.pool, "rX", &variable("a"))
-        .await
-        .unwrap();
+    variable::upsert(&db.pool, &variable("b")).await.unwrap();
+    // 显示名保留大小写，但 code 归一化后 `A` 与 `a` 是同一个变量。
+    variable::upsert(&db.pool, &variable("A")).await.unwrap();
+    variable::upsert(&db.pool, &variable("c")).await.unwrap();
 
-    let list = variable::list(&db.pool, "rX").await.unwrap();
+    let list = variable::list(&db.pool).await.unwrap();
     let names: Vec<&str> = list.iter().map(|v| v.var_name.as_str()).collect();
-    assert_eq!(names, ["A", "a", "b"], "变量列表按 var_name 字节序");
+    assert_eq!(names, ["A", "b", "c"], "变量列表按 var_unified_name 字节序");
+
+    // 查询、更新都走内部 code：大小写不同的写法命中同一条。
+    assert_eq!(
+        variable::get(&db.pool, "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .var_name,
+        "A"
+    );
 
     let mut v = variable("a");
     v.var_type = VariableType::Num;
-    v.var_constant_value = String::from("42");
     v.obtain_value_expression_type = VariableObtainValueExpressionType::JsonPointer;
     v.obtain_value_expression = String::from("/data/x");
     v.connect_timeout_milliseconds = 250;
-    v.cache_enabled = false;
-    variable::upsert(&db.pool, "rX", &v).await.unwrap();
+    v.val_cache_type = VariableValueCacheType::NoCache;
+    variable::upsert(&db.pool, &v).await.unwrap();
 
-    let got = variable::get(&db.pool, "rX", "a").await.unwrap().unwrap();
-    assert_eq!(got.var_type, VariableType::Num, "同名写入是整条覆盖");
-    assert_eq!(got.var_constant_value, "42");
+    let got = variable::get(&db.pool, "A").await.unwrap().unwrap();
+    assert_eq!(
+        got.var_type,
+        VariableType::Num,
+        "同一个 code 写入是整条覆盖"
+    );
+    assert_eq!(got.var_unified_name, "a");
     assert_eq!(
         got.obtain_value_expression_type,
         VariableObtainValueExpressionType::JsonPointer
     );
     assert_eq!(got.obtain_value_expression, "/data/x");
     assert_eq!(got.connect_timeout_milliseconds, 250);
-    assert!(!got.cache_enabled);
-    assert_eq!(variable::list(&db.pool, "rX").await.unwrap().len(), 3);
+    assert_eq!(got.val_cache_type, VariableValueCacheType::NoCache);
+    assert_eq!(got.var_name, "a", "显示名也随整条覆盖更新");
+    assert_eq!(variable::list(&db.pool).await.unwrap().len(), 3);
 
-    variable::delete(&db.pool, "rX", "a").await.unwrap();
-    assert!(variable::get(&db.pool, "rX", "a").await.unwrap().is_none());
+    variable::delete(&db.pool, "a").await.unwrap();
+    assert!(variable::get(&db.pool, "A").await.unwrap().is_none());
     // 删除不存在的变量不报错（与 redb 的 remove 一致）。
-    variable::delete(&db.pool, "rX", "nope").await.unwrap();
+    variable::delete(&db.pool, "nope").await.unwrap();
 
     db.cleanup().await;
 }
 
+/// 变量是全局的：删机器人不能删掉变量，也不再有 robot_id/cache_enabled 列。
 #[tokio::test]
-async fn deleting_robot_cascades_variables() {
+async fn deleting_robot_keeps_global_variables() {
     let Some(db) = TestDb::new().await else {
         eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
         return;
     };
-    robot::upsert(&db.pool, &robot("rY", "cascade"))
+    robot::upsert(&db.pool, &robot("rY", "global"))
         .await
         .unwrap();
-    variable::upsert(&db.pool, "rY", &variable("v1"))
-        .await
-        .unwrap();
-    variable::upsert(&db.pool, "rY", &variable("v2"))
-        .await
-        .unwrap();
+    variable::upsert(&db.pool, &variable("v1")).await.unwrap();
+
+    let cols: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns
+          WHERE table_schema = $1 AND table_name = 'variables'",
+    )
+    .bind(&db.schema)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(cols.iter().any(|c| c == "var_unified_name"));
+    assert!(cols.iter().any(|c| c == "val_cache_type"));
+    assert!(!cols.iter().any(|c| c == "robot_id"));
+    assert!(!cols.iter().any(|c| c == "cache_enabled"));
+    assert!(!cols.iter().any(|c| c == "var_constant_value"));
+
+    let has_unique_index: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_indexes
+              WHERE schemaname = $1
+                AND tablename = 'variables'
+                AND indexname = 'variables_var_unified_name_uniq'
+         )",
+    )
+    .bind(&db.schema)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(has_unique_index, "var_unified_name 必须有命名唯一索引");
 
     assert!(robot::delete(&db.pool, "rY").await.unwrap());
-    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM variables WHERE robot_id = $1")
-        .bind("rY")
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-    assert_eq!(left, 0, "删机器人必须级联清掉它的变量");
+    assert!(
+        variable::get(&db.pool, "v1").await.unwrap().is_some(),
+        "删机器人不能影响跨机器人共享的变量"
+    );
 
     db.cleanup().await;
 }
@@ -2329,25 +2361,21 @@ async fn optimistic_locking_rejects_stale_updates() {
     conflict(robot::update(&db.pool, &bot, 0).await.unwrap_err());
     assert!(robot::update(&db.pool, &bot, 1).await.unwrap());
 
-    // --- 变量（按名字 upsert，编辑必须带 version） ---
+    // --- 变量（按 code upsert，编辑必须带 version） ---
     let mut var = variable("vmeta");
-    variable::upsert(&db.pool, "rMeta", &var).await.unwrap();
+    variable::upsert(&db.pool, &var).await.unwrap();
     assert_eq!(
-        variable::get(&db.pool, "rMeta", "vmeta")
+        variable::get(&db.pool, "vmeta")
             .await
             .unwrap()
             .unwrap()
             .version,
         Some(0)
     );
-    var.var_constant_value = String::from("x");
-    assert!(variable::update(&db.pool, "rMeta", &var, 0).await.unwrap());
-    conflict(
-        variable::update(&db.pool, "rMeta", &var, 0)
-            .await
-            .unwrap_err(),
-    );
-    assert!(variable::update(&db.pool, "rMeta", &var, 1).await.unwrap());
+    var.var_associate_data = String::from("x");
+    assert!(variable::update(&db.pool, &var, 0).await.unwrap());
+    conflict(variable::update(&db.pool, &var, 0).await.unwrap_err());
+    assert!(variable::update(&db.pool, &var, 1).await.unwrap());
 
     // --- 外部 HTTP（主表 + 参数同事务，编辑必须带 version） ---
     let mut api = http_api("api1", "api");
