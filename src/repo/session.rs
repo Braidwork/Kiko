@@ -124,6 +124,16 @@ pub(crate) async fn revoke_by_hash(pool: &PgPool, token_hash: &[u8]) -> Result<(
     Ok(())
 }
 
+/// 测试用：把会话强制过期。SQL 仍然只在 repo 层（AGENTS 硬约束 1）。
+#[cfg(test)]
+pub(crate) async fn expire_for_test(pool: &PgPool, session_id: &str) -> Result<()> {
+    sqlx::query("UPDATE sessions SET expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// 改密后吊销该用户其他会话，保留当前会话（B-34）。
 pub(crate) async fn revoke_others(
     pool: &PgPool,
