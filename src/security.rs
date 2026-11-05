@@ -62,7 +62,7 @@ pub(crate) fn encrypt(plaintext: &str) -> Result<String> {
         .map_err(|e| Error::WithMessage(format!("Invalid master key: {e}")))?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce_bytes)
+    getrandom::fill(&mut nonce_bytes)
         .map_err(|e| Error::WithMessage(format!("Generating nonce failed: {e}")))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
@@ -135,7 +135,7 @@ fn load_or_generate_key_file() -> Result<[u8; KEY_LEN]> {
             .map_err(|e| Error::WithMessage(format!("Creating {} failed: {e}", dir.display())))?;
     }
     let mut key = [0u8; KEY_LEN];
-    getrandom::getrandom(&mut key)
+    getrandom::fill(&mut key)
         .map_err(|e| Error::WithMessage(format!("Generating master key failed: {e}")))?;
     std::fs::write(path, format!("{}\n", B64.encode(key)))
         .map_err(|e| Error::WithMessage(format!("Writing {} failed: {e}", path.display())))?;

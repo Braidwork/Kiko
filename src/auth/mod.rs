@@ -247,7 +247,7 @@ pub(crate) async fn issue_session(
 /// 32 字节随机 token，base64url（无 padding），可直接放进 cookie。
 fn new_session_token() -> Result<String> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|e| Error::WithMessage(format!("Generating session token failed: {e}")))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
@@ -406,9 +406,9 @@ fn generate_password() -> String {
     const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
     let mut bytes = [0u8; 32];
     // getrandom 失败概率极低；退化成固定串会违反 D24，所以先重试一次再放弃。
-    if getrandom::getrandom(&mut bytes).is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         let mut retry = [0u8; 32];
-        getrandom::getrandom(&mut retry).expect("OS random source is unavailable");
+        getrandom::fill(&mut retry).expect("OS random source is unavailable");
         bytes = retry;
     }
     let mut password = String::with_capacity(bytes.len());
