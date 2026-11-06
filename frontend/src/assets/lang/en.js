@@ -440,7 +440,7 @@ export default {
   var: {
     types: ["String", "Number"],
     sources: ["Import", "Collect", "External HTTP"],
-    title: "Variables management",
+    title: "Variables management (Shared by all robots)",
     add: "Add a new variable",
     table: ["Name", "Type", "Source of variable value", "Operations"],
     form: {
@@ -453,7 +453,7 @@ export default {
     },
   },
   eApi: {
-    title: "External HTTP APIs list",
+    title: "List of HTTP Interfaces (shared by all robots)",
     add: "Add new external HTTP API",
     detail: {
       title: "External HTTP API",

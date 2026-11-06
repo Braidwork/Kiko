@@ -62,7 +62,7 @@ async function list() {
 }
 
 onMounted(async () => {
-    const t = await httpReq('GET', 'external/http', { robotId: robotId }, null, null);
+    const t = await httpReq('GET', 'external/http', null, null, null);
     // console.log(t);
     if (t && t.status == 200) {
         httpApiList.value = t.data == null ? [] : t.data;

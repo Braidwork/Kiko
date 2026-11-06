@@ -291,8 +291,8 @@ fn resolve_body(body: &str, vars: &HashMap<String, VariableValue>) -> String {
 /// not set. Headers, query parameters and form data all resolve this way.
 fn param_value(param: &HttpReqParam, vars: &HashMap<String, VariableValue>) -> String {
     match param.value_source {
-        ValueSource::Val => param.value.clone(),
-        ValueSource::Var => vars
+        ValueSource::Const => param.value.clone(),
+        ValueSource::Variable => vars
             .get(&crate::variable::unify_var_name(&param.value))
             .map_or(String::new(), |v| v.val_to_string()),
     }
@@ -365,15 +365,15 @@ fn build_req(
         Method::POST => {
             let r = client.post(&url);
             if info.post_content_type == PostContentType::UrlEncoded {
-                // The body is the parameter table. `request_body` belongs to
-                // RAW and is not editable in this mode.
-                if info.form_data.is_empty() {
+                // The body is the URL-encoded payload table. `payload` belongs
+                // to RAW and is not editable in this mode.
+                if info.urlencoded_payload.is_empty() {
                     r
                 } else {
-                    r.form(&pairs(&info.form_data, vars))
+                    r.form(&pairs(&info.urlencoded_payload, vars))
                 }
             } else {
-                let body = resolve_body(&info.request_body, vars);
+                let body = resolve_body(&info.payload, vars);
                 if body.is_empty() { r } else { r.body(body) }
             }
         }
@@ -381,8 +381,8 @@ fn build_req(
     if !info.headers.is_empty() {
         req = req.headers(header_map(&info.headers, vars));
     }
-    if !info.query_params.is_empty() {
-        req = req.query(&pairs(&info.query_params, vars));
+    if !info.query_string.is_empty() {
+        req = req.query(&pairs(&info.query_string, vars));
     }
     if info.post_content_type == PostContentType::Raw {
         // The body is whatever the user typed. Only the default content type
@@ -434,11 +434,11 @@ mod tests {
             value_source: source,
         };
         let params = vec![
-            p("a", "x", ValueSource::Val),
-            p("b", "name", ValueSource::Var),
+            p("a", "x", ValueSource::Const),
+            p("b", "name", ValueSource::Variable),
             // Known variable of another kind, and one that does not exist.
-            p("c", "count", ValueSource::Var),
-            p("d", "nope", ValueSource::Var),
+            p("c", "count", ValueSource::Variable),
+            p("d", "nope", ValueSource::Variable),
         ];
         assert_eq!(
             pairs(&params, &vars()),
@@ -487,12 +487,12 @@ mod tests {
             value_source: source,
         };
         let params = vec![
-            p("X-Token", "literal", ValueSource::Val),
-            p("X-Name", "name", ValueSource::Var),
+            p("X-Token", "literal", ValueSource::Const),
+            p("X-Name", "name", ValueSource::Variable),
             // A space is not allowed in a header name and a newline is not
             // allowed in a value, so neither pair can be sent.
-            p("X Bad", "v", ValueSource::Val),
-            p("X-Newline", "a\nb", ValueSource::Val),
+            p("X Bad", "v", ValueSource::Const),
+            p("X-Newline", "a\nb", ValueSource::Const),
         ];
         let headers = header_map(&params, &vars());
         assert_eq!(headers.len(), 2);

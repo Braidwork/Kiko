@@ -31,9 +31,9 @@ const httpApiData = reactive({
   // timeoutMilliseconds: '1500',
   postContentType: 'UrlEncoded',
   headers: [],
-  queryParams: [],
-  formData: [],
-  requestBody: '',
+  queryString: [],
+  urlencodedPayload: [],
+  payload: '',
   // Records saved before this field existed keep this value; the backend
   // treats an empty one as application/json too.
   contentType: 'application/json',
@@ -77,18 +77,18 @@ const bodyToHtml = (s) => {
 // An empty document serialises to `<p></p>`; store it as no body at all.
 const syncRequestBody = () => {
   const editor = requestBodyEditor.value
-  if (editor) httpApiData.requestBody = editor.isEmpty ? '' : editor.getHTML()
+  if (editor) httpApiData.payload = editor.isEmpty ? '' : editor.getHTML()
 }
 
 onMounted(async () => {
   if (apiId && apiId != 'new') {
-    const t = await httpReq('GET', 'external/http/' + apiId, { robotId: robotId }, null, null);
+    const t = await httpReq('GET', 'external/http/' + apiId, null, null, null);
     // console.log(t);
     if (t && t.status == 200) {
       copyProperties(t.data, httpApiData);
     }
   }
-  let t = await httpReq('GET', 'variable', { robotId: robotId }, null, null);
+  let t = await httpReq('GET', 'variable', null, null, null);
   if (t && t.status == 200 && t.data) {
     for (var x in t.data) {
       if (t.data.hasOwnProperty(x)) {
@@ -99,7 +99,7 @@ onMounted(async () => {
   // Created after the fetch above, the content comes from the loaded API.
   requestBodyEditor.value = new Editor({
     extensions: [StarterKit, Variable],
-    content: bodyToHtml(httpApiData.requestBody),
+    content: bodyToHtml(httpApiData.payload),
     editorProps: {
       // https://github.com/ueberdosis/tiptap/issues/943
       transformPastedText(text) {
@@ -120,14 +120,14 @@ const tabCounts = () => {
   if (activeName.value == 'h')
     return httpApiData.headers.length
   else if (activeName.value == 'q')
-    return httpApiData.queryParams.length
+    return httpApiData.queryString.length
   else if (activeName.value == 'f')
-    return httpApiData.formData.length
+    return httpApiData.urlencodedPayload.length
 }
 const newParam = () => {
   param.name = '';
   param.value = '';
-  param.valueSource = 'Val';
+  param.valueSource = 'Const';
   editIdx.value = -1;
   const p = activeName.value;
   if (p == 'h')
@@ -145,16 +145,16 @@ const addParam = () => {
     if (activeName.value == 'h')
       httpApiData.headers[idx] = p;
     else if (activeName.value == 'q')
-      httpApiData.queryParams[idx] = p;
+      httpApiData.queryString[idx] = p;
     else if (activeName.value == 'f')
-      httpApiData.formData[idx] = p;
+      httpApiData.urlencodedPayload[idx] = p;
   } else {
     if (activeName.value == 'h')
       httpApiData.headers.push(p);
     else if (activeName.value == 'q')
-      httpApiData.queryParams.push(p);
+      httpApiData.queryString.push(p);
     else if (activeName.value == 'f')
-      httpApiData.formData.push(p);
+      httpApiData.urlencodedPayload.push(p);
   }
   setFormVisible.value = false
 }
@@ -163,9 +163,9 @@ const editParam = (idx) => {
   if (activeName.value == 'h')
     copyProperties(httpApiData.headers[idx], param)
   else if (activeName.value == 'q')
-    copyProperties(httpApiData.queryParams[idx], param)
+    copyProperties(httpApiData.queryString[idx], param)
   else if (activeName.value == 'f')
-    copyProperties(httpApiData.formData[idx], param)
+    copyProperties(httpApiData.urlencodedPayload[idx], param)
   const p = activeName.value;
   if (p == 'h')
     dynamicTitle.value = t('eApi.detail.editHeaderTitle')
@@ -179,13 +179,13 @@ const delParam = (idx) => {
   if (activeName.value == 'h')
     httpApiData.headers.splice(idx, 1)
   else if (activeName.value == 'q')
-    httpApiData.queryParams.splice(idx, 1)
+    httpApiData.queryString.splice(idx, 1)
   else if (activeName.value == 'f')
-    httpApiData.formData.splice(idx, 1)
+    httpApiData.urlencodedPayload.splice(idx, 1)
 }
 const save = async () => {
   httpApiData.protocol = httpApiData.protocol.replace('://', '').toUpperCase();
-  const resp = await httpReq('POST', 'external/http/' + apiId, { robotId: robotId }, null, httpApiData);
+  const resp = await httpReq('POST', 'external/http/' + apiId, null, null, httpApiData);
   // console.log(resp);
   if (resp && resp.status == 200) {
     ElMessage({
@@ -421,7 +421,7 @@ const changeTab = (v) => {
                 <el-table-column :label="t('eApi.detail.paramValue')" min-width="200">
                   <template #default="scope">
                     <span>{{ scope.row.value }}</span>
-                    <el-tag v-if="scope.row.valueSource == 'Var'" size="small" type="info" class="var-tag">
+                    <el-tag v-if="scope.row.valueSource == 'Variable'" size="small" type="info" class="var-tag">
                       {{ t('eApi.detail.varSource') }}
                     </el-tag>
                   </template>
@@ -445,13 +445,13 @@ const changeTab = (v) => {
               </el-button>
             </el-tab-pane>
             <el-tab-pane
-              :label="t('eApi.detail.queryParams') + ' (' + httpApiData.queryParams.length + ')'" name="q">
-              <el-table :data="httpApiData.queryParams" stripe class="param-table" style="width: 100%">
+              :label="t('eApi.detail.queryParams') + ' (' + httpApiData.queryString.length + ')'" name="q">
+              <el-table :data="httpApiData.queryString" stripe class="param-table" style="width: 100%">
                 <el-table-column prop="name" :label="t('eApi.detail.paramName')" min-width="240" />
                 <el-table-column :label="t('eApi.detail.paramValue')" min-width="200">
                   <template #default="scope">
                     <span>{{ scope.row.value }}</span>
-                    <el-tag v-if="scope.row.valueSource == 'Var'" size="small" type="info" class="var-tag">
+                    <el-tag v-if="scope.row.valueSource == 'Variable'" size="small" type="info" class="var-tag">
                       {{ t('eApi.detail.varSource') }}
                     </el-tag>
                   </template>
@@ -482,13 +482,13 @@ const changeTab = (v) => {
                   <el-radio-button value="Raw">raw</el-radio-button>
                 </el-radio-group>
               </div>
-              <el-table v-if="httpApiData.postContentType == 'UrlEncoded'" :data="httpApiData.formData" stripe
+              <el-table v-if="httpApiData.postContentType == 'UrlEncoded'" :data="httpApiData.urlencodedPayload" stripe
                 class="param-table" style="width: 100%">
                 <el-table-column prop="name" :label="t('eApi.detail.paramName')" min-width="240" />
                 <el-table-column :label="t('eApi.detail.paramValue')" min-width="200">
                   <template #default="scope">
                     <span>{{ scope.row.value }}</span>
-                    <el-tag v-if="scope.row.valueSource == 'Var'" size="small" type="info" class="var-tag">
+                    <el-tag v-if="scope.row.valueSource == 'Variable'" size="small" type="info" class="var-tag">
                       {{ t('eApi.detail.varSource') }}
                     </el-tag>
                   </template>
@@ -547,12 +547,12 @@ const changeTab = (v) => {
           <div class="value-row">
             <el-select v-model="param.valueSource" placeholder="" class="source-select"
               @change="param.value = ''">
-              <el-option :label="t('eApi.detail.constValue')" value="Val" />
-              <el-option :label="t('eApi.detail.fromVar')" value="Var" />
+              <el-option :label="t('eApi.detail.constValue')" value="Const" />
+              <el-option :label="t('eApi.detail.fromVar')" value="Variable" />
             </el-select>
-            <el-input v-if="param.valueSource == 'Val'" v-model="param.value" autocomplete="off"
+            <el-input v-if="param.valueSource == 'Const'" v-model="param.value" autocomplete="off"
               class="value-input" />
-            <el-select v-if="param.valueSource == 'Var'" v-model="param.value"
+            <el-select v-if="param.valueSource == 'Variable'" v-model="param.value"
               :placeholder="t('eApi.detail.selectVar')" class="value-input">
               <el-option v-for="item in vars" :key="item.varName" :label="item.varName" :value="item.varName" />
             </el-select>

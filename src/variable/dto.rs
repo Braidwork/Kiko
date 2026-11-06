@@ -217,8 +217,7 @@ impl Variable {
                     return self.get_data_from_res(ctx, &c);
                 }
                 if let Ok(Some(api)) =
-                    crate::external::http::crud::get_detail(&req.robot_id, &self.var_associate_data)
-                        .await
+                    crate::external::http::crud::get_detail(&self.var_associate_data).await
                 {
                     return match crate::external::http::client::req(
                         api,

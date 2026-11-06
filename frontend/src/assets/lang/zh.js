@@ -411,7 +411,7 @@ export default {
   var: {
     types: ["字符串", "数字"],
     sources: ["外部导入", "流程采集", "远程HTTP接口(正式版)"],
-    title: "变量管理",
+    title: "变量管理（所有机器人共享）",
     add: "新增变量",
     table: ["变量名", "变量类型", "变量取值来源", "操作"],
     form: {
@@ -424,7 +424,7 @@ export default {
     },
   },
   eApi: {
-    title: "外部 HTTP 接口列表",
+    title: "外部 HTTP 接口列表（所有机器人共享）",
     add: "添加新的外部 HTTP 接口",
     detail: {
       title: "外部 HTTP 接口",

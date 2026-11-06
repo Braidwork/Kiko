@@ -22,8 +22,8 @@ pub(crate) enum PostContentType {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) enum ValueSource {
-    Val,
-    Var,
+    Const,
+    Variable,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -50,15 +50,15 @@ pub(crate) struct HttpReqInfo {
     #[serde(rename = "postContentType")]
     pub(crate) post_content_type: PostContentType,
     pub(crate) headers: Vec<HttpReqParam>,
-    #[serde(rename = "queryParams")]
-    pub(crate) query_params: Vec<HttpReqParam>,
-    #[serde(rename = "formData")]
-    pub(crate) form_data: Vec<HttpReqParam>,
-    #[serde(rename = "requestBody")]
-    pub(crate) request_body: String,
-    /// The `Content-Type` to send with `request_body`. Empty means "derive it
-    /// from `post_content_type`", which is what every record written before
-    /// this field existed did.
+    #[serde(rename = "queryString")]
+    pub(crate) query_string: Vec<HttpReqParam>,
+    #[serde(rename = "urlencodedPayload")]
+    pub(crate) urlencoded_payload: Vec<HttpReqParam>,
+    #[serde(rename = "payload")]
+    pub(crate) payload: String,
+    /// The `Content-Type` to send with `payload`. Empty means "derive it from
+    /// `post_content_type`", which is what every record written before this
+    /// field existed did.
     #[serde(rename = "contentType", default)]
     pub(crate) content_type: String,
     #[serde(rename = "userAgent")]
@@ -77,38 +77,44 @@ pub(crate) enum ResponseData {
 mod tests {
     use super::*;
 
-    /// A record as it was written before `contentType` existed and while the
-    /// raw variant was still called `JSON`.
-    const LEGACY_RECORD: &str = r#"{
+    const RECORD: &str = r#"{
         "id": "abc",
-        "name": "legacy",
+        "name": "record",
         "description": "",
         "protocol": "HTTPS",
         "method": "POST",
         "address": "api.example.com/v1",
         "postContentType": "Raw",
-        "headers": [],
-        "queryParams": [],
-        "formData": [],
-        "requestBody": "{}",
+        "headers": [{"name": "X-A", "value": "1", "valueSource": "Const"}],
+        "queryString": [{"name": "q", "value": "v", "valueSource": "Variable"}],
+        "urlencodedPayload": [],
+        "payload": "{}",
         "userAgent": "ua"
     }"#;
 
     #[test]
-    fn legacy_record_still_reads() {
-        let info: HttpReqInfo = serde_json::from_str(LEGACY_RECORD).unwrap();
+    fn record_reads_with_new_names_and_value_sources() {
+        let info: HttpReqInfo = serde_json::from_str(RECORD).unwrap();
         assert!(matches!(info.post_content_type, PostContentType::Raw));
+        assert_eq!(info.headers[0].value_source, ValueSource::Const);
+        assert_eq!(info.query_string[0].value_source, ValueSource::Variable);
+        assert!(info.urlencoded_payload.is_empty());
+        assert_eq!(info.payload, "{}");
         // Missing `contentType` falls back to the empty string, which the
         // request builder sends as application/json.
         assert_eq!(info.content_type, "");
     }
 
     #[test]
-    fn record_is_written_with_the_new_names() {
-        let mut info: HttpReqInfo = serde_json::from_str(LEGACY_RECORD).unwrap();
+    fn record_is_written_with_new_names() {
+        let mut info: HttpReqInfo = serde_json::from_str(RECORD).unwrap();
         info.content_type = String::from("text/plain");
         let s = serde_json::to_string(&info).unwrap();
         assert!(s.contains(r#""postContentType":"Raw""#), "{s}");
+        assert!(s.contains(r#""queryString":[{"#), "{s}");
+        assert!(s.contains(r#""urlencodedPayload":[]"#), "{s}");
+        assert!(s.contains(r#""payload":"{}""#), "{s}");
+        assert!(s.contains(r#""valueSource":"Variable""#), "{s}");
         assert!(s.contains(r#""contentType":"text/plain""#), "{s}");
     }
 }

@@ -519,7 +519,7 @@ pub(crate) struct ExternalHttpCallNode {
 impl RuntimeNode for ExternalHttpCallNode {
     async fn exec(
         &mut self,
-        req: &Request,
+        _req: &Request,
         ctx: &mut Context,
         _response: &mut ResponseData,
         _channel_sender: &ResponseChannelWrapper,
@@ -527,7 +527,7 @@ impl RuntimeNode for ExternalHttpCallNode {
         // println!("Into ExternalHttpCallNode");
         let mut goto_node_id = &self.next_node_id;
         if let Ok(Some(api)) =
-            crate::external::http::crud::get_detail(&req.robot_id, self.http_api_id.as_str()).await
+            crate::external::http::crud::get_detail(self.http_api_id.as_str()).await
         {
             if self.async_req {
                 tokio::spawn(http::status_code(
