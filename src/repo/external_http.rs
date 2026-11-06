@@ -1,24 +1,19 @@
-//! `external_http_apis` / `external_http_params` 仓储（§5.5 / §15.4 S3.2）。
+//! `external_http_apis` 仓储（§5.5 / §15.4 S3.2）。
 //!
-//! A 把这个聚合整条 JSON 塞进 redb，键是 API 的 id；B 拆成「主表 + 参数子表」，
-//! 参数用 `kind`（header / query / form）+ `position` 保序。读写都要保持
-//! `HttpReqInfo` 的原有形状：三组参数各自有序、`valueSource` 原样往返。
+//! 外部 HTTP API 跨机器人共享，表里没有 `robot_id`。参数全部内联在主表：
 //!
-//! 保存语义与 A 的整条覆盖一致：同一个 id 再存一次 = 主表更新 + 参数整组替换。
-//! 参数 id 是内部行号，不出现在 API 契约里。
-
-use std::collections::HashMap;
+//! - `headers` / `query_string` / `urlencoded_payload` 是 JSONB 数组，元素形状
+//!   与 [`HttpReqParam`] 一致：`{"name","value","valueSource"}`；
+//! - `payload` 是原始请求体 TEXT，仅 `post_content_type = "Raw"` 时使用。
+//!
+//! 保存语义仍是整条覆盖；一行就是一个完整的 [`HttpReqInfo`]，不再需要主表 +
+//! 参数子表的事务。
 
 use sqlx::postgres::PgPool;
+use sqlx::types::Json;
 
-use crate::external::http::dto::{
-    HttpReqInfo, HttpReqParam, Method, PostContentType, Protocol, ValueSource,
-};
+use crate::external::http::dto::{HttpReqInfo, HttpReqParam, Method, PostContentType, Protocol};
 use crate::result::{Error, Result};
-
-const KIND_HEADER: &str = "header";
-const KIND_QUERY: &str = "query";
-const KIND_FORM: &str = "form";
 
 #[derive(sqlx::FromRow)]
 struct ApiRow {
@@ -29,246 +24,145 @@ struct ApiRow {
     method: String,
     address: String,
     post_content_type: String,
-    request_body: Option<String>,
+    headers: Json<Vec<HttpReqParam>>,
+    query_string: Json<Vec<HttpReqParam>>,
+    urlencoded_payload: Json<Vec<HttpReqParam>>,
+    payload: String,
     content_type: Option<String>,
     user_agent: Option<String>,
     version: i64,
 }
 
-#[derive(sqlx::FromRow)]
-struct ParamRow {
-    api_id: String,
-    kind: String,
-    name: String,
-    value: String,
-    value_source: String,
-}
-
 const API_COLUMNS: &str = "id, name, description, protocol, method, address, \
-                           post_content_type, request_body, content_type, user_agent, version";
+                           post_content_type, headers, query_string, urlencoded_payload, \
+                           payload, content_type, user_agent, version";
 
-/// 一个机器人的全部 API。顺序沿用 A 的 redb key 序（id 字节序，§5.1）。
-pub(crate) async fn list(pool: &PgPool, robot_id: &str) -> Result<Vec<HttpReqInfo>> {
+/// 全部 API（跨机器人）。顺序沿用 id 字节序（§5.1）。
+pub(crate) async fn list(pool: &PgPool) -> Result<Vec<HttpReqInfo>> {
     let apis: Vec<ApiRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        r#"SELECT {API_COLUMNS} FROM external_http_apis
-            WHERE robot_id = $1
-            ORDER BY id COLLATE "C""#
+        r#"SELECT {API_COLUMNS} FROM external_http_apis ORDER BY id COLLATE "C""#
     )))
-    .bind(robot_id)
     .fetch_all(pool)
     .await?;
-    if apis.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // 一次把参数取全再分组，避免每个 API 一次查询（列表页一次要显示几十条）。
-    let params: Vec<ParamRow> = sqlx::query_as(
-        r#"SELECT p.api_id, p.kind, p.name, p.value, p.value_source
-             FROM external_http_params p
-             JOIN external_http_apis a ON a.id = p.api_id
-            WHERE a.robot_id = $1
-            ORDER BY p.api_id COLLATE "C", p.position"#,
-    )
-    .bind(robot_id)
-    .fetch_all(pool)
-    .await?;
-
-    let mut grouped: HashMap<String, Vec<ParamRow>> = HashMap::new();
-    for p in params {
-        grouped.entry(p.api_id.clone()).or_default().push(p);
-    }
-
-    apis.into_iter()
-        .map(|api| {
-            let params = grouped.remove(&api.id).unwrap_or_default();
-            build_info(api, params)
-        })
-        .collect()
+    apis.into_iter().map(build_info).collect()
 }
 
-pub(crate) async fn get(pool: &PgPool, robot_id: &str, id: &str) -> Result<Option<HttpReqInfo>> {
+pub(crate) async fn get(pool: &PgPool, id: &str) -> Result<Option<HttpReqInfo>> {
     let api: Option<ApiRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        r#"SELECT {API_COLUMNS} FROM external_http_apis WHERE id = $1 AND robot_id = $2"#
+        r#"SELECT {API_COLUMNS} FROM external_http_apis WHERE id = $1"#
     )))
     .bind(id)
-    .bind(robot_id)
     .fetch_optional(pool)
     .await?;
-    let Some(api) = api else {
-        return Ok(None);
-    };
-
-    let params: Vec<ParamRow> = sqlx::query_as(
-        r#"SELECT api_id, kind, name, value, value_source
-             FROM external_http_params
-            WHERE api_id = $1
-            ORDER BY position"#,
-    )
-    .bind(id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(Some(build_info(api, params)?))
+    api.map(build_info).transpose()
 }
 
-/// 插入或整条覆盖。参数在同一个事务里整组替换，避免「主表更新了、参数还是旧的」。
-pub(crate) async fn upsert(pool: &PgPool, robot_id: &str, info: &HttpReqInfo) -> Result<()> {
-    let mut tx = pool.begin().await?;
-
+/// 插入或整条覆盖。一行就是一个完整的 API，不需要事务。
+pub(crate) async fn upsert(pool: &PgPool, info: &HttpReqInfo) -> Result<()> {
     sqlx::query(
         "INSERT INTO external_http_apis (
-             id, robot_id, name, description, protocol, method, address,
-             post_content_type, request_body, content_type, user_agent)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             id, name, description, protocol, method, address,
+             post_content_type, headers, query_string, urlencoded_payload,
+             payload, content_type, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (id) DO UPDATE
-            SET name              = EXCLUDED.name,
-                description       = EXCLUDED.description,
-                protocol          = EXCLUDED.protocol,
-                method            = EXCLUDED.method,
-                address           = EXCLUDED.address,
-                post_content_type = EXCLUDED.post_content_type,
-                request_body      = EXCLUDED.request_body,
-                content_type      = EXCLUDED.content_type,
-                user_agent        = EXCLUDED.user_agent,
-                updated_at        = now(),
-                version           = external_http_apis.version + 1",
+            SET name               = EXCLUDED.name,
+                description        = EXCLUDED.description,
+                protocol           = EXCLUDED.protocol,
+                method             = EXCLUDED.method,
+                address            = EXCLUDED.address,
+                post_content_type  = EXCLUDED.post_content_type,
+                headers            = EXCLUDED.headers,
+                query_string       = EXCLUDED.query_string,
+                urlencoded_payload = EXCLUDED.urlencoded_payload,
+                payload            = EXCLUDED.payload,
+                content_type       = EXCLUDED.content_type,
+                user_agent         = EXCLUDED.user_agent,
+                updated_at         = now(),
+                version            = external_http_apis.version + 1",
     )
     .bind(&info.id)
-    .bind(robot_id)
     .bind(&info.name)
     .bind(&info.description)
     .bind(protocol_to_db(&info.protocol))
     .bind(method_to_db(&info.method))
     .bind(&info.address)
     .bind(post_content_type_to_db(&info.post_content_type))
-    .bind(&info.request_body)
+    .bind(Json(&info.headers))
+    .bind(Json(&info.query_string))
+    .bind(Json(&info.urlencoded_payload))
+    .bind(&info.payload)
     .bind(&info.content_type)
     .bind(&info.user_agent)
-    .execute(&mut *tx)
+    .execute(pool)
     .await?;
-
-    replace_params(&mut tx, info).await?;
-    tx.commit().await?;
     Ok(())
 }
 
-/// 更新一个已存在的 API（B-17 强制乐观锁）。主表与参数在同一个事务里；版本不符
-/// 返回 [`crate::repo::version_conflict`]，不存在返回 `false`。
+/// 更新一个已存在的 API（B-17 强制乐观锁）。
 pub(crate) async fn update(
     pool: &PgPool,
-    robot_id: &str,
     info: &HttpReqInfo,
     expected_version: i64,
 ) -> Result<bool> {
-    let mut tx = pool.begin().await?;
     let r = sqlx::query(
         "UPDATE external_http_apis
-            SET name = $3, description = $4, protocol = $5, method = $6, address = $7,
-                post_content_type = $8, request_body = $9, content_type = $10,
-                user_agent = $11, updated_at = now(), version = version + 1
-          WHERE id = $1 AND robot_id = $2 AND version = $12",
+            SET name               = $2,
+                description        = $3,
+                protocol           = $4,
+                method             = $5,
+                address            = $6,
+                post_content_type  = $7,
+                headers            = $8,
+                query_string       = $9,
+                urlencoded_payload = $10,
+                payload            = $11,
+                content_type       = $12,
+                user_agent         = $13,
+                updated_at         = now(),
+                version            = version + 1
+          WHERE id = $1 AND version = $14",
     )
     .bind(&info.id)
-    .bind(robot_id)
     .bind(&info.name)
     .bind(&info.description)
     .bind(protocol_to_db(&info.protocol))
     .bind(method_to_db(&info.method))
     .bind(&info.address)
     .bind(post_content_type_to_db(&info.post_content_type))
-    .bind(&info.request_body)
+    .bind(Json(&info.headers))
+    .bind(Json(&info.query_string))
+    .bind(Json(&info.urlencoded_payload))
+    .bind(&info.payload)
     .bind(&info.content_type)
     .bind(&info.user_agent)
     .bind(expected_version)
-    .execute(&mut *tx)
+    .execute(pool)
     .await?;
-    if r.rows_affected() == 0 {
-        tx.rollback().await?;
-        let exists: Option<i32> =
-            sqlx::query_scalar("SELECT 1 FROM external_http_apis WHERE id = $1 AND robot_id = $2")
-                .bind(&info.id)
-                .bind(robot_id)
-                .fetch_optional(pool)
-                .await?;
-        return if exists.is_some() {
-            Err(crate::repo::version_conflict("External HTTP API"))
-        } else {
-            Ok(false)
-        };
+    if r.rows_affected() > 0 {
+        return Ok(true);
     }
-    replace_params(&mut tx, info).await?;
-    tx.commit().await?;
-    Ok(true)
-}
-
-/// 整组替换一个 API 的参数（调用方负责事务）。
-async fn replace_params(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    info: &HttpReqInfo,
-) -> Result<()> {
-    sqlx::query("DELETE FROM external_http_params WHERE api_id = $1")
+    let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM external_http_apis WHERE id = $1")
         .bind(&info.id)
-        .execute(&mut **tx)
+        .fetch_optional(pool)
         .await?;
-
-    for (kind, list) in [
-        (KIND_HEADER, &info.headers),
-        (KIND_QUERY, &info.query_params),
-        (KIND_FORM, &info.form_data),
-    ] {
-        for (position, p) in list.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO external_http_params
-                     (id, api_id, kind, position, name, value, value_source)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            )
-            .bind(scru128::new_string())
-            .bind(&info.id)
-            .bind(kind)
-            .bind(position as i32)
-            .bind(&p.name)
-            .bind(&p.value)
-            .bind(value_source_to_db(&p.value_source))
-            .execute(&mut **tx)
-            .await?;
-        }
+    if exists.is_some() {
+        Err(crate::repo::version_conflict("External HTTP API"))
+    } else {
+        Ok(false)
     }
-    Ok(())
 }
 
-/// 删除一个 API。参数由 FK 级联；不存在的 id 不报错（与 redb `remove` 一致）。
-pub(crate) async fn delete(pool: &PgPool, robot_id: &str, id: &str) -> Result<()> {
-    sqlx::query("DELETE FROM external_http_apis WHERE id = $1 AND robot_id = $2")
+/// 删除一个 API。不存在的 id 不报错（与 redb `remove` 一致）。
+pub(crate) async fn delete(pool: &PgPool, id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM external_http_apis WHERE id = $1")
         .bind(id)
-        .bind(robot_id)
         .execute(pool)
         .await?;
     Ok(())
 }
 
-fn build_info(api: ApiRow, params: Vec<ParamRow>) -> Result<HttpReqInfo> {
-    let mut headers = Vec::new();
-    let mut query_params = Vec::new();
-    let mut form_data = Vec::new();
-
-    for p in params {
-        let param = HttpReqParam {
-            name: p.name,
-            value: p.value,
-            value_source: value_source_from_db(&p.value_source)?,
-        };
-        match p.kind.as_str() {
-            KIND_HEADER => headers.push(param),
-            KIND_QUERY => query_params.push(param),
-            KIND_FORM => form_data.push(param),
-            other => {
-                return Err(Error::WithMessage(format!(
-                    "Unknown external_http_params kind in database: {other}"
-                )));
-            }
-        }
-    }
-
+fn build_info(api: ApiRow) -> Result<HttpReqInfo> {
     Ok(HttpReqInfo {
         id: api.id,
         version: Some(api.version),
@@ -278,10 +172,10 @@ fn build_info(api: ApiRow, params: Vec<ParamRow>) -> Result<HttpReqInfo> {
         method: method_from_db(&api.method)?,
         address: api.address,
         post_content_type: post_content_type_from_db(&api.post_content_type)?,
-        headers,
-        query_params,
-        form_data,
-        request_body: api.request_body.unwrap_or_default(),
+        headers: api.headers.0,
+        query_string: api.query_string.0,
+        urlencoded_payload: api.urlencoded_payload.0,
+        payload: api.payload,
         content_type: api.content_type.unwrap_or_default(),
         user_agent: api.user_agent.unwrap_or_default(),
     })
@@ -335,23 +229,6 @@ fn post_content_type_from_db(s: &str) -> Result<PostContentType> {
         "Raw" => Ok(PostContentType::Raw),
         other => Err(Error::WithMessage(format!(
             "Unknown external HTTP post_content_type in database: {other}"
-        ))),
-    }
-}
-
-fn value_source_to_db(v: &ValueSource) -> &'static str {
-    match v {
-        ValueSource::Val => "Val",
-        ValueSource::Var => "Var",
-    }
-}
-
-fn value_source_from_db(s: &str) -> Result<ValueSource> {
-    match s {
-        "Val" => Ok(ValueSource::Val),
-        "Var" => Ok(ValueSource::Var),
-        other => Err(Error::WithMessage(format!(
-            "Unknown external HTTP value_source in database: {other}"
         ))),
     }
 }

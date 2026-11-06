@@ -92,7 +92,6 @@ async fn migration_creates_all_v1_tables() {
         "intent_regexes",
         "intent_phrases",
         "external_http_apis",
-        "external_http_params",
         "documents",
         "doc_chunks",
         "qa",
@@ -111,6 +110,10 @@ async fn migration_creates_all_v1_tables() {
             "migration 少建了表 {expected}；实际：{tables:?}"
         );
     }
+    assert!(
+        !tables.iter().any(|t| t == "external_http_params"),
+        "0008 之后参数应内联，不能再有 external_http_params 表"
+    );
 
     db.cleanup().await;
 }
@@ -293,15 +296,15 @@ fn http_api(id: &str, name: &str) -> HttpReqInfo {
         address: String::from("api.example.com/v1"),
         post_content_type: PostContentType::Raw,
         headers: vec![
-            param("X-A", "1", ValueSource::Val),
-            param("X-B", "var", ValueSource::Var),
+            param("X-A", "1", ValueSource::Const),
+            param("X-B", "var", ValueSource::Variable),
         ],
-        query_params: vec![param("q", "v", ValueSource::Var)],
-        form_data: vec![
-            param("f1", "a", ValueSource::Val),
-            param("f2", "b", ValueSource::Val),
+        query_string: vec![param("q", "v", ValueSource::Variable)],
+        urlencoded_payload: vec![
+            param("f1", "a", ValueSource::Const),
+            param("f2", "b", ValueSource::Const),
         ],
-        request_body: String::from("{}"),
+        payload: String::from("{}"),
         content_type: String::from("application/json"),
         user_agent: String::from("kiko-test"),
     }
@@ -313,12 +316,11 @@ async fn external_http_roundtrip_and_replace() {
         eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
         return;
     };
-    robot::upsert(&db.pool, &robot("rH", "http")).await.unwrap();
 
     let mut api = http_api("api1", "first");
-    external_http::upsert(&db.pool, "rH", &api).await.unwrap();
+    external_http::upsert(&db.pool, &api).await.unwrap();
 
-    let got = external_http::get(&db.pool, "rH", "api1")
+    let got = external_http::get(&db.pool, "api1")
         .await
         .unwrap()
         .expect("api1 应该存在");
@@ -332,109 +334,80 @@ async fn external_http_roundtrip_and_replace() {
         got.headers, api.headers,
         "header 顺序与 valueSource 都要保序"
     );
-    assert_eq!(got.query_params, api.query_params);
-    assert_eq!(got.form_data, api.form_data);
+    assert_eq!(got.query_string, api.query_string);
+    assert_eq!(got.urlencoded_payload, api.urlencoded_payload);
+    assert_eq!(got.payload, "{}");
 
-    // 同一个 id 再存一次 = 主表更新 + 参数整组替换，不能残留旧参数。
+    // 同一个 id 再存一次 = 整行覆盖，不能残留旧数组元素。
     api.name = String::from("renamed");
-    api.headers = vec![param("X-Only", "1", ValueSource::Val)];
-    api.query_params.clear();
-    api.form_data = vec![param("f", "z", ValueSource::Var)];
-    external_http::upsert(&db.pool, "rH", &api).await.unwrap();
+    api.headers = vec![param("X-Only", "1", ValueSource::Const)];
+    api.query_string.clear();
+    api.urlencoded_payload = vec![param("f", "z", ValueSource::Variable)];
+    external_http::upsert(&db.pool, &api).await.unwrap();
 
-    let got = external_http::get(&db.pool, "rH", "api1")
-        .await
-        .unwrap()
-        .unwrap();
+    let got = external_http::get(&db.pool, "api1").await.unwrap().unwrap();
     assert_eq!(got.name, "renamed");
     assert_eq!(got.headers, api.headers);
-    assert!(got.query_params.is_empty());
-    assert_eq!(got.form_data, api.form_data);
+    assert!(got.query_string.is_empty());
+    assert_eq!(got.urlencoded_payload, api.urlencoded_payload);
 
-    let params: i64 = sqlx::query_scalar("SELECT count(*) FROM external_http_params")
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-    assert_eq!(params, 2, "旧参数必须被删掉，不能重复累积");
+    let lengths: (i32, i32, i32) = sqlx::query_as(
+        "SELECT jsonb_array_length(headers),
+                jsonb_array_length(query_string),
+                jsonb_array_length(urlencoded_payload)
+           FROM external_http_apis WHERE id = 'api1'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(lengths, (1, 0, 1), "JSONB 数组必须整组覆盖");
 
     // 列表与单条一致。
-    let list = external_http::list(&db.pool, "rH").await.unwrap();
+    let list = external_http::list(&db.pool).await.unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, "api1");
 
-    external_http::delete(&db.pool, "rH", "api1").await.unwrap();
+    external_http::delete(&db.pool, "api1").await.unwrap();
     assert!(
-        external_http::get(&db.pool, "rH", "api1")
+        external_http::get(&db.pool, "api1")
             .await
             .unwrap()
             .is_none()
     );
-    let params: i64 = sqlx::query_scalar("SELECT count(*) FROM external_http_params")
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-    assert_eq!(params, 0, "删 API 必须级联删参数");
 
     db.cleanup().await;
 }
 
 #[tokio::test]
-async fn external_http_list_orders_by_id_and_isolates_robots() {
+async fn external_http_list_is_global_and_orders_by_id() {
     let Some(db) = TestDb::new().await else {
         eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
         return;
     };
-    robot::upsert(&db.pool, &robot("rA", "a")).await.unwrap();
-    robot::upsert(&db.pool, &robot("rB", "b")).await.unwrap();
 
-    external_http::upsert(&db.pool, "rA", &http_api("b-api", "b"))
+    external_http::upsert(&db.pool, &http_api("b-api", "b"))
         .await
         .unwrap();
-    external_http::upsert(&db.pool, "rA", &http_api("a-api", "a"))
+    external_http::upsert(&db.pool, &http_api("a-api", "a"))
         .await
         .unwrap();
-    external_http::upsert(&db.pool, "rB", &http_api("c-api", "c"))
+    external_http::upsert(&db.pool, &http_api("c-api", "c"))
         .await
         .unwrap();
 
-    let a = external_http::list(&db.pool, "rA").await.unwrap();
-    let ids: Vec<&str> = a.iter().map(|x| x.id.as_str()).collect();
+    let all = external_http::list(&db.pool).await.unwrap();
+    let ids: Vec<&str> = all.iter().map(|x| x.id.as_str()).collect();
     assert_eq!(
         ids,
-        ["a-api", "b-api"],
-        "列表按 id 字节序，与 redb key 序一致"
+        ["a-api", "b-api", "c-api"],
+        "全局列表按 id 字节序，与 redb key 序一致"
     );
-
-    let b = external_http::list(&db.pool, "rB").await.unwrap();
-    assert_eq!(b.len(), 1);
-    assert_eq!(b[0].id, "c-api");
-
-    // 别的机器人拿不到别人的 API（防止跨机器人泄漏）。
+    // 变量/流程只靠 id 引用 API，不再按机器人隔离。
     assert!(
-        external_http::get(&db.pool, "rB", "a-api")
+        external_http::get(&db.pool, "c-api")
             .await
             .unwrap()
-            .is_none()
-    );
-
-    db.cleanup().await;
-}
-
-#[tokio::test]
-async fn external_http_surfaces_missing_robot_as_business_error() {
-    let Some(db) = TestDb::new().await else {
-        eprintln!("skipped: KIKO_TEST_DATABASE_URL is not set");
-        return;
-    };
-
-    // 机器人不存在 → 外键冲突。错误文案要是人话（B-08），不是 sqlx 的原文。
-    let err = external_http::upsert(&db.pool, "no-such-robot", &http_api("api1", "x"))
-        .await
-        .expect_err("外键冲突必须返回错误");
-    let msg = err.message();
-    assert!(
-        msg.contains("Referenced row is missing"),
-        "unexpected error message: {msg}"
+            .is_some()
     );
 
     db.cleanup().await;
@@ -2363,13 +2336,11 @@ async fn optimistic_locking_rejects_stale_updates() {
     conflict(variable::update(&db.pool, &var, 0).await.unwrap_err());
     assert!(variable::update(&db.pool, &var, 1).await.unwrap());
 
-    // --- 外部 HTTP（主表 + 参数同事务，编辑必须带 version） ---
+    // --- 外部 HTTP（单行覆盖，编辑必须带 version） ---
     let mut api = http_api("api1", "api");
-    external_http::upsert(&db.pool, "rMeta", &api)
-        .await
-        .unwrap();
+    external_http::upsert(&db.pool, &api).await.unwrap();
     assert_eq!(
-        external_http::get(&db.pool, "rMeta", "api1")
+        external_http::get(&db.pool, "api1")
             .await
             .unwrap()
             .unwrap()
@@ -2377,21 +2348,9 @@ async fn optimistic_locking_rejects_stale_updates() {
         Some(0)
     );
     api.name = String::from("api-renamed");
-    assert!(
-        external_http::update(&db.pool, "rMeta", &api, 0)
-            .await
-            .unwrap()
-    );
-    conflict(
-        external_http::update(&db.pool, "rMeta", &api, 0)
-            .await
-            .unwrap_err(),
-    );
-    assert!(
-        external_http::update(&db.pool, "rMeta", &api, 1)
-            .await
-            .unwrap()
-    );
+    assert!(external_http::update(&db.pool, &api, 0).await.unwrap());
+    conflict(external_http::update(&db.pool, &api, 0).await.unwrap_err());
+    assert!(external_http::update(&db.pool, &api, 1).await.unwrap());
 
     db.cleanup().await;
 }

@@ -136,7 +136,7 @@ onMounted(async () => {
     const r = await httpReq(
         "GET",
         "external/http",
-        { robotId: robotId },
+        null,
         null,
         null,
     );

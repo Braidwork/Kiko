@@ -13,7 +13,7 @@ const robotId=route.params.robotId
 
 const tableData = ref([])
 onMounted(async () => {
-    const t = await httpReq('GET', 'external/http', {robotId:robotId}, null, null);
+    const t = await httpReq('GET', 'external/http', null, null, null);
     // console.log(t);
     if (t && t.status == 200) {
         tableData.value = t.data == null ? [] : t.data;
@@ -40,7 +40,7 @@ const delApi = (idx, row) => {
         }
     )
         .then(async () => {
-            const t = await httpReq('DELETE', 'external/http/' + row.id, { robotId: robotId }, null, null);
+            const t = await httpReq('DELETE', 'external/http/' + row.id, null, null, null);
             // console.log(t);
             if (t && t.status == 200) {
                 ElMessage({
