@@ -88,10 +88,10 @@ const delApi = (idx, row) => {
             <el-table-column fixed="right" :label="tm('mainflow.table')[2]" width="160" align="center">
                 <template #default="scope">
                     <el-button link type="primary" @click="editApi(scope.$index, scope.row)">
-                        Edit
+                        {{ $t('common.edit') }}
                     </el-button>
                     <el-button link type="danger" @click="delApi(scope.$index, scope.row)">
-                        Delete
+                        {{ $t('common.del') }}
                     </el-button>
                 </template>
             </el-table-column>
