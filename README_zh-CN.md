@@ -34,6 +34,11 @@ PG 体系，而不是散落在 `data/` 里的二进制文件。
 | schema 管理 | 无（数据文件随程序走） | `sqlx::migrate!` 内嵌 migration，启动自动迁移（`auto_migrate`） |
 | 并发正确性 | 单写队列，读-改-写有丢更新窗口 | 事务 + 行锁 + **全部可编辑实体的乐观锁**（`version`），冲突显式报错 |
 | 敏感配置 | 本地明文 | `secrets` 表 + `enc:`/`env:`/`file:` 引用串，AES-GCM 加密，主密钥可外置 |
+| 安全：登录认证 | 无，无用户体系，所有接口无鉴权 | 全部管理接口需**本地管理员登录**：argon2id 口令哈希、`HttpOnly; SameSite=Lax` 会话 cookie（滑动 12h、绝对 7d），会话可在服务端吊销 |
+| 安全：账号保护 | 无 | 引导管理员首次登录强制改密；弱口令拒绝；`kiko hash-password` / `reset-password` 的口令只走 stdin（不进 argv），重置后吊销该用户全部会话 |
+| 安全：访问控制 | 无，无账号/角色/权限概念 | v1 为单一管理员身份（RBAC/SSO 留给后续版本）；未登录访问受保护路由返回 401；前端带登录/登出页与路由守卫 |
+| 安全：审计 | 无 | `audit_log`（append-only 操作审计）+ `audit_access_log`（检索审计），开关与保留期可配（默认关闭）；hash 链与外部锚点属政企版 |
+| 安全：加固 | 无 | 安全响应头（`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy`、`Permissions-Policy`）；默认同源、CORS 白名单显式开启；敏感配置加密（见上） |
 | 换嵌入模型 | 改配置即生效（可能新旧向量混用） | **active model 分离**：查询/增量写跟随"已建索引的模型"，只有重建才切换 |
 | 向量索引 | turso 内检索 | PG 为事实源 + 进程内暴力索引（内存预算、f16 降精度、dirty 标记、后台对账） |
 | 重启与续跑 | 依赖 redb/turso 文件的一致性 | 运行态也在 PG；重建扫描幂等，可中断续跑（无 jobs 表） |
